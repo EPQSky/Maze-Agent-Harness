@@ -10,6 +10,26 @@ afterEach(() => {
 });
 
 describe("实验工作台", () => {
+  it("终态实验保留历史 Arena，但不显示运行基线比赛入口", async () => {
+    const completed: Experiment = {
+      id: "completed-id", name: "已完成实验", status: "completed", createdAt: "2026-09-01T10:00:00.000Z",
+      modelProfile: null,
+      harnessEnvironments: {
+        generator: { home: "/h/c/g/home", workspace: "/h/c/g/workspace" },
+        solver: { home: "/h/c/s/home", workspace: "/h/c/s/workspace" },
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ experiments: [completed] } satisfies ExperimentListResponse)))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ providers: [] } satisfies HarnessCatalogResponse)))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: "MATCH_NOT_FOUND", message: "无历史" } }), { status: 404 })));
+
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "已完成实验" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "运行基线比赛" })).not.toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "迷宫比赛画布" })).toBeInTheDocument();
+  });
+
   it("首屏读取实验，并允许创建后查看草稿详情", async () => {
     const existing = {
       id: "existing-id",
@@ -60,7 +80,9 @@ describe("实验工作台", () => {
       .fn<typeof fetch>()
       .mockResolvedValueOnce(new Response(JSON.stringify({ experiments: [existing] } satisfies ExperimentListResponse)))
       .mockResolvedValueOnce(new Response(JSON.stringify(catalog)))
-      .mockResolvedValueOnce(new Response(JSON.stringify(created), { status: 201 }));
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: "MATCH_NOT_FOUND", message: "无历史" } }), { status: 404 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(created), { status: 201 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: "MATCH_NOT_FOUND", message: "无历史" } }), { status: 404 }));
     vi.stubGlobal("fetch", fetchMock);
     const user = userEvent.setup();
 
@@ -78,8 +100,9 @@ describe("实验工作台", () => {
     await waitFor(() => expect(screen.getByRole("heading", { name: "新的实验" })).toBeInTheDocument());
     expect(within(experimentList).getAllByText("草稿")).toHaveLength(2);
     expect(screen.getByText("确定性推理提供方 / Reasoner V1")).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenLastCalledWith("/api/experiments", expect.objectContaining({ method: "POST" }));
-    expect(JSON.parse(fetchMock.mock.calls.at(-1)?.[1]?.body as string)).toMatchObject({
+    const createCall = fetchMock.mock.calls.find(([url, init]) => url === "/api/experiments" && init?.method === "POST");
+    expect(createCall).toBeDefined();
+    expect(JSON.parse(createCall?.[1]?.body as string)).toMatchObject({
       modelProfile: { providerId: "custom-reasoning", modelId: "custom-reasoner", credentialRef: "dsh-credential://reasoning", reasoningEffort: "high" },
     });
   });
@@ -118,7 +141,8 @@ describe("实验工作台", () => {
     const fetchMock = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(new Response(JSON.stringify({ experiments: [] } satisfies ExperimentListResponse)))
       .mockResolvedValueOnce(new Response(JSON.stringify(catalog)))
-      .mockResolvedValueOnce(new Response(JSON.stringify(created), { status: 201 }));
+      .mockResolvedValueOnce(new Response(JSON.stringify(created), { status: 201 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: "MATCH_NOT_FOUND", message: "无历史" } }), { status: 404 }));
     vi.stubGlobal("fetch", fetchMock);
     const user = userEvent.setup();
 
@@ -129,8 +153,9 @@ describe("实验工作台", () => {
     await user.type(screen.getByLabelText("凭据引用"), "dsh-credential://vendor");
     await user.click(screen.getByRole("button", { name: "创建" }));
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
-    expect(JSON.parse(fetchMock.mock.calls.at(-1)?.[1]?.body as string)).toMatchObject({
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    const createCall = fetchMock.mock.calls.find(([url, init]) => url === "/api/experiments" && init?.method === "POST");
+    expect(JSON.parse(createCall?.[1]?.body as string)).toMatchObject({
       modelProfile: {
         providerId: "vendor-only",
         modelId: "model-only",

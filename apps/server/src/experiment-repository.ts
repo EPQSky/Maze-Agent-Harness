@@ -79,8 +79,8 @@ export class ExperimentRepository {
 
   private migrateSchema(): void {
     const version = this.database.prepare("PRAGMA user_version").get() as { user_version: number };
-    if (version.user_version > 2) {
-      throw new Error(`数据库版本 ${version.user_version} 高于当前支持版本 2`);
+    if (version.user_version > 4) {
+      throw new Error(`数据库版本 ${version.user_version} 高于当前支持版本 4`);
     }
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -130,7 +130,7 @@ export class ExperimentRepository {
       this.database.exec(`CREATE UNIQUE INDEX IF NOT EXISTS one_running_experiment
         ON experiments ((status = 'running'))
         WHERE status = 'running'`);
-      this.database.exec("PRAGMA user_version = 2");
+      if (version.user_version < 2) this.database.exec("PRAGMA user_version = 2");
       this.database.exec("COMMIT");
     } catch (error) {
       this.database.exec("ROLLBACK");

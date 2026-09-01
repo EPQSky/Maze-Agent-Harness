@@ -53,6 +53,75 @@ async function createExperiment(server: ReturnType<typeof createArenaServer>, na
 }
 
 describe("实验工作台 API", () => {
+  it("后台分批提交比赛事件，轮询可观察真实缓冲且不等待动画", async () => {
+    const server = createArenaServer({
+      databasePath: ":memory:", harnessAdapter: new DeterministicFakeHarnessAdapter(),
+      matchBatchSize: 40, matchBatchDelayMs: 15,
+    });
+    servers.push(server);
+    const experiment = await createExperiment(server, "基线比赛实验");
+    const response = await server.inject({
+      method: "POST",
+      url: `/api/experiments/${experiment.id}/matches/baseline`,
+      payload: { seed: "api-seed" },
+    });
+
+    expect(response.statusCode).toBe(202);
+    const match = response.json<import("@maze-arena/contracts").ArenaMatch>();
+    expect(match).toMatchObject({ status: "running", committedEventCount: 0, score: null });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const firstPage = await server.inject({ method: "GET", url: `/api/matches/${match.id}/events?after=0&limit=256` });
+    const partial = firstPage.json<import("@maze-arena/contracts").MatchEventPage>();
+    expect(partial.match.committedEventCount).toBeGreaterThan(0);
+    expect(partial.match.committedEventCount).toBeLessThan(match.totalEventCount);
+    expect(partial.events[0]?.sequence).toBe(1);
+
+    let metadata = partial.match;
+    for (let attempt = 0; attempt < 60 && metadata.status !== "completed"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      metadata = (await server.inject({ method: "GET", url: `/api/matches/${match.id}` })).json();
+    }
+    expect(metadata).toMatchObject({ status: "completed", committedEventCount: match.totalEventCount, score: { solved: true } });
+  });
+
+  it.each(["paused", "completed", "failed", "cancelled"] as const)("%s 实验拒绝运行基线比赛", async (status) => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-terminal-match-"));
+    const databasePath = join(directory, "arena.sqlite");
+    const server = createTestServer(databasePath);
+    const experiment = await createExperiment(server, `${status} 实验`);
+    const database = new DatabaseSync(databasePath);
+    database.prepare("UPDATE experiments SET status = ? WHERE id = ?").run(status, experiment.id);
+    database.close();
+
+    const response = await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/matches/baseline`, payload: {} });
+    expect(response.statusCode).toBe(409);
+    expect(response.json<DomainErrorResponse>()).toEqual({
+      error: { code: "INVALID_EXPERIMENT_STATE", message: `实验当前状态 ${status} 不允许运行基线比赛` },
+    });
+  });
+
+  it("权威数据损坏时 API 返回稳定错误而不泄漏冲突事实", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-corrupt-api-"));
+    const databasePath = join(directory, "arena.sqlite");
+    const server = createArenaServer({
+      databasePath, harnessAdapter: new DeterministicFakeHarnessAdapter(), matchBatchDelayMs: 10_000,
+    });
+    servers.push(server);
+    const experiment = await createExperiment(server, "损坏读取实验");
+    const started = await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/matches/baseline`, payload: {} });
+    const match = started.json<import("@maze-arena/contracts").ArenaMatch>();
+    const database = new DatabaseSync(databasePath);
+    database.prepare("UPDATE matches SET protocol_version = 9 WHERE id = ?").run(match.id);
+    database.close();
+
+    const response = await server.inject({ method: "GET", url: `/api/matches/${match.id}` });
+    expect(response.statusCode).toBe(500);
+    expect(response.json<DomainErrorResponse>()).toEqual({
+      error: { code: "MATCH_DATA_CORRUPT", message: "比赛权威数据损坏：比赛元数据非法" },
+    });
+  });
+
   it("创建草稿并通过列表和详情读取公共实验字段", async () => {
     const server = createTestServer(":memory:");
 

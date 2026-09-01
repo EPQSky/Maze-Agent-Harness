@@ -10,6 +10,7 @@ import type {
 import { FlaskConical, LoaderCircle, Play, Plus, RefreshCw } from "lucide-react";
 import { type FormEvent, useCallback, useEffect, useState } from "react";
 import { arenaApi } from "./api";
+import { ArenaView } from "./ArenaView";
 
 const statusLabels: Record<ExperimentStatus, string> = {
   draft: "草稿",
@@ -292,10 +293,13 @@ export function App() {
                   <div className="profile-heading"><div><p className="eyebrow">模型配置档</p><h3>尚未配置</h3></div><span className="status">启动前必需</span></div>
                 )}
               </section>
-              <div className="arena-placeholder">
-                <div className="grid-preview" aria-hidden="true" />
-                <div><strong>竞技场待命</strong><p>实验配置将在后续切片中冻结并进入基线验收。</p></div>
-              </div>
+              <ArenaView
+                experimentId={selected.id}
+                canRun={selected.status === "draft" || selected.status === "running"}
+                runMatch={arenaApi.runBaselineMatch}
+                loadLatest={arenaApi.getLatestMatch}
+                loadEvents={arenaApi.getMatchEvents}
+              />
             </>
           ) : (
             <div className="detail-empty"><FlaskConical size={30} /><p>选择或创建实验以查看详情。</p></div>
