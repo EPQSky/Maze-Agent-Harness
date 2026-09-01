@@ -1,0 +1,15 @@
+default_permissions = "maze-agent-harness-git"
+
+[permissions.maze-agent-harness-git.filesystem]
+":root" = "read"
+":tmpdir" = "write"
+":slash_tmp" = "write"
+
+[permissions.maze-agent-harness-git.filesystem.":workspace_roots"]
+"." = "write"
+".git" = "write"
+".codex" = "read"
+".agents" = "read"
+
+[permissions.maze-agent-harness-git.network]
+enabled = true
