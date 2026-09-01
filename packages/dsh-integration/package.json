@@ -1,26 +1,25 @@
 {
-  "name": "@maze-arena/server",
+  "name": "@maze-arena/dsh-integration",
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    "./app": "./src/app.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "dev": "tsx watch src/index.ts",
-    "start": "node dist/index.js",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@maze-arena/contracts": "workspace:*",
-    "@maze-arena/dsh-integration": "workspace:*",
-    "fastify": "5.5.0"
+    "@maze-arena/contracts": "workspace:*"
   },
   "devDependencies": {
-    "@types/node": "22.18.0",
-    "tsx": "4.20.5",
     "typescript": "5.9.2",
     "vitest": "3.2.4"
   }

@@ -7,7 +7,7 @@
 
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; }
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 button { color: inherit; }
 
 .app-shell { min-height: 100vh; background: #0d1217; }
@@ -28,12 +28,18 @@ h2 { font-size: 24px; }
 .icon-button:hover { border-color: #5ac8a8; color: #5ac8a8; }
 .create-form { padding: 0 22px 20px; border-bottom: 1px solid #27313a; }
 .create-form label { display: block; margin-bottom: 8px; color: #aeb9bd; font-size: 12px; }
-.create-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
-input { min-width: 0; height: 40px; padding: 0 12px; color: #edf2f3; border: 1px solid #34414b; border-radius: 5px; outline: none; background: #0d1419; }
-input:focus { border-color: #5ac8a8; box-shadow: 0 0 0 2px rgb(90 200 168 / 12%); }
+.field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.field-grid label { min-width: 0; }
+.field-grid input, .field-grid select { width: 100%; margin-top: 6px; }
+.create-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+input, select { min-width: 0; height: 40px; padding: 0 12px; color: #edf2f3; border: 1px solid #34414b; border-radius: 5px; outline: none; background: #0d1419; }
+input:focus, select:focus { border-color: #5ac8a8; box-shadow: 0 0 0 2px rgb(90 200 168 / 12%); }
 .primary-button { min-height: 40px; padding: 0 14px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 0; border-radius: 5px; color: #091411; background: #5ac8a8; font-weight: 700; cursor: pointer; }
 .primary-button:hover { background: #72d6b8; }
 .primary-button:disabled { cursor: not-allowed; opacity: .45; }
+.secondary-button { min-height: 40px; padding: 0 12px; display: inline-flex; align-items: center; gap: 7px; border: 1px solid #34414b; border-radius: 5px; color: #cbd5d8; background: #182129; cursor: pointer; }
+.secondary-button:hover { border-color: #5ac8a8; color: #9debd3; }
+.secondary-button:disabled { cursor: not-allowed; opacity: .45; }
 .error-banner { margin: 14px 22px 0; padding: 10px 12px; border: 1px solid #78484d; border-radius: 5px; color: #ffc4c8; background: #2b191d; font-size: 13px; }
 .experiment-list { padding: 10px; }
 .experiment-row { width: 100%; min-height: 74px; padding: 12px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; text-align: left; border: 1px solid transparent; border-radius: 6px; background: transparent; cursor: pointer; }
@@ -54,6 +60,13 @@ input:focus { border-color: #5ac8a8; box-shadow: 0 0 0 2px rgb(90 200 168 / 12%)
 .facts dt { margin-bottom: 8px; color: #718087; font-size: 11px; font-weight: 700; }
 .facts dd { margin: 0; min-width: 0; color: #cbd5d8; font-size: 13px; overflow-wrap: anywhere; }
 .mono { font-family: "SFMono-Regular", Consolas, monospace; }
+.model-profile { padding: 22px 0; border-bottom: 1px solid #27313a; }
+.profile-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.profile-heading h3 { margin: 0; font-size: 16px; letter-spacing: 0; }
+.profile-grid { margin: 18px 0 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.profile-grid div { min-width: 0; }
+.profile-grid dt { margin-bottom: 5px; color: #718087; font-size: 11px; font-weight: 700; }
+.profile-grid dd { margin: 0; color: #cbd5d8; font-size: 12px; overflow-wrap: anywhere; }
 .arena-placeholder { min-height: 320px; display: flex; align-items: center; justify-content: center; gap: 24px; color: #8d9ba0; }
 .arena-placeholder strong { display: block; margin-bottom: 7px; color: #dce4e8; }
 .arena-placeholder p { margin: 0; max-width: 430px; font-size: 13px; line-height: 1.6; }
@@ -68,6 +81,7 @@ input:focus { border-color: #5ac8a8; box-shadow: 0 0 0 2px rgb(90 200 168 / 12%)
   .experiment-panel { border-right: 0; border-bottom: 1px solid #27313a; }
   .detail-panel { padding: 24px 18px; }
   .facts { grid-template-columns: 1fr; gap: 16px; }
+  .field-grid, .profile-grid { grid-template-columns: 1fr; }
   .facts div, .facts div:first-child { padding: 0; border: 0; }
   .arena-placeholder { min-height: 220px; align-items: flex-start; padding-top: 38px; }
 }

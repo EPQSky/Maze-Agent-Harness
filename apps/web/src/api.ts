@@ -3,6 +3,8 @@ import type {
   DomainErrorResponse,
   Experiment,
   ExperimentListResponse,
+  HarnessCatalogResponse,
+  ModelProfileInput,
 } from "@maze-arena/contracts";
 
 async function request<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
@@ -16,6 +18,10 @@ async function request<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
 }
 
 export const arenaApi = {
+  getHarnessCatalog(): Promise<HarnessCatalogResponse> {
+    return request<HarnessCatalogResponse>("/api/harness/models");
+  },
+
   async listExperiments(): Promise<Experiment[]> {
     const response = await request<ExperimentListResponse>("/api/experiments");
     return response.experiments;
@@ -26,6 +32,14 @@ export const arenaApi = {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
+    });
+  },
+
+  updateModelProfile(id: string, modelProfile: ModelProfileInput): Promise<Experiment> {
+    return request<Experiment>(`/api/experiments/${id}/model-profile`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ modelProfile }),
     });
   },
 
