@@ -43,7 +43,7 @@ pnpm arena doctor
 
 ## Harness 模型导出
 
-Server 启动前必须设置 `DSH_HARNESS_EXPORT_PATH` 和精确的 `DSH_HARNESS_VERSION`。导出文件由外部 Harness 配置流程只读生成，顶层结构固定为：
+先运行 `maze-arena models sync`，再让 Server 通过 `ARENA_MODEL_CATALOG_PATH` 读取同步目录中的 `current/catalog.json`，并设置精确的 `DSH_HARNESS_VERSION`。目录由锁定的 Harness 显式导出并原子发布，顶层结构固定为：
 
 ```json
 {

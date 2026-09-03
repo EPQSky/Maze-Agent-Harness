@@ -55,7 +55,6 @@ describe("实验工作台端到端持久化", () => {
     const firstRender = render(<App />);
     await screen.findByText("尚无实验，请先创建一个草稿。");
     await user.type(screen.getByLabelText("新实验名称"), "贯通链路实验");
-    await user.type(screen.getByLabelText("凭据引用"), "dsh-credential://basic");
     await user.click(screen.getByRole("button", { name: "创建" }));
 
     expect(await screen.findByRole("heading", { name: "贯通链路实验" })).toBeInTheDocument();
@@ -98,7 +97,6 @@ describe("实验工作台端到端持久化", () => {
     expect(screen.getByRole("heading", { name: "尚未配置" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "启动实验" })).not.toBeInTheDocument();
 
-    await user.type(screen.getByLabelText("凭据引用"), "dsh-credential://basic");
     await user.click(screen.getByRole("button", { name: "保存到当前草稿" }));
     expect(await screen.findByText("确定性基础提供方 / Compact V1")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "执行验收" }));

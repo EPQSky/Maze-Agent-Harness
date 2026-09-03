@@ -1,4 +1,4 @@
-import { chmodSync, cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -69,6 +69,7 @@ function createFixture(overrides: Partial<Record<"node" | "pnpm" | "git" | "dock
   const bin = join(root, "bin");
   const harness = join(root, "deepseek-harness");
   const nodePrelude = join(root, "node-version.cjs");
+  const modelExport = join(root, "model-export.json");
   mkdirSync(home);
   mkdirSync(bin);
   mkdirSync(harness);
@@ -78,6 +79,21 @@ function createFixture(overrides: Partial<Record<"node" | "pnpm" | "git" | "dock
     cpSync(join(repositoryRoot, "packages", directory, "dist"), join(projectBackup, directory), { recursive: true });
   }
   writeFileSync(nodePrelude, 'Object.defineProperty(process, "version", { value: "v22.12.0" });\n');
+  writeFileSync(modelExport, `${JSON.stringify({
+    schemaVersion: 1,
+    harnessVersion: "dsh 2026.09.1",
+    credentialRefs: ["dsh-credential://vendor-a", "dsh-credential://vendor-b"],
+    providers: [
+      { id: "vendor-a", label: "Vendor A", models: [{ id: "compact", label: "Compact", capabilities: {
+        reasoningEfforts: [], temperature: { minimum: 0, maximum: 2 }, topP: { minimum: 0, maximum: 1 },
+        maxContextTokens: 8_000, maxOutputTokens: 2_000, maxTotalTokens: 10_000, providerOptions: {},
+      } }] },
+      { id: "vendor-b", label: "Vendor B", models: [{ id: "reasoner", label: "Reasoner", capabilities: {
+        reasoningEfforts: ["low", "medium", "high"], maxContextTokens: 16_000, maxOutputTokens: 4_000,
+        maxTotalTokens: 20_000, providerOptions: { thinkingBudget: { type: "number", minimum: 1_000, maximum: 8_000 } },
+      } }] },
+    ],
+  }, null, 2)}\n`);
 
   executable(join(bin, "node"), overrides.node ?? 'printf "v22.12.0\\n"');
   executable(join(bin, "pnpm"), overrides.pnpm ?? `
@@ -186,7 +202,14 @@ case "\${1:-}" in
   *) printf "unexpected docker command\\n" >&2; exit 1 ;;
 esac`);
   const dsh = join(bin, "dsh");
-  executable(dsh, overrides.dsh ?? 'printf "dsh 2026.09.1\\n"');
+  executable(dsh, overrides.dsh ?? `
+if [ "\${1:-}" = "--version" ]; then printf "dsh 2026.09.1\\n"; exit 0; fi
+if [ "\${1:-}" = "models" ] && [ "\${2:-}" = "export" ]; then
+  printf '%s\\n' "\${DSH_HOME:-}" > "${join(root, "model-export-home")}";
+  while IFS= read -r line; do printf '%s\\n' "$line"; done < "${modelExport}";
+  exit 0
+fi
+printf "unexpected dsh command\\n" >&2; exit 1`);
 
   return {
     root,
@@ -232,6 +255,10 @@ function buildImage(fixture: Fixture, immutableBaseImage = baseImage) {
   return run(fixture, ["image", "build", "--base-image", immutableBaseImage, "--image-name", "maze-arena/match-profile:local"]);
 }
 
+function syncModels(fixture: Fixture) {
+  return run(fixture, ["models", "sync"]);
+}
+
 function prepareBuiltImageFixture(): Fixture {
   const initialized = initializeRuntimeHarnessRepository(createFixture());
   const { fixture, commit } = initialized;
@@ -242,6 +269,166 @@ function prepareBuiltImageFixture(): Fixture {
 }
 
 describe("正式运行 CLI 黑盒边界", () => {
+  it("从锁定 Harness 显式导出并原子发布只读多提供方目录", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+
+    const result = syncModels(fixture);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("模型目录已同步：2 个提供方，2 个模型");
+    const catalogPath = join(fixture.root, "data/maze-arena/models/current/catalog.json");
+    const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
+    expect(catalog).toMatchObject({
+      schemaVersion: 1,
+      harnessVersion: "dsh 2026.09.1",
+      credentialRefs: ["dsh-credential://vendor-a", "dsh-credential://vendor-b"],
+      providers: [{ id: "vendor-a" }, { id: "vendor-b" }],
+    });
+    expect(statSync(dirname(catalogPath)).mode & 0o777).toBe(0o500);
+    expect(statSync(catalogPath).mode & 0o777).toBe(0o400);
+    expect(readFileSync(join(fixture.root, "model-export-home"), "utf8").trim())
+      .toBe(join(fixture.root, "data/maze-arena/harness"));
+
+    const exportPath = join(fixture.root, "model-export.json");
+    const replacement = JSON.parse(readFileSync(exportPath, "utf8"));
+    replacement.providers[0].label = "Vendor A Updated";
+    writeFileSync(exportPath, `${JSON.stringify(replacement)}\n`);
+    expect(syncModels(fixture).status).toBe(0);
+    expect(JSON.parse(readFileSync(catalogPath, "utf8")).providers[0].label).toBe("Vendor A Updated");
+    expect(readdirSync(join(fixture.root, "data/maze-arena/models/releases"))).toHaveLength(2);
+  });
+
+  it.each([
+    ["release 权限变为 0700", (release: string) => chmodSync(release, 0o700)],
+    ["catalog 权限变为 0600", (release: string) => chmodSync(join(release, "catalog.json"), 0o600)],
+  ] as const)("models sync 拒绝复用%s并保持旧 current", (_label, mutate) => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    expect(syncModels(fixture).status).toBe(0);
+    const catalogPath = join(fixture.root, "data/maze-arena/models/current/catalog.json");
+    const release = realpathSync(dirname(catalogPath));
+    const before = readFileSync(catalogPath, "utf8");
+    mutate(release);
+
+    const result = syncModels(fixture);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("不可变发布约束");
+    expect(realpathSync(dirname(catalogPath))).toBe(release);
+    expect(readFileSync(catalogPath, "utf8")).toBe(before);
+  });
+
+  it("models sync 拒绝复用指向同内容文件的 catalog 符号链接并保持旧 current", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    expect(syncModels(fixture).status).toBe(0);
+    const catalogPath = join(fixture.root, "data/maze-arena/models/current/catalog.json");
+    const release = realpathSync(dirname(catalogPath));
+    const releaseCatalog = join(release, "catalog.json");
+    const before = readFileSync(releaseCatalog, "utf8");
+    const replacement = join(fixture.root, "same-catalog.json");
+    writeFileSync(replacement, before, { mode: 0o400 });
+    chmodSync(release, 0o700);
+    rmSync(releaseCatalog);
+    symlinkSync(replacement, releaseCatalog, "file");
+    chmodSync(release, 0o500);
+
+    const result = syncModels(fixture);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("不可变发布约束");
+    expect(realpathSync(dirname(catalogPath))).toBe(release);
+    expect(lstatSync(releaseCatalog).isSymbolicLink()).toBe(true);
+    expect(readFileSync(catalogPath, "utf8")).toBe(before);
+  });
+
+  it.each([
+    ["schema 版本", (value: any) => { value.schemaVersion = 2; }, /schemaVersion/],
+    ["Harness 版本", (value: any) => { value.harnessVersion = "dsh 2026.08.9"; }, /版本不匹配/],
+    ["未知字段", (value: any) => { value.providers[0].models[0].capabilities.extra = true; }, /未知字段/],
+    ["非法能力", (value: any) => { value.providers[0].models[0].capabilities.maxTotalTokens = 1; }, /模型能力无效/],
+    ["非法凭据引用", (value: any) => { value.credentialRefs = ["plain-secret"]; }, /credentialRefs 无效/],
+  ])("models sync 拒绝%s并保留旧目录", (_label, mutate, expected) => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    expect(syncModels(fixture).status).toBe(0);
+    const catalogPath = join(fixture.root, "data/maze-arena/models/current/catalog.json");
+    const before = readFileSync(catalogPath, "utf8");
+    const exportPath = join(fixture.root, "model-export.json");
+    const invalid = JSON.parse(readFileSync(exportPath, "utf8"));
+    mutate(invalid);
+    writeFileSync(exportPath, `${JSON.stringify(invalid)}\n`);
+
+    const result = syncModels(fixture);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(expected);
+    expect(readFileSync(catalogPath, "utf8")).toBe(before);
+  });
+
+  it("失败时不把 Harness 原始秘密写入目录或命令输出", () => {
+    const secret = "sk-live-ticket03-never-persist";
+    const fixture = createFixture({ dsh: `
+if [ "\${1:-}" = "--version" ]; then printf "dsh 2026.09.1\\n"; exit 0; fi
+printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
+    expect(install(fixture).status).toBe(0);
+
+    const result = syncModels(fixture);
+
+    expect(result.status).toBe(1);
+    expect(`${result.stdout}${result.stderr}`).not.toContain(secret);
+    const modelsRoot = join(fixture.root, "data/maze-arena/models");
+    const stored = readdirSync(modelsRoot, { recursive: true })
+      .map((entry) => join(modelsRoot, String(entry)))
+      .filter((path) => existsSync(path) && statSync(path).isFile())
+      .map((path) => readFileSync(path, "utf8")).join("\n");
+    expect(stored).not.toContain(secret);
+  });
+
+  it("疑似秘密出现在导出自由文本时拒绝发布且不进入目录或输出", () => {
+    const secret = "sk-live-catalog-secret-123456";
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    expect(syncModels(fixture).status).toBe(0);
+    const catalogPath = join(fixture.root, "data/maze-arena/models/current/catalog.json");
+    const before = readFileSync(catalogPath, "utf8");
+    const exportPath = join(fixture.root, "model-export.json");
+    const invalid = JSON.parse(readFileSync(exportPath, "utf8"));
+    invalid.providers[0].label = `Vendor ${secret}`;
+    writeFileSync(exportPath, `${JSON.stringify(invalid)}\n`);
+
+    const result = syncModels(fixture);
+
+    expect(result.status).toBe(1);
+    expect(`${result.stdout}${result.stderr}`).not.toContain(secret);
+    expect(readFileSync(catalogPath, "utf8")).toBe(before);
+    const stored = readdirSync(join(fixture.root, "data/maze-arena/models"), { recursive: true })
+      .map((entry) => join(fixture.root, "data/maze-arena/models", String(entry)))
+      .filter((path) => existsSync(path) && statSync(path).isFile())
+      .map((path) => readFileSync(path, "utf8")).join("\n");
+    expect(stored).not.toContain(secret);
+  });
+
+  it("敏感裸字段名出现在 providerOptions 时拒绝发布且不暴露能力", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    expect(syncModels(fixture).status).toBe(0);
+    const catalogPath = join(fixture.root, "data/maze-arena/models/current/catalog.json");
+    const before = readFileSync(catalogPath, "utf8");
+    const exportPath = join(fixture.root, "model-export.json");
+    const invalid = JSON.parse(readFileSync(exportPath, "utf8"));
+    invalid.providers[0].models[0].capabilities.providerOptions.apiKey = { type: "string" };
+    writeFileSync(exportPath, `${JSON.stringify(invalid)}\n`);
+
+    const result = syncModels(fixture);
+
+    expect(result.status).toBe(1);
+    expect(`${result.stdout}${result.stderr}`).not.toContain("apiKey");
+    expect(readFileSync(catalogPath, "utf8")).toBe(before);
+    expect(readFileSync(catalogPath, "utf8")).not.toContain("apiKey");
+  });
+
   it("安装到标准用户目录，以 0700 权限保存无秘密身份清单", () => {
     const fixture = createFixture();
     const result = install(fixture);

@@ -9,7 +9,7 @@ import type {
   SolverResponse,
 } from "@maze-arena/contracts";
 import type { BaselineValidationAdapter, BaselineValidationStep } from "@maze-arena/control-plane";
-import type { HarnessAdapter } from "@maze-arena/dsh-integration";
+import { validateModelProfileSnapshot, type HarnessAdapter } from "@maze-arena/dsh-integration";
 import {
   evaluateGeneratorPair,
   evaluateSolverPair,
@@ -58,9 +58,13 @@ export function createRealBaselineValidationAdapter(options: BaselineAdapterOpti
     switch (step) {
       case "model-config": {
         if (!options.experiment.modelProfile) throw new Error("模型配置档缺失");
+        if (options.experiment.modelProfile.catalogIdentity && options.experiment.modelProfile.catalogCapabilities) {
+          validateModelProfileSnapshot(options.experiment.modelProfile);
+          return passed(step, "模型配置档已按实验创建时的目录能力快照验证");
+        }
         const { providerLabel: _providerLabel, modelLabel: _modelLabel, ...input } = options.experiment.modelProfile;
         options.harnessAdapter.validateModelProfile(input);
-        return passed(step, "模型配置档已按当前 Harness 能力重新验证");
+        return passed(step, "旧模型配置档已按当前 Harness 能力重新验证");
       }
       case "native-plugin-install": {
         const [generator, solver] = await Promise.all([

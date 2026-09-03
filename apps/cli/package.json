@@ -12,6 +12,9 @@
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
+  "dependencies": {
+    "@maze-arena/dsh-integration": "workspace:*"
+  },
   "devDependencies": {
     "@types/node": "22.18.0",
     "typescript": "5.9.2",

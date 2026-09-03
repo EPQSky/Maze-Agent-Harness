@@ -1,11 +1,12 @@
-import type {
-  Experiment,
-  ExperimentStatus,
-  HarnessCatalogResponse,
-  HarnessModel,
-  ModelProfileInput,
-  ProviderOptionValue,
-  ReasoningEffort,
+import {
+  isSensitiveProviderOptionName,
+  type Experiment,
+  type ExperimentStatus,
+  type HarnessCatalogResponse,
+  type HarnessModel,
+  type ModelProfileInput,
+  type ProviderOptionValue,
+  type ReasoningEffort,
 } from "@maze-arena/contracts";
 import { FlaskConical, LoaderCircle, Plus, RefreshCw } from "lucide-react";
 import { type FormEvent, useCallback, useEffect, useState } from "react";
@@ -22,11 +23,16 @@ const statusLabels: Record<ExperimentStatus, string> = {
   cancelled: "已取消",
 };
 
+function safeProviderOptions(model: HarnessModel | undefined) {
+  return Object.entries(model?.capabilities.providerOptions ?? {})
+    .filter(([key]) => !isSensitiveProviderOptionName(key));
+}
+
 export function App() {
   const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
   const [name, setName] = useState("");
-  const [catalog, setCatalog] = useState<HarnessCatalogResponse>({ providers: [] });
+  const [catalog, setCatalog] = useState<HarnessCatalogResponse>({ credentialRefs: [], providers: [] });
   const [providerId, setProviderId] = useState("");
   const [modelId, setModelId] = useState("");
   const [credentialRef, setCredentialRef] = useState("");
@@ -58,6 +64,7 @@ export function App() {
       const firstModel = firstProvider?.models[0];
       setProviderId(firstProvider?.id ?? "");
       setModelId(firstModel?.id ?? "");
+      setCredentialRef(nextCatalog.credentialRefs[0] ?? "");
       resetModelFields(firstModel);
       setSelectedId((current) => current ?? next[0]?.id);
     } catch (reason) {
@@ -123,7 +130,7 @@ export function App() {
     if (selectedModel?.capabilities.temperature) modelProfile.temperature = Number(temperature);
     if (selectedModel?.capabilities.topP) modelProfile.topP = Number(topP);
     const parsedProviderOptions: Record<string, ProviderOptionValue> = {};
-    for (const [key, capability] of Object.entries(selectedModel?.capabilities.providerOptions ?? {})) {
+    for (const [key, capability] of safeProviderOptions(selectedModel)) {
       const value = providerOptions[key] ?? "";
       parsedProviderOptions[key] = capability.type === "number" ? Number(value)
         : capability.type === "boolean" ? value === "true"
@@ -141,7 +148,7 @@ export function App() {
     setContextTokens(String(Math.min(4_000, model.capabilities.maxContextTokens)));
     setOutputTokens(String(Math.min(1_000, model.capabilities.maxOutputTokens)));
     setTotalTokenLimit(String(Math.min(5_000, model.capabilities.maxTotalTokens)));
-    setProviderOptions(Object.fromEntries(Object.entries(model.capabilities.providerOptions).map(([key, capability]) => [
+    setProviderOptions(Object.fromEntries(safeProviderOptions(model).map(([key, capability]) => [
       key,
       capability.type === "boolean" ? "false" : capability.type === "number" ? String(capability.minimum ?? 0) : "",
     ])));
@@ -196,7 +203,10 @@ export function App() {
               <label>模型<select aria-label="模型" value={modelId} onChange={(event) => changeModel(event.target.value)}>
                 {selectedProvider?.models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
               </select></label>
-              <label>凭据引用<input aria-label="凭据引用" placeholder="例如：dsh-credential://deepseek-main" value={credentialRef} onChange={(event) => setCredentialRef(event.target.value)} /></label>
+              <label>凭据引用<select aria-label="凭据引用" value={credentialRef} onChange={(event) => setCredentialRef(event.target.value)}>
+                <option value="" disabled>选择 Harness 凭据引用</option>
+                {catalog.credentialRefs.map((reference) => <option key={reference} value={reference}>{reference}</option>)}
+              </select></label>
               {selectedModel?.capabilities.reasoningEfforts.length ? (
                 <label>推理强度<select aria-label="推理强度" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}>
                   {selectedModel.capabilities.reasoningEfforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
@@ -208,7 +218,7 @@ export function App() {
               <label>输出令牌<input aria-label="输出令牌" type="number" value={outputTokens} onChange={(event) => setOutputTokens(event.target.value)} /></label>
               <label>总令牌上限<input aria-label="总令牌上限" type="number" value={totalTokenLimit} onChange={(event) => setTotalTokenLimit(event.target.value)} /></label>
               <label>成本上限（可选）<input aria-label="成本上限" type="number" min="0.01" step="0.01" value={costLimit} onChange={(event) => setCostLimit(event.target.value)} /></label>
-              {Object.entries(selectedModel?.capabilities.providerOptions ?? {}).map(([option, capability]) => (
+              {safeProviderOptions(selectedModel).map(([option, capability]) => (
                 <label key={option}>{option}{capability.type === "boolean" ? (
                   <select aria-label={option} value={providerOptions[option] ?? "false"} onChange={(event) => setProviderOptions((current) => ({ ...current, [option]: event.target.value }))}>
                     <option value="false">false</option><option value="true">true</option>
@@ -312,6 +322,12 @@ export function App() {
 
 export function toModelProfileInput(profile: Experiment["modelProfile"]): ModelProfileInput | null {
   if (!profile) return null;
-  const { providerLabel: _providerLabel, modelLabel: _modelLabel, ...input } = profile;
+  const {
+    providerLabel: _providerLabel,
+    modelLabel: _modelLabel,
+    catalogIdentity: _catalogIdentity,
+    catalogCapabilities: _catalogCapabilities,
+    ...input
+  } = profile;
   return input;
 }

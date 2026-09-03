@@ -32,7 +32,7 @@ async function mockApi(page: Page) {
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     const body = path === "/api/experiments" ? { experiments: [experiment] }
-      : path === "/api/harness/models" ? { providers: [] }
+      : path === "/api/harness/models" ? { credentialRefs: [], providers: [] }
       : path.endsWith("/baseline-validation") ? { experimentId: experiment.id, status: "ready", steps: [], operatorConfirmed: true, frozenConfiguration: {}, frozenDigest: "digest", smoke: { attempted: false, passed: null } }
       : path.endsWith("/runtime") ? runtime
       : path.endsWith("/audit-events") ? { events: [{ id: 1, experimentId: experiment.id, type: "harness.activity", occurredAt: "2026-09-02T12:00:01.000Z", details: { reasoning: "实际提供方返回", toolActivity: "read,test" } }], nextId: 1 }
@@ -128,7 +128,7 @@ test("直播 WebSocket 失败后从权威 HTTP 事件记录补齐", async ({ pag
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     const body = path === "/api/experiments" ? { experiments: [experiment] }
-      : path === "/api/harness/models" ? { providers: [] }
+      : path === "/api/harness/models" ? { credentialRefs: [], providers: [] }
       : path.endsWith("/baseline-validation") ? { experimentId: experiment.id, status: "ready", steps: [], operatorConfirmed: true, frozenConfiguration: {}, frozenDigest: "digest", smoke: { attempted: false, passed: null } }
       : path.endsWith("/runtime") ? runtime
       : path.endsWith("/audit-events") ? { events: [], nextId: 0 }

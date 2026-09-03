@@ -10,18 +10,19 @@ const DEFAULT_EVOLUTION_TIMEOUT_MS = 120_000;
 const MAX_PROCESS_OUTPUT_BYTES = 1024 * 1024;
 
 export function createProductionHarnessAdapter(environment: NodeJS.ProcessEnv): HarnessAdapter {
-  const exportPath = environment.DSH_HARNESS_EXPORT_PATH;
+  const catalogPath = environment.ARENA_MODEL_CATALOG_PATH;
   const harnessVersion = environment.DSH_HARNESS_VERSION;
   const evolutionCommand = environment.DSH_EVOLUTION_COMMAND;
   const smokeCommand = environment.DSH_SMOKE_COMMAND;
-  if (!exportPath || !harnessVersion || !evolutionCommand || !smokeCommand) {
-    throw new HarnessConfigurationError("生产启动必须配置 DSH_HARNESS_EXPORT_PATH、DSH_HARNESS_VERSION、DSH_EVOLUTION_COMMAND 与 DSH_SMOKE_COMMAND");
+  if (!catalogPath || !harnessVersion || !evolutionCommand || !smokeCommand) {
+    throw new HarnessConfigurationError("生产启动必须配置 ARENA_MODEL_CATALOG_PATH、DSH_HARNESS_VERSION、DSH_EVOLUTION_COMMAND 与 DSH_SMOKE_COMMAND");
   }
   const timeoutMs = parseTimeout(environment.DSH_EVOLUTION_TIMEOUT_MS);
-  const config = ExportedHarnessConfigAdapter.fromFile(resolve(exportPath), harnessVersion);
+  const resolvedCatalogPath = resolve(catalogPath);
+  const currentConfig = () => ExportedHarnessConfigAdapter.fromFile(resolvedCatalogPath, harnessVersion);
   return {
-    listModels: () => config.listModels(),
-    validateModelProfile: (input) => config.validateModelProfile(input),
+    listModels: () => currentConfig().listModels(),
+    validateModelProfile: (input) => currentConfig().validateModelProfile(input),
     smokeModel: (profile) => runSmokeCommand(resolve(smokeCommand), profile, timeoutMs),
     evolvePlugin: (request) => runEvolutionCommand(resolve(evolutionCommand), request, timeoutMs),
   };

@@ -9,6 +9,10 @@ importers:
   .: {}
 
   apps/cli:
+    dependencies:
+      '@maze-arena/dsh-integration':
+        specifier: workspace:*
+        version: link:../../packages/dsh-integration
     devDependencies:
       '@types/node':
         specifier: 22.18.0

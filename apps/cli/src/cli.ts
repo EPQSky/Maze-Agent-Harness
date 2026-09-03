@@ -4,6 +4,7 @@ import {
   chmodSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -12,12 +13,14 @@ import {
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { parseHarnessModelCatalog } from "@maze-arena/dsh-integration";
 
 const requirements = {
   node: { minimum: "22.12.0", maximumExclusive: "23.0.0" },
@@ -132,6 +135,7 @@ function runtimePaths(environment: NodeJS.ProcessEnv): RuntimePaths {
       configRoot,
       dataRoot,
       join(dataRoot, "harness"),
+      join(dataRoot, "models"),
       join(dataRoot, "lineages"),
       join(dataRoot, "lineages/generator"),
       join(dataRoot, "lineages/solver"),
@@ -365,6 +369,91 @@ function atomicWriteManifest(path: string, manifest: InstallManifest): void {
   chmodSync(temporary, 0o600);
   renameSync(temporary, path);
   chmodSync(path, 0o600);
+}
+
+function runHarnessModelExport(executable: string, environment: NodeJS.ProcessEnv, harnessHome: string): string {
+  const result = spawnSync(executable, ["models", "export", "--schema-version", "1", "--format", "json"], {
+    encoding: "utf8",
+    shell: false,
+    timeout: 30_000,
+    maxBuffer: 1024 * 1024,
+    env: { ...environment, DSH_HOME: harnessHome },
+  });
+  if (result.error) throw new CliError(`Harness 模型导出无法执行：${result.error.message}`);
+  // Harness 错误可能夹带提供方秘密，管理命令只报告稳定诊断，不转发原始输出。
+  if (result.status !== 0) throw new CliError(`Harness 模型导出失败（退出码 ${result.status ?? "未知"}）`);
+  return result.stdout;
+}
+
+function validateExistingModelRelease(release: string, serialized: string): void {
+  try {
+    const releaseStat = lstatSync(release);
+    if (releaseStat.isSymbolicLink() || !releaseStat.isDirectory() || (releaseStat.mode & 0o777) !== 0o500) {
+      throw new Error("invalid release");
+    }
+    const catalogPath = join(release, "catalog.json");
+    const catalogStat = lstatSync(catalogPath);
+    if (catalogStat.isSymbolicLink() || !catalogStat.isFile() || (catalogStat.mode & 0o777) !== 0o400
+      || readFileSync(catalogPath, "utf8") !== serialized) {
+      throw new Error("invalid catalog");
+    }
+  } catch {
+    throw new CliError("已存在的同摘要模型目录不满足不可变发布约束，拒绝发布");
+  }
+}
+
+function syncHarnessModels(environment: NodeJS.ProcessEnv): void {
+  const paths = runtimePaths(environment);
+  const manifest = readManifest(paths);
+  validateDirectoryPermissions(paths);
+  const sourceDirectory = resolveDirectory(manifest.harness.sourceDirectory, "Harness 源码目录");
+  if (currentHarnessCommit(sourceDirectory) !== manifest.harness.commit) throw new CliError("Harness 源码提交已漂移，拒绝同步模型目录");
+  validateCleanHarnessWorktree(sourceDirectory);
+  const executable = resolveFile(manifest.harness.executable.path, "dsh 可执行文件");
+  if (sha256(executable) !== manifest.harness.executable.sha256) throw new CliError("dsh 可执行文件内容已漂移，拒绝同步模型目录");
+  if (run(executable, ["--version"]) !== manifest.harness.executable.version) throw new CliError("dsh 精确版本已漂移，拒绝同步模型目录");
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(runHarnessModelExport(executable, environment, join(paths.dataRoot, "harness")));
+  } catch (error) {
+    if (error instanceof CliError) throw error;
+    throw new CliError("Harness 模型导出不是有效 JSON");
+  }
+  const catalog = parseHarnessModelCatalog(raw, manifest.harness.executable.version);
+  const serialized = `${JSON.stringify(catalog, null, 2)}\n`;
+  const releaseId = createHash("sha256").update(serialized).digest("hex");
+  const modelsRoot = join(paths.dataRoot, "models");
+  const releasesRoot = join(modelsRoot, "releases");
+  const release = join(releasesRoot, releaseId);
+  mkdirSync(releasesRoot, { recursive: true, mode: 0o700 });
+  chmodSync(releasesRoot, 0o700);
+  if (lstatSync(release, { throwIfNoEntry: false })) {
+    validateExistingModelRelease(release, serialized);
+  } else {
+    const staging = mkdtempSync(join(modelsRoot, ".sync-"));
+    try {
+      const catalogPath = join(staging, "catalog.json");
+      writeFileSync(catalogPath, serialized, { mode: 0o400, flag: "wx" });
+      chmodSync(catalogPath, 0o400);
+      renameSync(staging, release);
+      chmodSync(release, 0o500);
+    } finally {
+      if (existsSync(staging)) {
+        chmodSync(staging, 0o700);
+        rmSync(staging, { recursive: true, force: true });
+      }
+    }
+  }
+  const nextLink = join(modelsRoot, `.current.${process.pid}`);
+  try {
+    symlinkSync(join("releases", releaseId), nextLink, "dir");
+    renameSync(nextLink, join(modelsRoot, "current"));
+  } finally {
+    rmSync(nextLink, { force: true });
+  }
+  process.stdout.write(`模型目录已同步：${catalog.providers.length} 个提供方，${catalog.providers.reduce((sum, provider) => sum + provider.models.length, 0)} 个模型\n`);
+  process.stdout.write(`只读目录：${join(modelsRoot, "current", "catalog.json")}\n`);
 }
 
 function parseInstallOptions(args: string[]): Record<string, string> {
@@ -705,13 +794,14 @@ function doctor(environment: NodeJS.ProcessEnv): void {
 }
 
 function usage(): never {
-  throw new CliError("用法：maze-arena <install|image build|doctor> [参数]");
+  throw new CliError("用法：maze-arena <install|image build|models sync|doctor> [参数]");
 }
 
 function main(args: string[], environment: NodeJS.ProcessEnv): void {
   const [command, ...rest] = args;
   if (command === "install") return install(rest, environment);
   if (command === "image" && rest[0] === "build") return buildMatchProfileImage(rest.slice(1), environment);
+  if (command === "models" && rest[0] === "sync" && rest.length === 1) return syncHarnessModels(environment);
   if (command === "doctor" && rest.length === 0) return doctor(environment);
   return usage();
 }

@@ -32,7 +32,7 @@ describe("实验工作台", () => {
     };
     vi.stubGlobal("fetch", vi.fn<typeof fetch>()
       .mockResolvedValueOnce(new Response(JSON.stringify({ experiments: [completed] } satisfies ExperimentListResponse)))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ providers: [] } satisfies HarnessCatalogResponse)))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ credentialRefs: [], providers: [] } satisfies HarnessCatalogResponse)))
       .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: "MATCH_NOT_FOUND", message: "无历史" } }), { status: 404 })));
 
     render(<App />);
@@ -74,7 +74,7 @@ describe("实验工作台", () => {
         solver: { home: "/h/n/s/home", workspace: "/h/n/s/workspace" },
       },
     };
-    const catalog: HarnessCatalogResponse = { providers: [
+    const catalog: HarnessCatalogResponse = { credentialRefs: ["dsh-credential://basic", "dsh-credential://reasoning"], providers: [
       {
         id: "custom-basic", label: "确定性基础提供方", models: [{ id: "custom-compact", label: "Compact V1", capabilities: {
           reasoningEfforts: [], temperature: { minimum: 0, maximum: 2 }, topP: { minimum: 0, maximum: 1 },
@@ -108,7 +108,7 @@ describe("实验工作台", () => {
 
     await user.type(screen.getByLabelText("新实验名称"), "新的实验");
     await user.selectOptions(screen.getByLabelText("模型提供方"), "custom-reasoning");
-    await user.type(screen.getByLabelText("凭据引用"), "dsh-credential://reasoning");
+    await user.selectOptions(screen.getByLabelText("凭据引用"), "dsh-credential://reasoning");
     await user.type(screen.getByLabelText("成本上限"), "1.25");
     await user.selectOptions(screen.getByLabelText("推理强度"), "high");
     await user.click(screen.getByRole("button", { name: "创建" }));
@@ -125,7 +125,7 @@ describe("实验工作台", () => {
   });
 
   it("从仅有自定义 ID 的目录初始化首个模型并直接提交该配置", async () => {
-    const catalog: HarnessCatalogResponse = { providers: [{
+    const catalog: HarnessCatalogResponse = { credentialRefs: ["dsh-credential://vendor"], providers: [{
       id: "vendor-only",
       label: "Vendor Only",
       models: [{
@@ -172,7 +172,6 @@ describe("实验工作台", () => {
     expect(await screen.findByRole("option", { name: "Vendor Only" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Model Only" })).toBeInTheDocument();
     await user.type(screen.getByLabelText("新实验名称"), "自定义目录实验");
-    await user.type(screen.getByLabelText("凭据引用"), "dsh-credential://vendor");
     await user.click(screen.getByRole("button", { name: "创建" }));
 
     await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => url === "/api/experiments" && init?.method === "POST")).toBe(true));
@@ -187,5 +186,42 @@ describe("实验工作台", () => {
         totalTokenLimit: 5_000,
       },
     });
+  });
+
+  it("不展示或提交目录中的敏感 provider option", async () => {
+    const catalog: HarnessCatalogResponse = { credentialRefs: ["dsh-credential://vendor"], providers: [{
+      id: "vendor", label: "Vendor", models: [{ id: "model", label: "Model", capabilities: {
+        reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000,
+        providerOptions: Object.fromEntries([
+          ...["apiKey", "oauthToken", "sessionToken", "accessTokenValue", "bearerToken", "authorization",
+            "authHeader", "privateKey", "clientKey", "signingKey", "clientSecret", "password", "credential"]
+            .map((key) => [key, { type: "string" }] as const),
+          ["safeMode", { type: "boolean" }],
+          ...["tokenBudget", "maxTokens", "maxContextTokens", "maxOutputTokens", "maxTotalTokens"]
+            .map((key) => [key, { type: "number", minimum: 1, maximum: 10 }] as const),
+        ]),
+      } }],
+    }] };
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = input.toString();
+      if (url === "/api/experiments") {
+        if (init?.method === "POST") return new Response(JSON.stringify({}), { status: 500 });
+        return new Response(JSON.stringify({ experiments: [] } satisfies ExperimentListResponse));
+      }
+      if (url === "/api/harness/models") return new Response(JSON.stringify(catalog));
+      return new Response(JSON.stringify({ error: { code: "MATCH_NOT_FOUND", message: "无历史" } }), { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+
+    expect(await screen.findByLabelText("safeMode")).toBeInTheDocument();
+    for (const key of ["tokenBudget", "maxTokens", "maxContextTokens", "maxOutputTokens", "maxTotalTokens"]) {
+      expect(screen.getByLabelText(key)).toBeInTheDocument();
+    }
+    for (const key of ["apiKey", "oauthToken", "sessionToken", "accessTokenValue", "bearerToken", "authorization",
+      "authHeader", "privateKey", "clientKey", "signingKey", "clientSecret", "password", "credential"]) {
+      expect(screen.queryByLabelText(key)).not.toBeInTheDocument();
+    }
   });
 });

@@ -1,4 +1,4 @@
-import { chmodSync, cpSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -184,7 +184,13 @@ describe("实验工作台 API", () => {
     await server.inject({ method: "POST", url: `/api/experiments/${source.id}/baseline-validation/run`, payload: {} });
     await server.inject({ method: "POST", url: `/api/experiments/${source.id}/baseline-validation/confirm`, payload: {} });
     const sourceRuntime = (await server.inject({ method: "GET", url: `/api/experiments/${source.id}/runtime` })).json<import("@maze-arena/contracts").ExperimentRuntimeSnapshot>();
-    const { providerLabel: _providerLabel, modelLabel: _modelLabel, ...modelProfile } = source.modelProfile!;
+    const {
+      providerLabel: _providerLabel,
+      modelLabel: _modelLabel,
+      catalogIdentity: _catalogIdentity,
+      catalogCapabilities: _catalogCapabilities,
+      ...modelProfile
+    } = source.modelProfile!;
     const cloned = await server.inject({
       method: "POST", url: `/api/experiments/${source.id}/comparison-clones`, payload: { name: "公平比较克隆", modelProfile, costLimit: 0.75 },
     });
@@ -494,7 +500,7 @@ describe("实验工作台 API", () => {
     const server = createTestServer(":memory:");
     const catalog = await server.inject({ method: "GET", url: "/api/harness/models" });
     expect(catalog.statusCode).toBe(200);
-    expect(catalog.json()).toMatchObject({ providers: [
+    expect(catalog.json()).toMatchObject({ credentialRefs: ["dsh-credential://basic", "dsh-credential://reasoning"], providers: [
       { id: "fake-basic", models: [{ id: "compact-v1", capabilities: { reasoningEfforts: [] } }] },
       { id: "fake-reasoning", models: [{ id: "reasoner-v1", capabilities: { reasoningEfforts: ["low", "medium", "high"] } }] },
     ] });
@@ -565,7 +571,7 @@ describe("实验工作台 API", () => {
     expect(detail.json<Experiment>().modelProfile?.reasoningEffort).toBe("medium");
   });
 
-  it("Harness 能力在草稿期变化时，启动前重新验证并关闭失败", async () => {
+  it("创建时冻结目录能力快照，后续目录删除不影响基线与启动", async () => {
     const delegate = new DeterministicFakeHarnessAdapter();
     let enabled = true;
     const server = createArenaServer({
@@ -583,20 +589,56 @@ describe("实验工作台 API", () => {
     });
     servers.push(server);
     const created = await createExperiment(server, "能力漂移实验");
+    expect(created.modelProfile).toMatchObject({
+      catalogIdentity: expect.stringMatching(/^sha256:/),
+      catalogCapabilities: { maxContextTokens: 8_000, maxOutputTokens: 2_000 },
+    });
+    enabled = false;
+
+    const edited = await server.inject({
+      method: "PUT",
+      url: `/api/experiments/${created.id}/model-profile`,
+      payload: { modelProfile: {
+        providerId: "fake-basic", modelId: "compact-v1", credentialRef: "dsh-credential://basic",
+        contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000,
+      } },
+    });
+    expect(edited.statusCode).toBe(400);
+
+    await validateAndConfirm(server, created.id);
+    const response = await server.inject({ method: "POST", url: `/api/experiments/${created.id}/start` });
+
+    expect(response.statusCode).toBe(200);
+    const detail = await server.inject({ method: "GET", url: `/api/experiments/${created.id}` });
+    expect(detail.json<Experiment>()).toMatchObject({ status: "running", modelProfile: created.modelProfile });
+  });
+
+  it("基线冻结后目录变化不改变实验模型配置且不阻止启动", async () => {
+    const delegate = new DeterministicFakeHarnessAdapter();
+    let enabled = true;
+    const server = createArenaServer({
+      databasePath: ":memory:",
+      matchRunner: deterministicMatchRunner,
+      harnessAdapter: {
+        listModels: () => enabled ? delegate.listModels() : { credentialRefs: [], providers: [] },
+        validateModelProfile: (input) => {
+          if (!enabled) throw new ModelProfileValidationError([{ path: "providerId", message: "目录已更新" }]);
+          return delegate.validateModelProfile(input);
+        },
+      },
+    });
+    servers.push(server);
+    const created = await createExperiment(server, "冻结目录实验");
+    await validateAndConfirm(server, created.id);
     enabled = false;
 
     const response = await server.inject({ method: "POST", url: `/api/experiments/${created.id}/start` });
 
-    expect(response.statusCode).toBe(400);
-    expect(response.json<DomainErrorResponse>()).toEqual({
-      error: {
-        code: "MODEL_PROFILE_INVALID",
-        message: "模型配置档无效",
-        issues: [{ path: "providerId", message: "提供方已停用" }],
-      },
+    expect(response.statusCode).toBe(200);
+    expect(response.json<Experiment>()).toMatchObject({
+      status: "running",
+      modelProfile: created.modelProfile,
     });
-    const detail = await server.inject({ method: "GET", url: `/api/experiments/${created.id}` });
-    expect(detail.json<Experiment>().status).toBe("draft");
   });
 
   it("服务关闭并重新打开后仍能从 SQLite 恢复实验", async () => {
@@ -708,18 +750,59 @@ describe("实验工作台 API", () => {
     }));
 
     const production = createProductionHarnessAdapter({
-      DSH_HARNESS_EXPORT_PATH: exportPath,
+      ARENA_MODEL_CATALOG_PATH: exportPath,
       DSH_HARNESS_VERSION: "2026.09-preview.1",
       DSH_EVOLUTION_COMMAND: "/bin/false",
       DSH_SMOKE_COMMAND: "/bin/false",
     });
     expect(production.listModels().providers.map(({ id }) => id)).toEqual(["configured-provider"]);
+    const updated = JSON.parse(readFileSync(exportPath, "utf8"));
+    updated.credentialRefs = ["dsh-credential://replacement"];
+    updated.providers[0].id = "replacement-provider";
+    writeFileSync(exportPath, JSON.stringify(updated));
+    expect(production.listModels()).toMatchObject({
+      credentialRefs: ["dsh-credential://replacement"],
+      providers: [{ id: "replacement-provider" }],
+    });
     expect(() => createProductionHarnessAdapter({})).toThrow(/必须配置/);
     expect(() => createProductionHarnessAdapter({
-      DSH_HARNESS_EXPORT_PATH: exportPath,
+      ARENA_MODEL_CATALOG_PATH: exportPath,
       DSH_HARNESS_VERSION: "2026.09-preview.1",
       DSH_EVOLUTION_COMMAND: "/bin/false",
     })).toThrow(/DSH_SMOKE_COMMAND/);
+  });
+
+  it("API 拒绝目录中的敏感 provider option 且响应不回显", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-production-secret-"));
+    const exportPath = join(directory, "models.json");
+    writeFileSync(exportPath, JSON.stringify({
+      schemaVersion: 1,
+      harnessVersion: "2026.09-preview.1",
+      credentialRefs: ["dsh-credential://production"],
+      providers: [{ id: "provider", label: "Provider", models: [{
+        id: "model", label: "Model", capabilities: {
+          reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000,
+          maxTotalTokens: 9_000, providerOptions: { apiKey: { type: "string" } },
+        },
+      }] }],
+    }));
+    const server = createArenaServer({
+      databasePath: ":memory:",
+      matchRunner: deterministicMatchRunner,
+      harnessAdapter: createProductionHarnessAdapter({
+        ARENA_MODEL_CATALOG_PATH: exportPath,
+        DSH_HARNESS_VERSION: "2026.09-preview.1",
+        DSH_EVOLUTION_COMMAND: "/bin/false",
+        DSH_SMOKE_COMMAND: "/bin/false",
+      }),
+    });
+    servers.push(server);
+
+    const response = await server.inject({ method: "GET", url: "/api/harness/models" });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.body).not.toContain("provider");
+    expect(response.body).not.toContain("apiKey");
   });
 
   it("生产 Harness 通过无 shell JSON 进程桥接返回可信用量与实际 reasoning", async () => {
@@ -738,7 +821,7 @@ describe("实验工作台 API", () => {
     chmodSync(commandPath, 0o755);
     chmodSync(smokePath, 0o755);
     const adapter = createProductionHarnessAdapter({
-      DSH_HARNESS_EXPORT_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
+      ARENA_MODEL_CATALOG_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
       DSH_EVOLUTION_COMMAND: commandPath, DSH_SMOKE_COMMAND: smokePath,
     });
     const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model", credentialRef: "dsh-credential://production",
@@ -763,7 +846,7 @@ describe("实验工作台 API", () => {
     writeFileSync(commandPath, `#!/usr/bin/env node\nlet input="";for await(const chunk of process.stdin)input+=chunk;const request=JSON.parse(input);if(request.attemptId==="block"){setInterval(()=>{},1000);await new Promise(()=>{});}process.stdout.write(JSON.stringify({hypothesis:"h",strategyPlan:"p",submitted:true,usage:{tokens:1,cost:0,untrusted:true}}));\n`);
     chmodSync(commandPath, 0o755);
     const adapter = createProductionHarnessAdapter({
-      DSH_HARNESS_EXPORT_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
+      ARENA_MODEL_CATALOG_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
       DSH_EVOLUTION_COMMAND: commandPath, DSH_SMOKE_COMMAND: "/bin/false",
     });
     const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model", credentialRef: "dsh-credential://production",

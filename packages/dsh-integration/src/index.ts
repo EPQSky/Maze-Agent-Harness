@@ -1,13 +1,15 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type {
-  HarnessAgentEnvironments,
-  HarnessCatalogResponse,
-  HarnessModel,
-  ModelProfile,
-  ModelProfileInput,
-  ProviderOptionCapability,
-  ProviderOptionValue,
+import {
+  isSensitiveProviderOptionName,
+  type HarnessAgentEnvironments,
+  type HarnessCatalogResponse,
+  type HarnessModel,
+  type ModelProfile,
+  type ModelProfileInput,
+  type ProviderOptionCapability,
+  type ProviderOptionValue,
 } from "@maze-arena/contracts";
 
 export interface HarnessAdapter {
@@ -57,7 +59,7 @@ export class HarnessConfigurationError extends Error {
   }
 }
 
-interface HarnessExport {
+export interface HarnessModelCatalog {
   schemaVersion: 1;
   harnessVersion: string;
   credentialRefs: string[];
@@ -65,6 +67,7 @@ interface HarnessExport {
 }
 
 const catalog: HarnessCatalogResponse = {
+  credentialRefs: ["dsh-credential://basic", "dsh-credential://reasoning"],
   providers: [
     {
       id: "fake-basic",
@@ -103,6 +106,10 @@ const catalog: HarnessCatalogResponse = {
 
 const fakeCredentialRefs = new Set(["dsh-credential://basic", "dsh-credential://reasoning"]);
 const credentialReferencePattern = /^dsh-credential:\/\/[a-z0-9][a-z0-9._-]{0,79}$/;
+const catalogIdPattern = /^[a-z0-9][a-z0-9._-]{0,79}$/;
+const providerOptionNamePattern = /^[A-Za-z][A-Za-z0-9._-]{0,79}$/;
+const catalogIdentityPattern = /^sha256:[0-9a-f]{64}$/;
+const obviousSecretPattern = /(?:\bsk-[A-Za-z0-9_-]{8,}\b|\bbearer\s+\S+|\b(?:api[_ -]?key|access[_ -]?token|secret)\s*[:=]\s*\S+)/i;
 
 const allowedProfileFields = new Set([
   "providerId",
@@ -180,7 +187,30 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 function rejectUnknownFields(value: Record<string, unknown>, allowed: readonly string[], path: string): void {
   const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
   if (unknown.length > 0) {
-    throw new HarnessConfigurationError(`${path} 包含未知字段：${unknown.join(", ")}`);
+    throw new HarnessConfigurationError(`${path} 包含未知字段`);
+  }
+}
+
+function assertNoSecretFieldName(key: string, path: readonly string[]): void {
+  const normalized = key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+  if (path.length === 0 && normalized === "credentialrefs") return;
+  if (["maxcontexttokens", "maxoutputtokens", "maxtotaltokens"].includes(normalized)) return;
+  const forbidden = obviousSecretPattern.test(key)
+    || isSensitiveProviderOptionName(key);
+  if (forbidden) throw new HarnessConfigurationError("Harness 导出包含禁止的敏感字段");
+}
+
+function assertNoSecretMaterial(value: unknown, path: readonly string[] = []): void {
+  if (typeof value === "string" && obviousSecretPattern.test(value)) {
+    throw new HarnessConfigurationError("Harness 导出包含疑似真实凭据内容");
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) assertNoSecretMaterial(entry, path);
+  } else if (isPlainObject(value)) {
+    for (const [key, entry] of Object.entries(value)) {
+      assertNoSecretFieldName(key, path);
+      assertNoSecretMaterial(entry, [...path, key]);
+    }
   }
 }
 
@@ -188,6 +218,7 @@ function validateAgainstCatalog(
   input: ModelProfileInput,
   available: HarnessCatalogResponse,
   credentialRefs: ReadonlySet<string>,
+  catalogIdentity: string,
 ): ModelProfile {
   const issues: ModelProfileIssue[] = [];
   if (!isPlainObject(input)) throw new ModelProfileValidationError([{ path: "modelProfile", message: "模型配置档必须为普通对象" }]);
@@ -217,7 +248,26 @@ function validateAgainstCatalog(
     providerOptions: input.providerOptions ? { ...input.providerOptions } : undefined,
     providerLabel: provider!.label,
     modelLabel: model!.label,
+    catalogIdentity,
+    catalogCapabilities: structuredClone(model!.capabilities),
   };
+}
+
+export function validateModelProfileSnapshot(profile: ModelProfile): ModelProfile {
+  if (!isPlainObject(profile) || typeof profile.providerLabel !== "string" || typeof profile.modelLabel !== "string"
+    || typeof profile.catalogIdentity !== "string" || !catalogIdentityPattern.test(profile.catalogIdentity)
+    || !isPlainObject(profile.catalogCapabilities)) {
+    throw new ModelProfileValidationError([{ path: "modelProfile", message: "模型配置档缺少有效目录快照" }]);
+  }
+  const { providerLabel, modelLabel, catalogIdentity, catalogCapabilities, ...input } = profile;
+  return validateAgainstCatalog(input, {
+    credentialRefs: [input.credentialRef],
+    providers: [{
+      id: input.providerId,
+      label: providerLabel,
+      models: [{ id: input.modelId, label: modelLabel, capabilities: catalogCapabilities }],
+    }],
+  }, new Set([input.credentialRef]), catalogIdentity);
 }
 
 function validateCapabilities(input: ModelProfileInput, model: HarnessModel, issues: ModelProfileIssue[]): void {
@@ -247,43 +297,49 @@ function validateCapabilities(input: ModelProfileInput, model: HarnessModel, iss
   }
 }
 
-function parseHarnessExport(raw: unknown, expectedHarnessVersion: string): HarnessExport {
+export function parseHarnessModelCatalog(raw: unknown, expectedHarnessVersion: string): HarnessModelCatalog {
+  assertNoSecretMaterial(raw);
   if (!isPlainObject(raw)) throw new HarnessConfigurationError("Harness 导出必须为 JSON 对象");
   const unknownFields = Object.keys(raw).filter((key) => !["schemaVersion", "harnessVersion", "credentialRefs", "providers"].includes(key));
-  if (unknownFields.length > 0) throw new HarnessConfigurationError(`Harness 导出包含未知字段：${unknownFields.join(", ")}`);
+  if (unknownFields.length > 0) throw new HarnessConfigurationError("Harness 导出包含未知字段");
   if (raw.schemaVersion !== 1) throw new HarnessConfigurationError("不支持的 Harness 导出 schemaVersion");
   if (raw.harnessVersion !== expectedHarnessVersion) {
-    throw new HarnessConfigurationError(`Harness 版本不匹配：期望 ${expectedHarnessVersion}，实际 ${String(raw.harnessVersion)}`);
+    throw new HarnessConfigurationError("Harness 版本不匹配安装清单");
   }
   if (!Array.isArray(raw.credentialRefs) || !raw.credentialRefs.every((value) => typeof value === "string" && credentialReferencePattern.test(value))) {
     throw new HarnessConfigurationError("Harness 导出的 credentialRefs 无效");
+  }
+  if (new Set(raw.credentialRefs).size !== raw.credentialRefs.length) {
+    throw new HarnessConfigurationError("Harness 导出的 credentialRefs 包含重复引用");
   }
   if (!Array.isArray(raw.providers) || raw.providers.length === 0) {
     throw new HarnessConfigurationError("Harness 导出未包含可用提供方");
   }
   const ids = new Set<string>();
   for (const provider of raw.providers) {
-    if (!isPlainObject(provider) || typeof provider.id !== "string" || !provider.id
-      || typeof provider.label !== "string" || !provider.label || !Array.isArray(provider.models) || provider.models.length === 0) {
+    if (!isPlainObject(provider) || typeof provider.id !== "string" || !catalogIdPattern.test(provider.id)
+      || typeof provider.label !== "string" || !provider.label.trim() || provider.label.length > 120
+      || !Array.isArray(provider.models) || provider.models.length === 0) {
       throw new HarnessConfigurationError("Harness 导出的 provider 结构无效");
     }
-    rejectUnknownFields(provider, ["id", "label", "models"], `provider ${provider.id}`);
-    if (ids.has(provider.id)) throw new HarnessConfigurationError(`Harness 导出包含重复 provider：${provider.id}`);
+    rejectUnknownFields(provider, ["id", "label", "models"], "Harness 导出的 provider");
+    if (ids.has(provider.id)) throw new HarnessConfigurationError("Harness 导出包含重复 provider");
     ids.add(provider.id);
     const modelIds = new Set<string>();
     for (const model of provider.models) {
-      if (!isPlainObject(model) || typeof model.id !== "string" || !model.id
-        || typeof model.label !== "string" || !model.label || !isPlainObject(model.capabilities)) {
+      if (!isPlainObject(model) || typeof model.id !== "string" || !catalogIdPattern.test(model.id)
+        || typeof model.label !== "string" || !model.label.trim() || model.label.length > 120
+        || !isPlainObject(model.capabilities)) {
         throw new HarnessConfigurationError("Harness 导出的 model 结构无效");
       }
-      rejectUnknownFields(model, ["id", "label", "capabilities"], `model ${provider.id}/${model.id}`);
-      if (modelIds.has(model.id)) throw new HarnessConfigurationError(`Harness 导出包含重复 model：${provider.id}/${model.id}`);
+      rejectUnknownFields(model, ["id", "label", "capabilities"], "Harness 导出的 model");
+      if (modelIds.has(model.id)) throw new HarnessConfigurationError("Harness 导出包含重复 model");
       modelIds.add(model.id);
       const capabilities = model.capabilities;
       rejectUnknownFields(capabilities, [
         "reasoningEfforts", "temperature", "topP", "maxContextTokens", "maxOutputTokens",
         "maxTotalTokens", "providerOptions",
-      ], `capabilities ${provider.id}/${model.id}`);
+      ], "Harness 导出的模型能力");
       const validRange = (value: unknown) => value === undefined || (
         isPlainObject(value)
         && typeof value.minimum === "number" && Number.isFinite(value.minimum)
@@ -291,51 +347,58 @@ function parseHarnessExport(raw: unknown, expectedHarnessVersion: string): Harne
         && value.minimum <= value.maximum
       );
       for (const [rangeName, range] of [["temperature", capabilities.temperature], ["topP", capabilities.topP]] as const) {
-        if (isPlainObject(range)) rejectUnknownFields(range, ["minimum", "maximum"], `${rangeName} ${provider.id}/${model.id}`);
+        if (isPlainObject(range)) rejectUnknownFields(range, ["minimum", "maximum"], "Harness 导出的数值能力范围");
       }
       if (!Array.isArray(capabilities.reasoningEfforts)
         || !capabilities.reasoningEfforts.every((value) => ["low", "medium", "high"].includes(String(value)))
+        || new Set(capabilities.reasoningEfforts).size !== capabilities.reasoningEfforts.length
         || !validRange(capabilities.temperature) || !validRange(capabilities.topP)
         || !Number.isInteger(capabilities.maxContextTokens) || Number(capabilities.maxContextTokens) <= 0
         || !Number.isInteger(capabilities.maxOutputTokens) || Number(capabilities.maxOutputTokens) <= 0
         || !Number.isInteger(capabilities.maxTotalTokens) || Number(capabilities.maxTotalTokens) <= 0
-        || Number(capabilities.maxTotalTokens) < Number(capabilities.maxOutputTokens)
+        || Number(capabilities.maxTotalTokens) < Number(capabilities.maxContextTokens) + Number(capabilities.maxOutputTokens)
         || !isPlainObject(capabilities.providerOptions)) {
-        throw new HarnessConfigurationError(`Harness 导出的模型能力无效：${provider.id}/${model.id}`);
+        throw new HarnessConfigurationError("Harness 导出的模型能力无效");
       }
       for (const [optionName, capability] of Object.entries(capabilities.providerOptions)) {
-        if (!isPlainObject(capability) || !["boolean", "number", "string"].includes(String(capability.type))
+        if (!providerOptionNamePattern.test(optionName) || !isPlainObject(capability) || !["boolean", "number", "string"].includes(String(capability.type))
           || (capability.type !== "number" && (capability.minimum !== undefined || capability.maximum !== undefined))
           || (capability.minimum !== undefined && (typeof capability.minimum !== "number" || !Number.isFinite(capability.minimum)))
           || (capability.maximum !== undefined && (typeof capability.maximum !== "number" || !Number.isFinite(capability.maximum)))
           || (typeof capability.minimum === "number" && typeof capability.maximum === "number" && capability.minimum > capability.maximum)) {
-          throw new HarnessConfigurationError(`Harness 导出的 provider option 能力无效：${provider.id}/${model.id}`);
+          throw new HarnessConfigurationError("Harness 导出的 provider option 能力无效");
         }
-        rejectUnknownFields(capability, ["type", "minimum", "maximum"], `providerOptions.${optionName} ${provider.id}/${model.id}`);
+        rejectUnknownFields(capability, ["type", "minimum", "maximum"], "Harness 导出的 provider option 能力");
       }
     }
   }
-  return raw as unknown as HarnessExport;
+  return structuredClone(raw) as unknown as HarnessModelCatalog;
 }
 
 export class ExportedHarnessConfigAdapter implements HarnessAdapter {
   private constructor(
     private readonly catalog: HarnessCatalogResponse,
     private readonly credentialRefs: ReadonlySet<string>,
+    private readonly catalogIdentity: string,
   ) {}
 
   static fromFile(exportPath: string, expectedHarnessVersion: string): ExportedHarnessConfigAdapter {
     if (!expectedHarnessVersion) throw new HarnessConfigurationError("必须配置精确的 Harness 版本");
-    let raw: unknown;
+    let contents: string;
     try {
-      raw = JSON.parse(readFileSync(exportPath, "utf8"));
+      contents = readFileSync(exportPath, "utf8");
     } catch (error) {
       throw new HarnessConfigurationError(`无法读取 Harness 导出：${error instanceof Error ? error.message : String(error)}`);
     }
-    const parsed = parseHarnessExport(raw, expectedHarnessVersion);
+    let raw: unknown;
+    try { raw = JSON.parse(contents); }
+    catch { throw new HarnessConfigurationError("Harness 导出不是有效 JSON"); }
+    const parsed = parseHarnessModelCatalog(raw, expectedHarnessVersion);
+    const catalogIdentity = `sha256:${createHash("sha256").update(JSON.stringify(parsed)).digest("hex")}`;
     return new ExportedHarnessConfigAdapter(
-      { providers: structuredClone(parsed.providers) },
+      { credentialRefs: structuredClone(parsed.credentialRefs), providers: structuredClone(parsed.providers) },
       new Set(parsed.credentialRefs),
+      catalogIdentity,
     );
   }
 
@@ -344,7 +407,7 @@ export class ExportedHarnessConfigAdapter implements HarnessAdapter {
   }
 
   validateModelProfile(input: ModelProfileInput): ModelProfile {
-    return validateAgainstCatalog(input, this.catalog, this.credentialRefs);
+    return validateAgainstCatalog(input, this.catalog, this.credentialRefs, this.catalogIdentity);
   }
 }
 
@@ -354,7 +417,7 @@ export class DeterministicFakeHarnessAdapter implements HarnessAdapter {
   }
 
   validateModelProfile(input: ModelProfileInput): ModelProfile {
-    return validateAgainstCatalog(input, catalog, fakeCredentialRefs);
+    return validateAgainstCatalog(input, catalog, fakeCredentialRefs, `sha256:${"0".repeat(64)}`);
   }
 
   async smokeModel(profile: ModelProfile): Promise<{ providerText?: string }> {

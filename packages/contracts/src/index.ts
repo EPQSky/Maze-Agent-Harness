@@ -139,6 +139,8 @@ export interface ModelProfileInput {
 export interface ModelProfile extends ModelProfileInput {
   providerLabel: string;
   modelLabel: string;
+  catalogIdentity?: string;
+  catalogCapabilities?: HarnessModelCapabilities;
 }
 
 export interface HarnessAgentEnvironment {
@@ -180,7 +182,35 @@ export interface HarnessProvider {
 }
 
 export interface HarnessCatalogResponse {
+  credentialRefs: string[];
   providers: HarnessProvider[];
+}
+
+const allowedTokenProviderOptionNames = new Set([
+  "tokenbudget",
+  "maxtokens",
+  "maxcontexttokens",
+  "maxoutputtokens",
+  "maxtotaltokens",
+]);
+
+export function isSensitiveProviderOptionName(name: string): boolean {
+  const normalized = name.replace(/[^a-z0-9]/gi, "").toLowerCase();
+  if (allowedTokenProviderOptionNames.has(normalized)) return false;
+  const words = name
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean)
+    .map((word) => word.toLowerCase());
+  if (normalized.includes("token")) return true;
+  if (words.some((word) => ["secret", "password", "credential", "authorization"].includes(word))) return true;
+  if (["secret", "password", "credential", "authorization"]
+    .some((term) => normalized.startsWith(term) || normalized.endsWith(term))) return true;
+  if (normalized.includes("auth") && ["header", "value", "key"].some((term) => normalized.includes(term))) return true;
+  return words.includes("key") && words.some((word) => ["api", "private", "client", "signing"].includes(word))
+    || (normalized.includes("key") && ["api", "private", "client", "signing"]
+      .some((term) => normalized.startsWith(term) || normalized.endsWith(term)));
 }
 
 export interface UpdateModelProfileRequest {

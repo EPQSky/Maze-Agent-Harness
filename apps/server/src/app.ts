@@ -26,6 +26,7 @@ import {
 import {
   type HarnessAdapter,
   ModelProfileValidationError,
+  validateModelProfileSnapshot,
 } from "@maze-arena/dsh-integration";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import websocket from "@fastify/websocket";
@@ -109,6 +110,9 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
   function revalidateStoredModelProfile(modelProfile: Experiment["modelProfile"]) {
     if (!modelProfile) {
       throw new ModelProfileValidationError([{ path: "modelProfile", message: "旧实验尚未配置模型配置档" }]);
+    }
+    if (modelProfile.catalogIdentity && modelProfile.catalogCapabilities) {
+      return validateModelProfileSnapshot(modelProfile);
     }
     const { providerLabel: _providerLabel, modelLabel: _modelLabel, ...input } = modelProfile;
     return harnessAdapter.validateModelProfile(input);
