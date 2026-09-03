@@ -468,6 +468,24 @@ describe("原生插件与正式隔离策略", () => {
     expect(() => factory.create("solver")).toThrow(/摘要不匹配/);
   });
 
+  it.each([
+    "latest",
+    "maze-match:latest",
+    "maze-match:1.2.3",
+    "maze-match@sha256:abcd",
+    `maze-match:latest@sha256:${"A".repeat(64)}`,
+    `maze-match:latest@sha256:${"a".repeat(64)}`,
+    `maze-match:1.2.3@sha256:${"a".repeat(64)}`,
+  ])("生产 Docker 命令拒绝浮动或不完整镜像引用 %s", (image) => {
+    expect(() => new DockerMatchProfileCommandFactory(image, "/tmp/match-profile"))
+      .toThrow(/完整 sha256 摘要/);
+  });
+
+  it("生产 Docker 命令允许 registry 端口和无 tag 名称的完整摘要", () => {
+    const image = `localhost:5000/maze/match-profile@sha256:${"a".repeat(64)}`;
+    expect(() => new DockerMatchProfileCommandFactory(image, "/tmp/match-profile")).not.toThrow();
+  });
+
   it("真实子进程加载两个插件完成比赛，Solver 信封不含生成种子", async () => {
     const { home } = await installProfiles();
     const runner = new NativePluginMatchRunner({

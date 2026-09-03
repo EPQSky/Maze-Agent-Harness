@@ -31,10 +31,15 @@ pnpm arena install \
   --harness-commit <40-character-git-commit> \
   --dsh-executable /absolute/path/to/dsh \
   --dsh-version '<exact-dsh-version-output>'
+pnpm arena image build \
+  --base-image 'node@sha256:<64-character-digest>' \
+  --image-name maze-arena/match-profile:local
 pnpm arena doctor
 ```
 
 默认安装清单位于 `~/.config/maze-arena/install-manifest.json`，运行数据目录位于 `~/.local/share/maze-arena/`，日志与进程状态目录位于 `~/.local/state/maze-arena/`。命令遵守 `XDG_CONFIG_HOME`、`XDG_DATA_HOME` 和 `XDG_STATE_HOME` 覆盖；清单只记录 Harness 源码提交、可执行文件 SHA-256 和精确版本，不保存 API Key。
+
+`image build` 只接受带完整 SHA-256 摘要的基础镜像，使用已校验的 Harness 提交、`dsh` 可执行文件和当前可信项目构建产物在本机构建 Match Profile 镜像。Docker 返回的实际镜像 ID 会作为不可变引用写入安装清单；正式 `doctor` 会拒绝缺失、被替换或构建身份漂移的镜像，并检查 Docker 的 seccomp 与 cgroup namespace 安全能力。
 
 ## Harness 模型导出
 

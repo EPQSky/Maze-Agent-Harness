@@ -163,7 +163,16 @@ export class DockerMatchProfileCommandFactory implements MatchProfileCommandFact
     private readonly image: string,
     private readonly harnessHome: string,
   ) {
-    if (!image.includes("@sha256:")) throw new Error("Match Profile 镜像必须使用 sha256 摘要精确锁定");
+    const directDigest = /^sha256:[0-9a-f]{64}$/;
+    const imageNameSegment = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/;
+    const registrySegment = /^[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?$/;
+    const named = image.match(/^(.+)@(sha256:[0-9a-f]{64})$/);
+    const namedSegments = named?.[1]!.split("/") ?? [];
+    const validNamedDigest = namedSegments.length > 0 && namedSegments.every((segment, index) =>
+      (index === 0 && namedSegments.length > 1 ? registrySegment : imageNameSegment).test(segment));
+    if (!directDigest.test(image) && !validNamedDigest) {
+      throw new Error("Match Profile 镜像必须使用完整 sha256 摘要精确锁定");
+    }
   }
 
   create(role: MatchPluginRole): MatchProfileCommand {
