@@ -20,6 +20,22 @@ pnpm dev
 
 开发服务器默认在 `http://localhost:5173` 提供工作台，并将 `/api` 请求代理到 `http://localhost:3000`。Arena Server 默认把 SQLite 数据保存到 `.data/maze-arena.sqlite`，可通过 `ARENA_DATABASE_PATH` 覆盖。
 
+## 正式安装预检
+
+正式运行由操作员提供已经检出并固定提交的 DeepSeek Harness 源码，以及与其对应的 `dsh` 可执行文件；命令不会下载、克隆或升级 Harness：
+
+```bash
+pnpm build
+pnpm arena install \
+  --harness-source /absolute/path/to/deepseek-harness \
+  --harness-commit <40-character-git-commit> \
+  --dsh-executable /absolute/path/to/dsh \
+  --dsh-version '<exact-dsh-version-output>'
+pnpm arena doctor
+```
+
+默认安装清单位于 `~/.config/maze-arena/install-manifest.json`，运行数据目录位于 `~/.local/share/maze-arena/`，日志与进程状态目录位于 `~/.local/state/maze-arena/`。命令遵守 `XDG_CONFIG_HOME`、`XDG_DATA_HOME` 和 `XDG_STATE_HOME` 覆盖；清单只记录 Harness 源码提交、可执行文件 SHA-256 和精确版本，不保存 API Key。
+
 ## Harness 模型导出
 
 Server 启动前必须设置 `DSH_HARNESS_EXPORT_PATH` 和精确的 `DSH_HARNESS_VERSION`。导出文件由外部 Harness 配置流程只读生成，顶层结构固定为：
