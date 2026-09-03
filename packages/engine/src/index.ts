@@ -267,6 +267,11 @@ function openDirections(maze: MazeSnapshot, position: Coordinate): Direction[] {
 
 export function runMazeMatch(options: { seed: string; solver: SolverPolicy }): MatchResult {
   const maze = generateBaselineMaze(options.seed);
+  return runSolverOnMaze({ seed: options.seed, maze, solver: options.solver });
+}
+
+export function runSolverOnMaze(options: { seed: string; maze: MazeSnapshot; solver: SolverPolicy }): MatchResult {
+  const maze = options.maze;
   const validation = validateMaze(maze);
   if (!validation.valid) throw new Error(validation.reason);
 

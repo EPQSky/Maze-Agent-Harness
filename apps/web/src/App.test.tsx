@@ -2,7 +2,7 @@ import type { Experiment, ExperimentListResponse, HarnessCatalogResponse } from 
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { App } from "./App";
+import { App, toModelProfileInput } from "./App";
 
 afterEach(() => {
   cleanup();
@@ -10,10 +10,21 @@ afterEach(() => {
 });
 
 describe("实验工作台", () => {
+  it("派生实验复用冻结配置时不携带仅供展示的提供方与模型标签", () => {
+    expect(toModelProfileInput({
+      providerId: "custom-basic", modelId: "custom-compact", credentialRef: "dsh-credential://existing",
+      contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000,
+      providerLabel: "确定性基础提供方", modelLabel: "Compact V1",
+    })).toEqual({
+      providerId: "custom-basic", modelId: "custom-compact", credentialRef: "dsh-credential://existing",
+      contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000,
+    });
+  });
+
   it("终态实验保留历史 Arena，但不显示运行基线比赛入口", async () => {
     const completed: Experiment = {
       id: "completed-id", name: "已完成实验", status: "completed", createdAt: "2026-09-01T10:00:00.000Z",
-      modelProfile: null,
+      modelProfile: null, costLimit: null,
       harnessEnvironments: {
         generator: { home: "/h/c/g/home", workspace: "/h/c/g/workspace" },
         solver: { home: "/h/c/s/home", workspace: "/h/c/s/workspace" },
@@ -36,6 +47,7 @@ describe("实验工作台", () => {
       name: "已有实验",
       status: "draft" as const,
       createdAt: "2026-09-01T08:00:00.000Z",
+      costLimit: null,
       modelProfile: {
         providerId: "custom-basic", modelId: "custom-compact", credentialRef: "dsh-credential://existing",
         contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000,
@@ -51,6 +63,7 @@ describe("实验工作台", () => {
       name: "新的实验",
       status: "draft" as const,
       createdAt: "2026-09-01T09:00:00.000Z",
+      costLimit: null,
       modelProfile: {
         providerId: "custom-reasoning", modelId: "custom-reasoner", credentialRef: "dsh-credential://reasoning",
         reasoningEffort: "high", contextTokens: 16_000, outputTokens: 2_000, totalTokenLimit: 20_000,
@@ -76,13 +89,15 @@ describe("实验工作台", () => {
         } }],
       },
     ] };
-    const fetchMock = vi
-      .fn<typeof fetch>()
-      .mockResolvedValueOnce(new Response(JSON.stringify({ experiments: [existing] } satisfies ExperimentListResponse)))
-      .mockResolvedValueOnce(new Response(JSON.stringify(catalog)))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: "MATCH_NOT_FOUND", message: "无历史" } }), { status: 404 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify(created), { status: 201 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: "MATCH_NOT_FOUND", message: "无历史" } }), { status: 404 }));
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = input.toString();
+      if (url === "/api/experiments" && init?.method === "POST") return new Response(JSON.stringify(created), { status: 201 });
+      if (url === "/api/experiments") return new Response(JSON.stringify({ experiments: [existing] } satisfies ExperimentListResponse));
+      if (url === "/api/harness/models") return new Response(JSON.stringify(catalog));
+      if (url.endsWith("/baseline-validation")) return new Response(JSON.stringify({ experimentId: url, status: "pending", steps: [], operatorConfirmed: false, frozenConfiguration: null, frozenDigest: null, smoke: { attempted: false, passed: null } }));
+      if (url.endsWith("/audit-events")) return new Response(JSON.stringify({ events: [], nextId: 0 }));
+      return new Response(JSON.stringify({ error: { code: "MATCH_NOT_FOUND", message: "无历史" } }), { status: 404 });
+    });
     vi.stubGlobal("fetch", fetchMock);
     const user = userEvent.setup();
 
@@ -94,6 +109,7 @@ describe("实验工作台", () => {
     await user.type(screen.getByLabelText("新实验名称"), "新的实验");
     await user.selectOptions(screen.getByLabelText("模型提供方"), "custom-reasoning");
     await user.type(screen.getByLabelText("凭据引用"), "dsh-credential://reasoning");
+    await user.type(screen.getByLabelText("成本上限"), "1.25");
     await user.selectOptions(screen.getByLabelText("推理强度"), "high");
     await user.click(screen.getByRole("button", { name: "创建" }));
 
@@ -103,6 +119,7 @@ describe("实验工作台", () => {
     const createCall = fetchMock.mock.calls.find(([url, init]) => url === "/api/experiments" && init?.method === "POST");
     expect(createCall).toBeDefined();
     expect(JSON.parse(createCall?.[1]?.body as string)).toMatchObject({
+      costLimit: 1.25,
       modelProfile: { providerId: "custom-reasoning", modelId: "custom-reasoner", credentialRef: "dsh-credential://reasoning", reasoningEffort: "high" },
     });
   });
@@ -128,6 +145,7 @@ describe("实验工作台", () => {
       name: "自定义目录实验",
       status: "draft",
       createdAt: "2026-09-01T10:00:00.000Z",
+      costLimit: null,
       modelProfile: {
         providerId: "vendor-only", modelId: "model-only", credentialRef: "dsh-credential://vendor",
         reasoningEffort: "low", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000,
@@ -138,11 +156,15 @@ describe("实验工作台", () => {
         solver: { home: "/h/c/s/home", workspace: "/h/c/s/workspace" },
       },
     };
-    const fetchMock = vi.fn<typeof fetch>()
-      .mockResolvedValueOnce(new Response(JSON.stringify({ experiments: [] } satisfies ExperimentListResponse)))
-      .mockResolvedValueOnce(new Response(JSON.stringify(catalog)))
-      .mockResolvedValueOnce(new Response(JSON.stringify(created), { status: 201 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: "MATCH_NOT_FOUND", message: "无历史" } }), { status: 404 }));
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = input.toString();
+      if (url === "/api/experiments" && init?.method === "POST") return new Response(JSON.stringify(created), { status: 201 });
+      if (url === "/api/experiments") return new Response(JSON.stringify({ experiments: [] } satisfies ExperimentListResponse));
+      if (url === "/api/harness/models") return new Response(JSON.stringify(catalog));
+      if (url.endsWith("/baseline-validation")) return new Response(JSON.stringify({ experimentId: url, status: "pending", steps: [], operatorConfirmed: false, frozenConfiguration: null, frozenDigest: null, smoke: { attempted: false, passed: null } }));
+      if (url.endsWith("/audit-events")) return new Response(JSON.stringify({ events: [], nextId: 0 }));
+      return new Response(JSON.stringify({ error: { code: "MATCH_NOT_FOUND", message: "无历史" } }), { status: 404 });
+    });
     vi.stubGlobal("fetch", fetchMock);
     const user = userEvent.setup();
 
@@ -153,7 +175,7 @@ describe("实验工作台", () => {
     await user.type(screen.getByLabelText("凭据引用"), "dsh-credential://vendor");
     await user.click(screen.getByRole("button", { name: "创建" }));
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => url === "/api/experiments" && init?.method === "POST")).toBe(true));
     const createCall = fetchMock.mock.calls.find(([url, init]) => url === "/api/experiments" && init?.method === "POST");
     expect(JSON.parse(createCall?.[1]?.body as string)).toMatchObject({
       modelProfile: {

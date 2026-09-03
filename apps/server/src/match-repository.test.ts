@@ -4,12 +4,13 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { MatchDataCorruptError, MatchRepository } from "./match-repository.js";
+import { runBaselineMatch } from "@maze-arena/engine";
 
 const repositories: MatchRepository[] = [];
 afterEach(() => repositories.splice(0).forEach((repository) => repository.close()));
 
 function complete(repository: MatchRepository, seed = "persisted-seed") {
-  const prepared = repository.prepareBaseline("experiment-1", seed);
+  const prepared = repository.prepare("experiment-1", seed, runBaselineMatch(seed));
   repository.appendEvents(prepared.match.id, prepared.events, prepared.score);
   return repository.find(prepared.match.id)!;
 }
@@ -19,7 +20,7 @@ describe("比赛事件持久化", () => {
     const databasePath = join(mkdtempSync(join(tmpdir(), "maze-match-")), "arena.sqlite");
     const first = new MatchRepository(databasePath);
     repositories.push(first);
-    const prepared = first.prepareBaseline("experiment-1", "persisted-seed");
+    const prepared = first.prepare("experiment-1", "persisted-seed", runBaselineMatch("persisted-seed"));
     first.appendEvents(prepared.match.id, prepared.events.slice(0, 40));
 
     expect(first.readEvents(prepared.match.id, 20, 10)).toMatchObject({
@@ -44,6 +45,48 @@ describe("比赛事件持久化", () => {
     const second = complete(repository, "repeatable-seed");
     expect(JSON.stringify(first.events)).toBe(JSON.stringify(second.events));
     expect(JSON.stringify(first.score)).toBe(JSON.stringify(second.score));
+  });
+
+  it("原始事件逐字节保留，投影协议不可用时仍能审计读取", () => {
+    const databasePath = join(mkdtempSync(join(tmpdir(), "maze-raw-events-")), "arena.sqlite");
+    const repository = new MatchRepository(databasePath);
+    repositories.push(repository);
+    const match = complete(repository, "raw-seed");
+    const raw = repository.readRawEvents(match.id, 0, 1_024)!;
+    expect(raw.events).toHaveLength(Math.min(1_024, match.events.length));
+    expect(Buffer.from(raw.events[0]!.bytesBase64, "base64").toString("utf8"))
+      .toBe(JSON.stringify(match.events[0]));
+
+    const attacker = new DatabaseSync(databasePath);
+    attacker.prepare("UPDATE match_events SET protocol_version = 99 WHERE match_id = ? AND sequence = 1").run(match.id);
+    attacker.close();
+    expect(() => repository.readEvents(match.id)).toThrow(/不支持比赛事件协议版本 99/);
+    expect(repository.readRawEvents(match.id)?.events[0]).toMatchObject({ protocolVersion: 99, sequence: 1 });
+  });
+
+  it("迁移旧事件文本后保留其原始 JSON 字节", () => {
+    const databasePath = join(mkdtempSync(join(tmpdir(), "maze-event-migration-")), "arena.sqlite");
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`CREATE TABLE matches (
+      id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL, seed TEXT NOT NULL, protocol_version INTEGER NOT NULL,
+      status TEXT NOT NULL, committed_event_count INTEGER NOT NULL, total_event_count INTEGER NOT NULL, score_json TEXT NOT NULL
+    );
+    CREATE TABLE match_events (
+      match_id TEXT NOT NULL, sequence INTEGER NOT NULL, event_json TEXT NOT NULL,
+      PRIMARY KEY (match_id, sequence)
+    );
+    PRAGMA user_version = 4;`);
+    const event = runBaselineMatch("legacy-raw").events[0]!;
+    const bytes = JSON.stringify(event);
+    legacy.prepare("INSERT INTO matches VALUES (?, ?, ?, 1, 'running', 1, 1, 'null')")
+      .run("legacy-match", "experiment-1", "legacy-raw");
+    legacy.prepare("INSERT INTO match_events VALUES (?, 1, ?)").run("legacy-match", bytes);
+    legacy.close();
+
+    const repository = new MatchRepository(databasePath);
+    repositories.push(repository);
+    const raw = repository.readRawEvents("legacy-match")!;
+    expect(Buffer.from(raw.events[0]!.bytesBase64, "base64").toString("utf8")).toBe(bytes);
   });
 
   it.each([

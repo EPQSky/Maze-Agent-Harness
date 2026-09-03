@@ -61,6 +61,37 @@ input:focus, select:focus { border-color: #5ac8a8; box-shadow: 0 0 0 2px rgb(90 
 .facts dd { margin: 0; min-width: 0; color: #cbd5d8; font-size: 13px; overflow-wrap: anywhere; }
 .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .model-profile { padding: 22px 0; border-bottom: 1px solid #27313a; }
+.experiment-workbench { padding: 22px 0; border-bottom: 1px solid #27313a; }
+.workbench-tabs { display: flex; gap: 2px; overflow-x: auto; border-bottom: 1px solid #27313a; }
+.workbench-tabs button { min-height: 38px; padding: 0 12px; border: 0; border-bottom: 2px solid transparent; color: #8d9ba0; background: transparent; cursor: pointer; }
+.workbench-tabs button[aria-selected="true"] { color: #9debd3; border-bottom-color: #5ac8a8; }
+.workbench-view { padding-top: 18px; min-width: 0; }
+.workbench-view h3 { margin: 0 0 14px; font-size: 17px; }
+.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 14px; }
+.section-heading h3 { margin: 0; }
+.control-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.validation-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid #27313a; border-left: 1px solid #27313a; }
+.validation-step { min-width: 0; min-height: 60px; padding: 10px; display: flex; gap: 9px; align-items: flex-start; border-right: 1px solid #27313a; border-bottom: 1px solid #27313a; }
+.validation-step svg { flex: 0 0 auto; margin-top: 2px; color: #5ac8a8; }
+.validation-step.failed svg { color: #ff9ca5; }
+.validation-step strong, .validation-step small { display: block; }
+.validation-step strong { font-size: 12px; }
+.validation-step small { margin-top: 4px; color: #718087; font-size: 10px; overflow-wrap: anywhere; }
+.step-dot { width: 8px; height: 8px; margin: 5px 4px; border-radius: 50%; background: #52616a; }
+.runtime-strip { margin-top: 14px; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border: 1px solid #27313a; }
+.runtime-strip span { padding: 9px; color: #718087; font-size: 10px; border-right: 1px solid #27313a; }
+.runtime-strip span:last-child { border: 0; }
+.runtime-strip strong { display: block; margin-top: 3px; color: #dce4e8; font-size: 12px; overflow-wrap: anywhere; }
+.runtime-actions { margin-top: 12px; justify-content: flex-end; }
+.danger-button { min-height: 40px; padding: 0 12px; display: inline-flex; align-items: center; gap: 7px; border: 1px solid #78484d; border-radius: 5px; color: #ffc4c8; background: #2b191d; cursor: pointer; }
+.filter-bar { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.data-row { min-width: 0; padding: 10px 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; border-bottom: 1px solid #27313a; font-size: 12px; }
+.data-row code { overflow-wrap: anywhere; color: #9debd3; }
+.muted { color: #718087; font-size: 12px; }
+.champion-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.champion-grid > div { min-width: 0; padding: 12px; display: grid; grid-template-columns: auto 1fr; gap: 8px; border: 1px solid #27313a; }
+.champion-grid code { grid-column: 1 / -1; overflow-wrap: anywhere; color: #9debd3; font-size: 11px; }
+.derive-controls { margin-top: 10px; display: grid; grid-template-columns: minmax(160px, 1fr) repeat(3, auto); gap: 8px; }
 .profile-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .profile-heading h3 { margin: 0; font-size: 16px; letter-spacing: 0; }
 .profile-grid { margin: 18px 0 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
@@ -100,5 +131,10 @@ input:focus, select:focus { border-color: #5ac8a8; box-shadow: 0 0 0 2px rgb(90 
   .arena-heading { align-items: flex-start; }
   .arena-layout { grid-template-columns: minmax(0, 1fr); }
   .arena-sidebar { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .section-heading { align-items: flex-start; flex-direction: column; }
+  .validation-grid, .filter-bar, .champion-grid { grid-template-columns: 1fr; }
+  .runtime-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .data-row { grid-template-columns: 1fr; }
+  .derive-controls { grid-template-columns: 1fr; }
   .playback-controls { justify-content: center; }
 }

@@ -7,10 +7,11 @@ import type {
   ProviderOptionValue,
   ReasoningEffort,
 } from "@maze-arena/contracts";
-import { FlaskConical, LoaderCircle, Play, Plus, RefreshCw } from "lucide-react";
+import { FlaskConical, LoaderCircle, Plus, RefreshCw } from "lucide-react";
 import { type FormEvent, useCallback, useEffect, useState } from "react";
 import { arenaApi } from "./api";
 import { ArenaView } from "./ArenaView";
+import { ExperimentWorkbench } from "./ExperimentWorkbench";
 
 const statusLabels: Record<ExperimentStatus, string> = {
   draft: "草稿",
@@ -35,11 +36,13 @@ export function App() {
   const [contextTokens, setContextTokens] = useState("");
   const [outputTokens, setOutputTokens] = useState("");
   const [totalTokenLimit, setTotalTokenLimit] = useState("");
+  const [costLimit, setCostLimit] = useState("");
   const [providerOptions, setProviderOptions] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [savingProfile, setSavingProfile] = useState(false);
   const [error, setError] = useState<string>();
+  const [replayMatchId, setReplayMatchId] = useState<string>();
 
   const loadExperiments = useCallback(async () => {
     setLoading(true);
@@ -75,7 +78,9 @@ export function App() {
     setError(undefined);
     try {
       const modelProfile = buildModelProfile();
-      const created = await arenaApi.createExperiment({ name: name.trim(), modelProfile });
+      const created = await arenaApi.createExperiment({
+        name: name.trim(), modelProfile, costLimit: costLimit === "" ? null : Number(costLimit),
+      });
       setExperiments((current) => [created, ...current]);
       setSelectedId(created.id);
       setName("");
@@ -98,16 +103,6 @@ export function App() {
       setError(reason instanceof Error ? reason.message : "保存模型配置失败");
     } finally {
       setSavingProfile(false);
-    }
-  }
-
-  async function startExperiment(experiment: Experiment) {
-    setError(undefined);
-    try {
-      const updated = await arenaApi.startExperiment(experiment.id);
-      setExperiments((current) => current.map((item) => (item.id === updated.id ? updated : item)));
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "启动失败");
     }
   }
 
@@ -212,6 +207,7 @@ export function App() {
               <label>上下文令牌<input aria-label="上下文令牌" type="number" value={contextTokens} onChange={(event) => setContextTokens(event.target.value)} /></label>
               <label>输出令牌<input aria-label="输出令牌" type="number" value={outputTokens} onChange={(event) => setOutputTokens(event.target.value)} /></label>
               <label>总令牌上限<input aria-label="总令牌上限" type="number" value={totalTokenLimit} onChange={(event) => setTotalTokenLimit(event.target.value)} /></label>
+              <label>成本上限（可选）<input aria-label="成本上限" type="number" min="0.01" step="0.01" value={costLimit} onChange={(event) => setCostLimit(event.target.value)} /></label>
               {Object.entries(selectedModel?.capabilities.providerOptions ?? {}).map(([option, capability]) => (
                 <label key={option}>{option}{capability.type === "boolean" ? (
                   <select aria-label={option} value={providerOptions[option] ?? "false"} onChange={(event) => setProviderOptions((current) => ({ ...current, [option]: event.target.value }))}>
@@ -248,7 +244,7 @@ export function App() {
                 className={`experiment-row ${selectedId === experiment.id ? "selected" : ""}`}
                 key={experiment.id}
                 type="button"
-                onClick={() => setSelectedId(experiment.id)}
+                onClick={() => { setSelectedId(experiment.id); setReplayMatchId(undefined); }}
               >
                 <span className="experiment-name">{experiment.name}</span>
                 <span className={`status status-${experiment.status}`}>{statusLabels[experiment.status]}</span>
@@ -266,11 +262,6 @@ export function App() {
                   <p className="eyebrow">实验详情</p>
                   <h2>{selected.name}</h2>
                 </div>
-                {selected.status === "draft" && selected.modelProfile && (
-                  <button className="primary-button" type="button" onClick={() => void startExperiment(selected)}>
-                    <Play size={17} fill="currentColor" />启动实验
-                  </button>
-                )}
               </div>
               <dl className="facts">
                 <div><dt>状态</dt><dd><span className={`status status-${selected.status}`}>{statusLabels[selected.status]}</span></dd></div>
@@ -285,6 +276,7 @@ export function App() {
                       <div><dt>凭据引用</dt><dd className="mono">{selected.modelProfile.credentialRef}</dd></div>
                       <div><dt>上下文 / 输出</dt><dd>{selected.modelProfile.contextTokens} / {selected.modelProfile.outputTokens}</dd></div>
                       <div><dt>总令牌上限</dt><dd>{selected.modelProfile.totalTokenLimit}</dd></div>
+                      <div><dt>成本上限</dt><dd>{selected.costLimit ?? "不限"}</dd></div>
                       <div><dt>Generator Home</dt><dd className="mono">{selected.harnessEnvironments.generator.home}</dd></div>
                       <div><dt>Solver Home</dt><dd className="mono">{selected.harnessEnvironments.solver.home}</dd></div>
                     </dl>
@@ -293,12 +285,20 @@ export function App() {
                   <div className="profile-heading"><div><p className="eyebrow">模型配置档</p><h3>尚未配置</h3></div><span className="status">启动前必需</span></div>
                 )}
               </section>
+              <ExperimentWorkbench
+                experimentId={selected.id}
+                modelProfile={credentialRef.trim() && selectedModel ? buildModelProfile() : toModelProfileInput(selected.modelProfile)}
+                onOpenMatch={setReplayMatchId}
+              />
               <ArenaView
                 experimentId={selected.id}
                 canRun={selected.status === "draft" || selected.status === "running"}
                 runMatch={arenaApi.runBaselineMatch}
                 loadLatest={arenaApi.getLatestMatch}
                 loadEvents={arenaApi.getMatchEvents}
+                subscribeEvents={arenaApi.subscribeMatchEvents}
+                replayMatchId={replayMatchId}
+                loadMatch={arenaApi.getMatch}
               />
             </>
           ) : (
@@ -308,4 +308,10 @@ export function App() {
       </main>
     </div>
   );
+}
+
+export function toModelProfileInput(profile: Experiment["modelProfile"]): ModelProfileInput | null {
+  if (!profile) return null;
+  const { providerLabel: _providerLabel, modelLabel: _modelLabel, ...input } = profile;
+  return input;
 }

@@ -14,13 +14,22 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@fastify/websocket": "11.2.0",
     "@maze-arena/contracts": "workspace:*",
+    "@maze-arena/control-plane": "workspace:*",
     "@maze-arena/dsh-integration": "workspace:*",
     "@maze-arena/engine": "workspace:*",
+    "@maze-arena/evaluation": "workspace:*",
+    "@maze-arena/evolution": "workspace:*",
+    "@maze-arena/generator-plugin": "workspace:*",
+    "@maze-arena/lineage": "workspace:*",
+    "@maze-arena/match-profile": "workspace:*",
+    "@maze-arena/solver-plugin": "workspace:*",
     "fastify": "5.5.0"
   },
   "devDependencies": {
     "@types/node": "22.18.0",
+    "@types/ws": "8.18.1",
     "tsx": "4.20.5",
     "typescript": "5.9.2",
     "vitest": "3.2.4"

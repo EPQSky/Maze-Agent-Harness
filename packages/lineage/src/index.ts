@@ -1,0 +1,371 @@
+import { createHash } from "node:crypto";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { spawnSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
+import { validatePluginPackage, type LineageBaseline } from "@maze-arena/match-profile";
+
+export type PluginRole = "generator" | "solver";
+
+export interface CandidateCommitInput {
+  experimentId: string;
+  role: PluginRole;
+  sourceRoot: string;
+  attemptId: string;
+  hypothesis: string;
+  resultSummary: string;
+  outcome: "failed" | "tie" | "public-only" | "promoted";
+  generation?: number;
+  lineageBaseline?: LineageBaseline;
+}
+
+export interface CandidateCommit {
+  commit: string;
+  role: PluginRole;
+  outcome: CandidateCommitInput["outcome"];
+  promotionTag?: string;
+}
+
+export interface LineageEntry {
+  commit: string;
+  subject: string;
+  tags: string[];
+}
+
+interface PromotionRow {
+  experiment_id: string;
+  role: PluginRole;
+  generation: number;
+  tag_name: string;
+  target_commit: string;
+  metadata_json: string;
+  metadata_digest: string;
+  tag_object: string | null;
+  state: "pending" | "complete";
+}
+
+export class LineageTamperError extends Error {
+  constructor(message: string) { super(`插件谱系完整性失败：${message}`); this.name = "LineageTamperError"; }
+}
+
+export class PluginLineageRepository {
+  private readonly database: DatabaseSync;
+
+  constructor(private readonly root: string, databasePath: string) {
+    mkdirSync(root, { recursive: true });
+    if (databasePath !== ":memory:") mkdirSync(dirname(databasePath), { recursive: true });
+    this.database = new DatabaseSync(databasePath);
+    this.database.exec(`CREATE TABLE IF NOT EXISTS lineage_repositories (
+      experiment_id TEXT NOT NULL, role TEXT NOT NULL, repository_path TEXT NOT NULL,
+      baseline_commit TEXT NOT NULL, baseline_tag_object TEXT NOT NULL,
+      PRIMARY KEY (experiment_id, role)
+    );
+    CREATE TABLE IF NOT EXISTS promotion_tags (
+      experiment_id TEXT NOT NULL, role TEXT NOT NULL, generation INTEGER NOT NULL,
+      tag_name TEXT NOT NULL UNIQUE, target_commit TEXT NOT NULL, metadata_json TEXT NOT NULL,
+      metadata_digest TEXT NOT NULL, tag_object TEXT, state TEXT NOT NULL,
+      PRIMARY KEY (experiment_id, role, generation)
+    );
+    CREATE TABLE IF NOT EXISTS lineage_integrity_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, experiment_id TEXT NOT NULL, role TEXT NOT NULL,
+      reason TEXT NOT NULL, occurred_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS blocked_lineages (
+      experiment_id TEXT PRIMARY KEY, reason TEXT NOT NULL
+    );`);
+  }
+
+  async initialize(experimentId: string, role: PluginRole, baselineSource: string): Promise<string> {
+    validateIdentity(experimentId);
+    this.ensureNotBlocked(experimentId);
+    const existing = this.repositoryRow(experimentId, role);
+    if (existing) { this.verifyIntegrity(experimentId, role); return existing.baseline_commit; }
+    await validatePluginPackage(baselineSource);
+    const repository = this.repositoryPath(experimentId, role);
+    if (existsSync(repository)) throw new Error(`谱系目录已存在但未登记：${repository}`);
+    mkdirSync(repository, { recursive: true });
+    git(repository, ["init", "--initial-branch=main"]);
+    git(repository, ["config", "user.name", "Maze Arena Orchestrator"]);
+    git(repository, ["config", "user.email", "arena@localhost"]);
+    replaceWorktree(repository, baselineSource);
+    git(repository, ["add", "-A"]);
+    git(repository, ["commit", "-m", `baseline: ${role}`]);
+    const baselineCommit = git(repository, ["rev-parse", "HEAD"]);
+    const tagName = `baseline/${experimentId}/${role}`;
+    const metadata = canonicalJson({ experimentId, role, kind: "baseline", targetCommit: baselineCommit });
+    git(repository, ["tag", "-a", tagName, baselineCommit, "-m", metadata]);
+    const baselineTagObject = git(repository, ["rev-parse", `${tagName}^{tag}`]);
+    this.database.prepare(`INSERT INTO lineage_repositories
+      (experiment_id, role, repository_path, baseline_commit, baseline_tag_object) VALUES (?, ?, ?, ?, ?)`)
+      .run(experimentId, role, repository, baselineCommit, baselineTagObject);
+    return baselineCommit;
+  }
+
+  async commitCandidate(input: CandidateCommitInput): Promise<CandidateCommit> {
+    validateIdentity(input.experimentId);
+    this.ensureNotBlocked(input.experimentId);
+    this.verifyIntegrity(input.experimentId, input.role);
+    await validatePluginPackage(input.sourceRoot, input.lineageBaseline);
+    const repository = this.repositoryPath(input.experimentId, input.role);
+    const metadata = canonicalJson({
+      attemptId: input.attemptId, hypothesis: input.hypothesis, resultSummary: input.resultSummary, outcome: input.outcome,
+    });
+    if (input.outcome === "promoted" && (!Number.isSafeInteger(input.generation) || (input.generation ?? 0) < 1)) {
+      throw new Error("晋级候选必须提供正整数代次");
+    }
+    const existing = findCandidateCommit(repository, input.attemptId);
+    if (existing) {
+      const message = git(repository, ["show", "-s", "--format=%B", existing]).trim();
+      if (message !== `candidate: ${input.attemptId}\n\n${metadata}`) throw new Error("候选尝试标识与既有 Git 证据冲突");
+      const promotionTag = input.outcome === "promoted"
+        ? this.ensurePromotion(input.experimentId, input.role, input.generation!, existing, {
+          attemptId: input.attemptId, hypothesis: input.hypothesis, resultSummary: input.resultSummary,
+        })
+        : undefined;
+      return { commit: existing, role: input.role, outcome: input.outcome, promotionTag };
+    }
+    replaceWorktree(repository, input.sourceRoot);
+    git(repository, ["add", "-A"]);
+    git(repository, ["commit", "--allow-empty", "-m", `candidate: ${input.attemptId}`, "-m", metadata]);
+    const commit = git(repository, ["rev-parse", "HEAD"]);
+    let promotionTag: string | undefined;
+    if (input.outcome === "promoted") {
+      promotionTag = this.ensurePromotion(input.experimentId, input.role, input.generation!, commit, {
+        attemptId: input.attemptId, hypothesis: input.hypothesis, resultSummary: input.resultSummary,
+      });
+    }
+    return { commit, role: input.role, outcome: input.outcome, promotionTag };
+  }
+
+  ensurePromotion(
+    experimentId: string,
+    role: PluginRole,
+    generation: number,
+    targetCommit: string,
+    metadata: Record<string, string>,
+  ): string {
+    this.ensureNotBlocked(experimentId);
+    const repository = this.repositoryPath(experimentId, role);
+    const tagName = `promotion/${experimentId}/${role}/g${String(generation).padStart(4, "0")}`;
+    const metadataJson = canonicalJson({ experimentId, role, generation, targetCommit, ...metadata });
+    const digest = sha256(metadataJson);
+    let row = this.promotionRow(experimentId, role, generation);
+    if (!row) {
+      this.database.prepare(`INSERT INTO promotion_tags
+        (experiment_id, role, generation, tag_name, target_commit, metadata_json, metadata_digest, tag_object, state)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'pending')`)
+        .run(experimentId, role, generation, tagName, targetCommit, metadataJson, digest);
+      row = this.promotionRow(experimentId, role, generation)!;
+    }
+    if (row.tag_name !== tagName || row.target_commit !== targetCommit || row.metadata_digest !== digest) {
+      return this.tampered(experimentId, role, "晋级标签预期元数据冲突");
+    }
+    const existing = optionalGit(repository, ["rev-parse", `${tagName}^{tag}`]);
+    if (row.state === "complete") {
+      if (!existing || existing !== row.tag_object) return this.tampered(experimentId, role, "已完成晋级标签被删除、移动或替换");
+      this.verifyTag(repository, row);
+      return tagName;
+    }
+    if (!existing) git(repository, ["tag", "-a", tagName, targetCommit, "-m", metadataJson]);
+    const tagObject = git(repository, ["rev-parse", `${tagName}^{tag}`]);
+    const pending = { ...row, tag_object: tagObject };
+    this.verifyTag(repository, pending);
+    this.database.prepare(`UPDATE promotion_tags SET tag_object = ?, state = 'complete'
+      WHERE experiment_id = ? AND role = ? AND generation = ? AND state = 'pending'`)
+      .run(tagObject, experimentId, role, generation);
+    return tagName;
+  }
+
+  verifyIntegrity(experimentId: string, role: PluginRole): void {
+    this.ensureNotBlocked(experimentId);
+    const repositoryRow = this.repositoryRow(experimentId, role);
+    if (!repositoryRow) throw new Error(`尚未初始化 ${role} 谱系`);
+    const repository = repositoryRow.repository_path;
+    if (optionalGit(repository, ["remote"]) !== "") this.tampered(experimentId, role, "谱系仓库出现远程地址");
+    const baselineTag = `baseline/${experimentId}/${role}`;
+    const baselineObject = optionalGit(repository, ["rev-parse", `${baselineTag}^{tag}`]);
+    const baselineTarget = optionalGit(repository, ["rev-parse", `${baselineTag}^{commit}`]);
+    if (baselineObject !== repositoryRow.baseline_tag_object || baselineTarget !== repositoryRow.baseline_commit) {
+      this.tampered(experimentId, role, "基线标签被删除、移动或替换");
+    }
+    const rows = this.database.prepare(`SELECT experiment_id, role, generation, tag_name, target_commit,
+      metadata_json, metadata_digest, tag_object, state FROM promotion_tags WHERE experiment_id = ? AND role = ?`)
+      .all(experimentId, role) as unknown as PromotionRow[];
+    for (const row of rows) {
+      if (row.state === "pending") this.ensurePromotion(experimentId, role, row.generation, row.target_commit, parsePromotionMetadata(row.metadata_json));
+      else {
+        const actual = optionalGit(repository, ["rev-parse", `${row.tag_name}^{tag}`]);
+        if (!actual || actual !== row.tag_object) this.tampered(experimentId, role, "晋级标签完整性不一致");
+        this.verifyTag(repository, row);
+      }
+    }
+  }
+
+  listHistory(experimentId: string, role: PluginRole): LineageEntry[] {
+    this.verifyIntegrity(experimentId, role);
+    const repository = this.repositoryPath(experimentId, role);
+    const lines = git(repository, ["log", "--format=%H%x09%s%x09%D", "--reverse"]).split("\n").filter(Boolean);
+    return lines.map((line) => {
+      const [commit = "", subject = "", decorations = ""] = line.split("\t");
+      const tags = [...decorations.matchAll(/tag: ([^,)]+)/g)].map((match) => match[1]!);
+      return { commit, subject, tags };
+    });
+  }
+
+  diff(experimentId: string, role: PluginRole, from: string, to: string): string {
+    this.verifyIntegrity(experimentId, role);
+    return git(this.repositoryPath(experimentId, role), ["diff", "--no-ext-diff", from, to, "--"]);
+  }
+
+  baselineCommit(experimentId: string, role: PluginRole): string {
+    this.verifyIntegrity(experimentId, role);
+    return this.repositoryRow(experimentId, role)!.baseline_commit;
+  }
+
+  materialize(experimentId: string, role: PluginRole, commit: string, destination: string): void {
+    this.verifyIntegrity(experimentId, role);
+    const repository = this.repositoryPath(experimentId, role);
+    const resolved = optionalGit(repository, ["rev-parse", `${commit}^{commit}`]);
+    if (!resolved) throw new Error(`插件提交不存在：${commit}`);
+    rmSync(destination, { recursive: true, force: true });
+    mkdirSync(destination, { recursive: true });
+    const archive = spawnSync("git", ["-C", repository, "archive", resolved], { encoding: null, maxBuffer: 16 * 1024 * 1024 });
+    if (archive.status !== 0 || !archive.stdout) throw new Error(`无法导出插件提交 ${commit}`);
+    const extract = spawnSync("tar", ["-x", "-C", destination], { input: archive.stdout, encoding: null, maxBuffer: 16 * 1024 * 1024 });
+    if (extract.status !== 0) throw new Error(`无法展开插件提交 ${commit}`);
+  }
+
+  contains(experimentId: string, role: PluginRole, commit: string): boolean {
+    this.verifyIntegrity(experimentId, role);
+    return optionalGit(this.repositoryPath(experimentId, role), ["cat-file", "-e", `${commit}^{commit}`]) !== undefined;
+  }
+
+  branchFrom(sourceId: string, childId: string, role: PluginRole, selectedCommit: string): string {
+    validateIdentity(childId);
+    this.verifyIntegrity(sourceId, role);
+    const source = this.repositoryPath(sourceId, role);
+    const resolved = optionalGit(source, ["rev-parse", `${selectedCommit}^{commit}`]);
+    if (!resolved) throw new Error(`选定的 ${role} 提交不属于源实验谱系`);
+    const destination = this.repositoryPath(childId, role);
+    if (existsSync(destination) || this.repositoryRow(childId, role)) throw new Error(`派生 ${role} 谱系已经存在`);
+    mkdirSync(dirname(destination), { recursive: true });
+    cpSync(source, destination, { recursive: true });
+    const tagName = `baseline/${childId}/${role}`;
+    const metadata = canonicalJson({ experimentId: childId, role, kind: "baseline", targetCommit: resolved });
+    git(destination, ["tag", "-a", tagName, resolved, "-m", metadata]);
+    const tagObject = git(destination, ["rev-parse", `${tagName}^{tag}`]);
+    this.database.prepare(`INSERT INTO lineage_repositories
+      (experiment_id, role, repository_path, baseline_commit, baseline_tag_object) VALUES (?, ?, ?, ?, ?)`)
+      .run(childId, role, destination, resolved, tagObject);
+    return resolved;
+  }
+
+  discardDerived(experimentId: string): void {
+    validateIdentity(experimentId);
+    const promotionCount = this.database.prepare("SELECT COUNT(*) AS count FROM promotion_tags WHERE experiment_id = ?")
+      .get(experimentId) as { count: number };
+    if (promotionCount.count > 0) throw new Error("不能清理已经产生候选或晋级标签的派生谱系");
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare("DELETE FROM lineage_repositories WHERE experiment_id = ?").run(experimentId);
+      this.database.prepare("DELETE FROM lineage_integrity_events WHERE experiment_id = ?").run(experimentId);
+      this.database.prepare("DELETE FROM blocked_lineages WHERE experiment_id = ?").run(experimentId);
+      this.database.exec("COMMIT");
+    } catch (error) { this.database.exec("ROLLBACK"); throw error; }
+    rmSync(join(this.root, experimentId), { recursive: true, force: true });
+  }
+
+  isBlocked(experimentId: string): boolean {
+    return Boolean(this.database.prepare("SELECT 1 FROM blocked_lineages WHERE experiment_id = ?").get(experimentId));
+  }
+
+  close(): void { this.database.close(); }
+
+  private verifyTag(repository: string, row: PromotionRow): void {
+    const target = optionalGit(repository, ["rev-parse", `${row.tag_name}^{commit}`]);
+    const message = optionalGit(repository, ["for-each-ref", `refs/tags/${row.tag_name}`, "--format=%(contents)"]);
+    if (target !== row.target_commit || message === undefined
+      || sha256(message.trim()) !== row.metadata_digest || message.trim() !== row.metadata_json) {
+      this.tampered(row.experiment_id, row.role, "晋级标签目标或元数据不一致");
+    }
+  }
+
+  private tampered(experimentId: string, role: PluginRole, reason: string): never {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare(`INSERT INTO lineage_integrity_events
+        (experiment_id, role, reason, occurred_at) VALUES (?, ?, ?, ?)`)
+        .run(experimentId, role, reason, new Date().toISOString());
+      this.database.prepare("INSERT OR REPLACE INTO blocked_lineages (experiment_id, reason) VALUES (?, ?)").run(experimentId, reason);
+      this.database.exec("COMMIT");
+    } catch (error) { this.database.exec("ROLLBACK"); throw error; }
+    throw new LineageTamperError(reason);
+  }
+
+  private ensureNotBlocked(experimentId: string): void {
+    const row = this.database.prepare("SELECT reason FROM blocked_lineages WHERE experiment_id = ?").get(experimentId) as { reason: string } | undefined;
+    if (row) throw new LineageTamperError(`实验已因既有篡改停止：${row.reason}`);
+  }
+
+  private repositoryPath(experimentId: string, role: PluginRole): string { return join(this.root, experimentId, role); }
+  private repositoryRow(experimentId: string, role: PluginRole) {
+    return this.database.prepare(`SELECT experiment_id, role, repository_path, baseline_commit, baseline_tag_object
+      FROM lineage_repositories WHERE experiment_id = ? AND role = ?`).get(experimentId, role) as {
+        experiment_id: string; role: PluginRole; repository_path: string; baseline_commit: string; baseline_tag_object: string;
+      } | undefined;
+  }
+  private promotionRow(experimentId: string, role: PluginRole, generation: number): PromotionRow | undefined {
+    return this.database.prepare(`SELECT experiment_id, role, generation, tag_name, target_commit,
+      metadata_json, metadata_digest, tag_object, state FROM promotion_tags
+      WHERE experiment_id = ? AND role = ? AND generation = ?`).get(experimentId, role, generation) as unknown as PromotionRow | undefined;
+  }
+}
+
+function replaceWorktree(repository: string, sourceRoot: string): void {
+  for (const entry of readdirSync(repository)) if (entry !== ".git") rmSync(join(repository, entry), { recursive: true, force: true });
+  copyTree(sourceRoot, repository, sourceRoot);
+}
+
+function copyTree(source: string, destination: string, root: string): void {
+  for (const entry of readdirSync(source)) {
+    if (entry === ".git" || entry === "node_modules") continue;
+    const from = join(source, entry);
+    const local = relative(root, from);
+    if (local.split(sep).includes(".git")) continue;
+    const to = join(destination, entry);
+    if (statSync(from).isDirectory()) { mkdirSync(to, { recursive: true }); copyTree(from, to, root); }
+    else cpSync(from, to);
+  }
+}
+
+function git(repository: string, args: string[]): string {
+  const result = spawnSync("git", ["-C", repository, ...args], { encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
+  if (result.status !== 0) throw new Error(`Git 操作失败：git ${args.join(" ")}\n${result.stderr.trim()}`);
+  return result.stdout.trim();
+}
+
+function optionalGit(repository: string, args: string[]): string | undefined {
+  try { return git(repository, args); } catch { return undefined; }
+}
+
+function findCandidateCommit(repository: string, attemptId: string): string | undefined {
+  const subject = `candidate: ${attemptId}`;
+  const line = git(repository, ["log", "--all", "--format=%H%x09%s"]).split("\n")
+    .find((entry) => entry.slice(41) === subject);
+  return line?.slice(0, 40);
+}
+
+function canonicalJson(value: Record<string, unknown>): string {
+  return JSON.stringify(Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right))));
+}
+
+function parsePromotionMetadata(json: string): Record<string, string> {
+  const value = JSON.parse(json) as Record<string, unknown>;
+  const { experimentId: _experimentId, role: _role, generation: _generation, targetCommit: _targetCommit, ...metadata } = value;
+  return Object.fromEntries(Object.entries(metadata).map(([key, entry]) => [key, String(entry)]));
+}
+
+function sha256(value: string): string { return createHash("sha256").update(value).digest("hex"); }
+function validateIdentity(value: string): void {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(value)) throw new Error("实验标识不适合用作谱系命名空间");
+}

@@ -1,0 +1,12 @@
+{
+  "name": "@maze-arena/evolution",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "scripts": { "build": "tsc -p tsconfig.json", "test": "vitest run", "typecheck": "tsc -p tsconfig.json --noEmit" },
+  "dependencies": { "@maze-arena/lineage": "workspace:*" },
+  "devDependencies": { "@types/node": "22.18.0", "typescript": "5.9.2", "vitest": "3.2.4" }
+}

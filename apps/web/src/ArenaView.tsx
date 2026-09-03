@@ -9,9 +9,17 @@ interface ArenaViewProps {
   runMatch: (experimentId: string) => Promise<ArenaMatch>;
   loadLatest: (experimentId: string) => Promise<ArenaMatch | null>;
   loadEvents: (matchId: string, afterSequence: number) => Promise<MatchEventPage>;
+  subscribeEvents?: (
+    matchId: string,
+    afterSequence: number,
+    onPage: (page: MatchEventPage) => void,
+    onError: (error: Error) => void,
+  ) => () => void;
+  replayMatchId?: string;
+  loadMatch?: (matchId: string) => Promise<ArenaMatch>;
 }
 
-export function ArenaView({ experimentId, canRun, runMatch, loadLatest, loadEvents }: ArenaViewProps) {
+export function ArenaView({ experimentId, canRun, runMatch, loadLatest, loadEvents, subscribeEvents, replayMatchId, loadMatch }: ArenaViewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [match, setMatch] = useState<ArenaMatch>();
   const [events, setEvents] = useState<MatchEvent[]>([]);
@@ -32,25 +40,37 @@ export function ArenaView({ experimentId, canRun, runMatch, loadLatest, loadEven
     setCursor(0);
     setPlaying(false);
     setError(undefined);
-    void loadLatest(experimentId).then((latest) => {
+    const request = replayMatchId && loadMatch ? loadMatch(replayMatchId) : loadLatest(experimentId);
+    void request.then((latest) => {
       if (active && latest) setMatch(latest);
     }).catch((reason) => {
       if (active) setError(reason instanceof Error ? reason.message : "读取历史比赛失败");
     });
     return () => { active = false; };
-  }, [experimentId, loadLatest]);
+  }, [experimentId, loadLatest, loadMatch, replayMatchId]);
+
+  useEffect(() => {
+    if (!match || !subscribeEvents || match.status !== "running") return;
+    const after = events.at(-1)?.sequence ?? 0;
+    return subscribeEvents(match.id, after, (page) => {
+      setMatch(page.match);
+      setEvents((current) => appendUnseenEvents(current, page.events));
+    }, () => {
+      // WebSocket 只是低延迟提示；HTTP 分页循环会从 SQLite 权威记录继续补齐。
+    });
+  }, [events, match, subscribeEvents]);
 
   useEffect(() => {
     if (!match) return;
     let active = true;
     const after = events.at(-1)?.sequence ?? 0;
-    if (match.status === "completed" && after >= match.committedEventCount) return;
+    if (match.status !== "running" && after >= match.committedEventCount) return;
     const timer = window.setTimeout(() => {
       void loadEvents(match.id, after).then((page) => {
         if (!active) return;
         setMatch(page.match);
         if (page.events.length > 0) {
-          setEvents((current) => [...current, ...page.events]);
+          setEvents((current) => appendUnseenEvents(current, page.events));
         }
       }).catch((reason) => {
         if (active) setError(reason instanceof Error ? reason.message : "读取比赛事件失败");
@@ -170,4 +190,10 @@ export function ArenaView({ experimentId, canRun, runMatch, loadLatest, loadEven
 
 function phaseLabel(phase: "generation" | "solving" | "completed"): string {
   return phase === "generation" ? "生成" : phase === "solving" ? "求解" : "完成";
+}
+
+function appendUnseenEvents(current: MatchEvent[], incoming: MatchEvent[]): MatchEvent[] {
+  const lastSequence = current.at(-1)?.sequence ?? 0;
+  const unseen = incoming.filter(({ sequence }) => sequence > lastSequence);
+  return unseen.length === 0 ? current : [...current, ...unseen];
 }

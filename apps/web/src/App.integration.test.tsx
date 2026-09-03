@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createArenaServer } from "@maze-arena/server/app";
 import { DeterministicFakeHarnessAdapter } from "@maze-arena/dsh-integration";
+import { runBaselineMatch } from "@maze-arena/engine";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -18,7 +19,11 @@ afterEach(async () => {
 });
 
 function createServer(databasePath: string) {
-  const server = createArenaServer({ databasePath, harnessAdapter: new DeterministicFakeHarnessAdapter() });
+  const server = createArenaServer({
+    databasePath,
+    harnessAdapter: new DeterministicFakeHarnessAdapter(),
+    matchRunner: { run: async (seed: string) => runBaselineMatch(seed) },
+  });
   servers.push(server);
   return server;
 }
@@ -96,11 +101,13 @@ describe("实验工作台端到端持久化", () => {
     await user.type(screen.getByLabelText("凭据引用"), "dsh-credential://basic");
     await user.click(screen.getByRole("button", { name: "保存到当前草稿" }));
     expect(await screen.findByText("确定性基础提供方 / Compact V1")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "启动实验" }));
+    await user.click(screen.getByRole("button", { name: "执行验收" }));
+    await user.click(await screen.findByRole("button", { name: "确认并冻结" }));
+    await user.click(await screen.findByRole("button", { name: "启动进化" }));
 
-    expect(await screen.findByText("已冻结")).toBeInTheDocument();
+    expect(await screen.findByText("generation.snapshot")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "保存到当前草稿" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "启动实验" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "启动进化" })).not.toBeInTheDocument();
 
     const detail = await server.inject({ method: "GET", url: "/api/experiments/legacy-web-id" });
     expect(detail.json()).toMatchObject({

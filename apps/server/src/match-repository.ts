@@ -2,14 +2,15 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { ArenaMatch, CompletedArenaMatch, MatchEvent, MatchEventPage, MatchScore } from "@maze-arena/contracts";
-import { GOAL, GRID_SIZE, MAX_SOLVER_STEPS, START, createInitialProjection, projectMatchEvents, runBaselineMatch, validateMaze } from "@maze-arena/engine";
+import type { ArenaMatch, CompletedArenaMatch, MatchEvent, MatchEventPage, MatchScore, ObservationMatch, RawMatchEventPage } from "@maze-arena/contracts";
+import { GOAL, GRID_SIZE, MAX_SOLVER_STEPS, START, createInitialProjection, projectMatchEvents, validateMaze, type MatchResult } from "@maze-arena/engine";
 
 interface MatchRow {
   id: string; experiment_id: string; seed: string; protocol_version: number; status: string;
   committed_event_count: number; total_event_count: number; score_json: string;
+  observation_json: string | null;
 }
-interface EventRow { sequence: number; event_json: string }
+interface EventRow { sequence: number; protocol_version: number; event_bytes: Uint8Array }
 
 export class MatchDataCorruptError extends Error {
   constructor(message: string) { super(`比赛权威数据损坏：${message}`); this.name = "MatchDataCorruptError"; }
@@ -28,16 +29,17 @@ export class MatchRepository {
 
   private migrateSchema(): void {
     const version = this.database.prepare("PRAGMA user_version").get() as { user_version: number };
-    if (version.user_version > 4) throw new Error(`数据库版本 ${version.user_version} 高于当前支持版本 4`);
+    if (version.user_version > 5) throw new Error(`数据库版本 ${version.user_version} 高于当前支持版本 5`);
     this.database.exec("BEGIN IMMEDIATE");
     try {
       this.database.exec(`CREATE TABLE IF NOT EXISTS matches (
         id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL, seed TEXT NOT NULL, protocol_version INTEGER NOT NULL,
         status TEXT NOT NULL DEFAULT 'completed', committed_event_count INTEGER NOT NULL DEFAULT 0,
-        total_event_count INTEGER NOT NULL DEFAULT 0, score_json TEXT NOT NULL
+        total_event_count INTEGER NOT NULL DEFAULT 0, score_json TEXT NOT NULL, observation_json TEXT
       );
       CREATE TABLE IF NOT EXISTS match_events (
         match_id TEXT NOT NULL, sequence INTEGER NOT NULL, event_json TEXT NOT NULL,
+        protocol_version INTEGER, event_bytes BLOB,
         PRIMARY KEY (match_id, sequence), FOREIGN KEY (match_id) REFERENCES matches(id) ON DELETE CASCADE
       );
       CREATE INDEX IF NOT EXISTS matches_by_experiment ON matches(experiment_id);`);
@@ -47,26 +49,52 @@ export class MatchRepository {
         ["committed_event_count", "INTEGER NOT NULL DEFAULT 0"],
         ["total_event_count", "INTEGER NOT NULL DEFAULT 0"],
       ] as const) if (!columns.has(name)) this.database.exec(`ALTER TABLE matches ADD COLUMN ${name} ${definition}`);
+      if (!columns.has("observation_json")) this.database.exec("ALTER TABLE matches ADD COLUMN observation_json TEXT");
+      const eventColumns = new Set((this.database.prepare("PRAGMA table_info(match_events)").all() as Array<{ name: string }>).map(({ name }) => name));
+      if (!eventColumns.has("protocol_version")) this.database.exec("ALTER TABLE match_events ADD COLUMN protocol_version INTEGER");
+      if (!eventColumns.has("event_bytes")) this.database.exec("ALTER TABLE match_events ADD COLUMN event_bytes BLOB");
+      this.database.exec(`UPDATE match_events SET
+        protocol_version = COALESCE(protocol_version, 1),
+        event_bytes = COALESCE(event_bytes, CAST(event_json AS BLOB))
+        WHERE protocol_version IS NULL OR event_bytes IS NULL`);
       this.database.exec(`UPDATE matches SET
         committed_event_count = (SELECT COUNT(*) FROM match_events WHERE match_id = matches.id),
         total_event_count = (SELECT COUNT(*) FROM match_events WHERE match_id = matches.id)
         WHERE total_event_count = 0`);
-      this.database.exec("PRAGMA user_version = 4");
+      this.database.exec("PRAGMA user_version = 5");
       this.database.exec("COMMIT");
     } catch (error) { this.database.exec("ROLLBACK"); throw error; }
   }
 
-  prepareBaseline(experimentId: string, seed: string): { match: ArenaMatch; events: MatchEvent[]; score: MatchScore } {
-    const result = runBaselineMatch(seed);
-    const match: ArenaMatch = {
-      id: randomUUID(), experimentId, seed, protocolVersion: 1, status: "running",
-      committedEventCount: 0, totalEventCount: result.events.length, score: null,
-    };
-    this.database.prepare(`INSERT INTO matches
-      (id, experiment_id, seed, protocol_version, status, committed_event_count, total_event_count, score_json)
-      VALUES (?, ?, ?, ?, 'running', 0, ?, 'null')`)
-      .run(match.id, experimentId, seed, match.protocolVersion, result.events.length);
+  prepare(experimentId: string, seed: string, result: MatchResult): { match: ArenaMatch; events: MatchEvent[]; score: MatchScore } {
+    const match = this.start(experimentId, seed, result.events.length);
     return { match, events: result.events, score: result.score };
+  }
+
+  start(
+    experimentId: string,
+    seed: string,
+    totalEventCount = 0,
+    observation?: Omit<ObservationMatch, "id">,
+    id: string = randomUUID(),
+  ): ArenaMatch {
+    const existing = this.getMetadata(id);
+    if (existing) {
+      if (existing.experimentId !== experimentId || existing.seed !== seed) throw new Error("幂等比赛标识与既有比赛冲突");
+      return existing;
+    }
+    const match: ArenaMatch = {
+      id, experimentId, seed, protocolVersion: 1, status: "running",
+      committedEventCount: 0, totalEventCount, score: null,
+      ...(observation ? { observation: { id: "", ...observation } } : {}),
+    };
+    if (match.observation) match.observation.id = match.id;
+    this.database.prepare(`INSERT INTO matches
+      (id, experiment_id, seed, protocol_version, status, committed_event_count, total_event_count, score_json, observation_json)
+      VALUES (?, ?, ?, ?, 'running', 0, ?, 'null', ?)`)
+      .run(match.id, experimentId, seed, match.protocolVersion, totalEventCount,
+        match.observation ? JSON.stringify(match.observation) : null);
+    return match;
   }
 
   appendEvents(id: string, events: readonly MatchEvent[], score?: MatchScore): ArenaMatch {
@@ -75,20 +103,26 @@ export class MatchRepository {
       const row = this.getRow(id);
       if (!row) throw new Error(`未找到比赛 ${id}`);
       if (row.status !== "running") throw new Error(`比赛 ${id} 已完成`);
-      const insert = this.database.prepare("INSERT INTO match_events (match_id, sequence, event_json) VALUES (?, ?, ?)");
+      const insert = this.database.prepare(`INSERT INTO match_events
+        (match_id, sequence, event_json, protocol_version, event_bytes) VALUES (?, ?, ?, ?, ?)`);
       let expected = row.committed_event_count + 1;
       for (const event of events) {
         if (event.sequence !== expected) throw new MatchDataCorruptError("待提交事件序号不连续");
-        insert.run(id, event.sequence, JSON.stringify(event));
+        const bytes = Buffer.from(JSON.stringify(event), "utf8");
+        insert.run(id, event.sequence, bytes.toString("utf8"), event.protocolVersion, bytes);
         expected += 1;
       }
       const committed = expected - 1;
       const completed = score !== undefined;
-      if (completed && committed !== row.total_event_count) throw new MatchDataCorruptError("完成时事件尚未全部提交");
-      this.database.prepare("UPDATE matches SET committed_event_count = ?, status = ?, score_json = ? WHERE id = ?")
-        .run(committed, completed ? "completed" : "running", completed ? JSON.stringify(score) : "null", id);
+      this.database.prepare("UPDATE matches SET committed_event_count = ?, total_event_count = ?, status = ?, score_json = ? WHERE id = ?")
+        .run(committed, committed, completed ? "completed" : "running", completed ? JSON.stringify(score) : "null", id);
       this.database.exec("COMMIT");
     } catch (error) { this.database.exec("ROLLBACK"); throw error; }
+    return this.getMetadata(id) as ArenaMatch;
+  }
+
+  fail(id: string): ArenaMatch {
+    this.database.prepare("UPDATE matches SET status = 'failed', total_event_count = committed_event_count, score_json = 'null' WHERE id = ? AND status = 'running'").run(id);
     return this.getMetadata(id) as ArenaMatch;
   }
 
@@ -106,6 +140,21 @@ export class MatchRepository {
     return { match: toMetadata(row, allEvents), events, nextSequence: events.at(-1)?.sequence ?? afterSequence };
   }
 
+  readRawEvents(id: string, afterSequence = 0, limit = 256): RawMatchEventPage | undefined {
+    const row = this.getRow(id);
+    if (!row) return undefined;
+    const events = this.readStoredEvents(row.id)
+      .filter(({ sequence }) => sequence > afterSequence)
+      .slice(0, Math.max(1, Math.min(limit, 1_024)))
+      .map((stored) => ({
+        sequence: stored.sequence,
+        protocolVersion: stored.protocol_version,
+        contentType: "application/json" as const,
+        bytesBase64: Buffer.from(stored.event_bytes).toString("base64"),
+      }));
+    return { matchId: id, events, nextSequence: events.at(-1)?.sequence ?? afterSequence };
+  }
+
   find(id: string): CompletedArenaMatch | undefined {
     const row = this.getRow(id);
     if (!row) return undefined;
@@ -121,21 +170,31 @@ export class MatchRepository {
     return row ? this.getMetadata(row.id) : undefined;
   }
 
+  listForExperiment(experimentId: string): ArenaMatch[] {
+    const rows = this.database.prepare("SELECT id FROM matches WHERE experiment_id = ? ORDER BY rowid DESC")
+      .all(experimentId) as Array<{ id: string }>;
+    return rows.map(({ id }) => this.getMetadata(id)!).filter(Boolean);
+  }
+
   private getRow(id: string): MatchRow | undefined {
     return this.database.prepare(`SELECT id, experiment_id, seed, protocol_version, status,
-      committed_event_count, total_event_count, score_json FROM matches WHERE id = ?`).get(id) as unknown as MatchRow | undefined;
+      committed_event_count, total_event_count, score_json, observation_json FROM matches WHERE id = ?`).get(id) as unknown as MatchRow | undefined;
   }
 
   private readValidatedEvents(row: MatchRow): MatchEvent[] {
-    if (row.protocol_version !== 1 || !["running", "completed"].includes(row.status)) throw new MatchDataCorruptError("比赛元数据非法");
-    const rows = this.database.prepare("SELECT sequence, event_json FROM match_events WHERE match_id = ? ORDER BY sequence")
-      .all(row.id) as unknown as EventRow[];
+    if (row.protocol_version !== 1 || !["running", "completed", "failed"].includes(row.status)) throw new MatchDataCorruptError("比赛元数据非法");
+    const rows = this.readStoredEvents(row.id);
     if (rows.length !== row.committed_event_count || row.committed_event_count > row.total_event_count) {
       throw new MatchDataCorruptError("事件计数与元数据不一致");
     }
     const events = rows.map((stored, index) => parseEvent(stored, index + 1));
     validateEventStream(row, events);
     return events;
+  }
+
+  private readStoredEvents(id: string): EventRow[] {
+    return this.database.prepare(`SELECT sequence, protocol_version, event_bytes
+      FROM match_events WHERE match_id = ? ORDER BY sequence`).all(id) as unknown as EventRow[];
   }
 
   close(): void { this.database.close(); }
@@ -146,13 +205,16 @@ function toMetadata(row: MatchRow, events: MatchEvent[]): ArenaMatch {
     id: row.id, experimentId: row.experiment_id, seed: row.seed, protocolVersion: 1,
     status: row.status as ArenaMatch["status"], committedEventCount: events.length,
     totalEventCount: row.total_event_count, score: row.status === "completed" ? parseScore(row.score_json) : null,
+    ...(row.observation_json ? { observation: JSON.parse(row.observation_json) as ObservationMatch } : {}),
   };
 }
 
 function parseEvent(stored: EventRow, expectedSequence: number): MatchEvent {
   let value: unknown;
-  try { value = JSON.parse(stored.event_json); } catch { throw new MatchDataCorruptError("事件 JSON 无法解析"); }
-  if (!isRecord(value) || stored.sequence !== expectedSequence || value.sequence !== stored.sequence || value.protocolVersion !== 1) {
+  if (stored.protocol_version !== 1) throw new MatchDataCorruptError(`不支持比赛事件协议版本 ${stored.protocol_version}`);
+  try { value = JSON.parse(Buffer.from(stored.event_bytes).toString("utf8")); } catch { throw new MatchDataCorruptError("事件 JSON 无法解析"); }
+  if (!isRecord(value) || stored.sequence !== expectedSequence || value.sequence !== stored.sequence
+    || value.protocolVersion !== stored.protocol_version) {
     throw new MatchDataCorruptError("事件序号或协议版本非法");
   }
   const event = value as unknown as MatchEvent;
@@ -226,7 +288,7 @@ function validateEventStream(row: MatchRow, events: MatchEvent[]): void {
     }
   }
 
-  if (row.status === "running") {
+  if (row.status === "running" || row.status === "failed") {
     if (phase === "completed" || row.score_json !== "null") throw new MatchDataCorruptError("运行中比赛包含完成事实");
     return;
   }

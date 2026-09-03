@@ -1,6 +1,7 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import type {
   CreateExperimentRequest,
@@ -15,22 +16,29 @@ import {
 import { afterEach, describe, expect, it } from "vitest";
 import { createArenaServer } from "./app.js";
 import { createProductionHarnessAdapter } from "./production-harness.js";
+import { runBaselineMatch } from "@maze-arena/engine";
+import type { AutonomousEvolutionAdapter } from "./autonomous-runner.js";
 
 const servers: ReturnType<typeof createArenaServer>[] = [];
+const deterministicMatchRunner = { run: async (seed: string) => runBaselineMatch(seed) };
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => server.close()));
 });
 
-function createTestServer(databasePath: string) {
-  const server = createArenaServer({ databasePath, harnessAdapter: new DeterministicFakeHarnessAdapter() });
+function createTestServer(databasePath: string, autonomousEvolutionAdapter?: AutonomousEvolutionAdapter) {
+  const server = createArenaServer({
+    databasePath, harnessAdapter: new DeterministicFakeHarnessAdapter(), matchRunner: deterministicMatchRunner,
+    autonomousEvolutionAdapter,
+  });
   servers.push(server);
   return server;
 }
 
-async function createExperiment(server: ReturnType<typeof createArenaServer>, name: string) {
+async function createExperiment(server: ReturnType<typeof createArenaServer>, name: string, costLimit?: number) {
   const payload: CreateExperimentRequest = {
     name,
+    ...(costLimit === undefined ? {} : { costLimit }),
     modelProfile: {
       providerId: "fake-basic",
       modelId: "compact-v1",
@@ -52,10 +60,196 @@ async function createExperiment(server: ReturnType<typeof createArenaServer>, na
   return response.json<Experiment>();
 }
 
+async function validateAndConfirm(server: ReturnType<typeof createArenaServer>, id: string): Promise<void> {
+  expect((await server.inject({ method: "POST", url: `/api/experiments/${id}/baseline-validation/run`, payload: {} })).statusCode).toBe(200);
+  expect((await server.inject({ method: "POST", url: `/api/experiments/${id}/baseline-validation/confirm`, payload: {} })).statusCode).toBe(200);
+}
+
+const abortableBlockingAdapter: AutonomousEvolutionAdapter = {
+  runRole: ({ signal }) => new Promise((_resolve, reject) => {
+    if (signal.aborted) { reject(new Error("已取消")); return; }
+    signal.addEventListener("abort", () => reject(new Error("已取消")), { once: true });
+  }),
+};
+
 describe("实验工作台 API", () => {
+  it("监督基线验收通过并确认后才创建就绪运行时，重启仍保持冻结事实", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-baseline-api-"));
+    const databasePath = join(directory, "arena.sqlite");
+    const first = createTestServer(databasePath);
+    const experiment = await createExperiment(first, "监督基线实验");
+    const before = await first.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` });
+    expect(before.statusCode).toBe(404);
+
+    const validation = await first.inject({
+      method: "POST", url: `/api/experiments/${experiment.id}/baseline-validation/run`, payload: { smokeProvider: true },
+    });
+    expect(validation.statusCode).toBe(200);
+    expect(validation.json()).toMatchObject({ status: "passed", operatorConfirmed: false, smoke: { attempted: true, passed: true } });
+    expect(validation.json().steps).toHaveLength(10);
+    expect((await first.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).statusCode).toBe(404);
+
+    const confirmed = await first.inject({ method: "POST", url: `/api/experiments/${experiment.id}/baseline-validation/confirm`, payload: {} });
+    expect(confirmed.json()).toMatchObject({ status: "ready", operatorConfirmed: true, frozenConfiguration: { compatibilityFingerprint: "maze-arena-v1" } });
+    const readyRuntime = (await first.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json<import("@maze-arena/contracts").ExperimentRuntimeSnapshot>();
+    expect(readyRuntime).toMatchObject({ state: "ready", generation: 0, sealed: true });
+    expect(readyRuntime.champions.generator).toMatch(/^[0-9a-f]{40}$/);
+    expect(readyRuntime.champions.solver).toMatch(/^[0-9a-f]{40}$/);
+
+    await first.close();
+    servers.splice(servers.indexOf(first), 1);
+    const restarted = createTestServer(databasePath);
+    expect((await restarted.inject({ method: "GET", url: `/api/experiments/${experiment.id}/baseline-validation` })).json())
+      .toMatchObject({ status: "ready", frozenConfiguration: { compatibilityFingerprint: "maze-arena-v1" } });
+  });
+
+  it("运行 API 在安全边界暂停并拒绝第二个并发实验", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const adapter: AutonomousEvolutionAdapter = {
+      runRole: async ({ role, frozenChampions }) => {
+        await gate;
+        return { result: {
+          candidateCommit: `${role}-candidate`, championBefore: frozenChampions[role], championAfter: frozenChampions[role],
+          outcome: "tie", promotionTag: null, publicProgress: 1, hiddenProgress: 1, aggregate: { primary: 1 },
+        }, usage: { tokens: 10, cost: 0 } };
+      },
+    };
+    const server = createTestServer(":memory:", adapter);
+    const first = await createExperiment(server, "运行实验一");
+    const second = await createExperiment(server, "运行实验二");
+    for (const experiment of [first, second]) {
+      await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/baseline-validation/run`, payload: {} });
+      await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/baseline-validation/confirm`, payload: {} });
+    }
+    expect((await server.inject({ method: "POST", url: `/api/experiments/${first.id}/runtime/start` })).statusCode).toBe(200);
+    const conflict = await server.inject({ method: "POST", url: `/api/experiments/${second.id}/runtime/start` });
+    expect(conflict.statusCode).toBe(409);
+    expect(conflict.json<DomainErrorResponse>().error.message).toMatch(/已有运行中的实验/);
+    await server.inject({ method: "POST", url: `/api/experiments/${first.id}/runtime/pause` });
+    release();
+    let committed = (await server.inject({ method: "GET", url: `/api/experiments/${first.id}/runtime` })).json();
+    for (let attempt = 0; attempt < 100 && committed.generation === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      committed = (await server.inject({ method: "GET", url: `/api/experiments/${first.id}/runtime` })).json();
+    }
+    expect(committed).toMatchObject({ state: "paused", generation: 1, stagnationCount: 1, usage: { tokens: 20, cost: 0 } });
+  });
+
+  it("可编程假 Harness 穿过真实本地适配器完成一代 8/24 配对评测", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-local-evolution-"));
+    const databasePath = join(directory, "arena.sqlite");
+    const delegate = new DeterministicFakeHarnessAdapter();
+    const packagesRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../../packages");
+    const providerCalls = { generator: 0, solver: 0 };
+    const server = createArenaServer({
+      databasePath,
+      matchRunner: deterministicMatchRunner,
+      harnessAdapter: {
+        listModels: () => delegate.listModels(),
+        validateModelProfile: (input) => delegate.validateModelProfile(input),
+        smokeModel: (profile) => delegate.smokeModel(profile),
+        evolvePlugin: async (request) => {
+          providerCalls[request.role] += 1;
+          if (providerCalls[request.role] > 1) {
+            cpSync(join(packagesRoot, `${request.role}-plugin/dist`), join(request.workspace, "dist"), { recursive: true });
+          }
+          return delegate.evolvePlugin(request);
+        },
+      },
+    });
+    servers.push(server);
+    const experiment = await createExperiment(server, "真实本地适配器实验");
+    await validateAndConfirm(server, experiment.id);
+    expect((await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/start` })).statusCode).toBe(200);
+    await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/pause` });
+
+    let snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` }))
+      .json<import("@maze-arena/contracts").ExperimentRuntimeSnapshot>();
+    for (let attempt = 0; attempt < 400 && snapshot.generation === 0 && snapshot.state !== "failed"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json();
+    }
+    expect(snapshot).toMatchObject({ state: "paused", generation: 1, usage: { tokens: 400, cost: 0 } });
+    expect(providerCalls).toEqual({ generator: 2, solver: 2 });
+    expect(snapshot.generations[0]).toMatchObject({
+      generator: { outcome: "tie", publicProgress: 8, hiddenProgress: 24 },
+      solver: { outcome: "tie", publicProgress: 8, hiddenProgress: 24 },
+    });
+  }, 20_000);
+
+  it("比较克隆继承密封套件且展示局不改变代次、冠军或用量", async () => {
+    const server = createTestServer(":memory:");
+    const source = await createExperiment(server, "源实验");
+    await server.inject({ method: "POST", url: `/api/experiments/${source.id}/baseline-validation/run`, payload: {} });
+    await server.inject({ method: "POST", url: `/api/experiments/${source.id}/baseline-validation/confirm`, payload: {} });
+    const sourceRuntime = (await server.inject({ method: "GET", url: `/api/experiments/${source.id}/runtime` })).json<import("@maze-arena/contracts").ExperimentRuntimeSnapshot>();
+    const { providerLabel: _providerLabel, modelLabel: _modelLabel, ...modelProfile } = source.modelProfile!;
+    const cloned = await server.inject({
+      method: "POST", url: `/api/experiments/${source.id}/comparison-clones`, payload: { name: "公平比较克隆", modelProfile, costLimit: 0.75 },
+    });
+    expect(cloned.statusCode).toBe(200);
+    expect(cloned.json()).toMatchObject({
+      evaluationSuiteId: sourceRuntime.evaluationSuiteId, sealGroupId: sourceRuntime.sealGroupId,
+      compatibilityFingerprint: sourceRuntime.compatibilityFingerprint, sealed: true,
+      budget: { tokenLimit: modelProfile.totalTokenLimit, costLimit: 0.75 },
+    });
+    const childId = cloned.json<import("@maze-arena/contracts").ExperimentRuntimeSnapshot>().experimentId;
+    expect((await server.inject({ method: "GET", url: `/api/experiments/${childId}/baseline-validation` })).json())
+      .toMatchObject({ status: "ready", frozenConfiguration: {
+        modelProfile: { providerId: modelProfile.providerId }, tokenLimit: modelProfile.totalTokenLimit, costLimit: 0.75,
+      } });
+
+    const experimentCount = (await server.inject({ method: "GET", url: "/api/experiments" })).json<ExperimentListResponse>().experiments.length;
+    const failedFork = await server.inject({
+      method: "POST", url: `/api/experiments/${source.id}/continuation-forks`,
+      payload: { name: "不完整分支", modelProfile, generatorCommit: sourceRuntime.champions.generator, solverCommit: "0".repeat(40) },
+    });
+    expect(failedFork.statusCode).toBe(409);
+    expect((await server.inject({ method: "GET", url: "/api/experiments" })).json<ExperimentListResponse>().experiments)
+      .toHaveLength(experimentCount);
+
+    const before = (await server.inject({ method: "GET", url: `/api/experiments/${source.id}/runtime` })).json();
+    const exhibition = await server.inject({
+      method: "POST", url: `/api/experiments/${source.id}/exhibitions`,
+      payload: { generatorCommit: sourceRuntime.champions.generator, solverCommit: sourceRuntime.champions.solver, publicSeed: "public-demo" },
+    });
+    expect(exhibition.statusCode).toBe(202);
+    const after = (await server.inject({ method: "GET", url: `/api/experiments/${source.id}/runtime` })).json();
+    expect(after).toEqual(before);
+  });
+
+  it("密封期间隐藏比赛列表只显示聚合元数据且所有单场事件入口拒绝读取", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-hidden-api-"));
+    const databasePath = join(directory, "arena.sqlite");
+    const server = createTestServer(databasePath);
+    const experiment = await createExperiment(server, "隐藏评测实验");
+    await validateAndConfirm(server, experiment.id);
+    const started = await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/matches/baseline`, payload: { seed: "hidden-secret" } });
+    const match = started.json<import("@maze-arena/contracts").ArenaMatch>();
+    let completed = match;
+    for (let attempt = 0; attempt < 100 && completed.status === "running"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      completed = (await server.inject({ method: "GET", url: `/api/matches/${match.id}` })).json();
+    }
+    const database = new DatabaseSync(databasePath);
+    database.prepare("UPDATE matches SET observation_json = ? WHERE id = ?").run(JSON.stringify({
+      id: match.id, generation: 1, role: "generator", opponent: "sealed-opponent",
+      evaluationType: "hidden", result: "won", replayable: true,
+    }), match.id);
+    database.close();
+    const list = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/matches` })).json<import("@maze-arena/contracts").MatchListResponse>();
+    expect(list.matches[0]).toMatchObject({ seed: "[sealed]", observation: { evaluationType: "hidden", replayable: false } });
+    expect((await server.inject({ method: "GET", url: `/api/matches/${match.id}/events` })).statusCode).toBe(403);
+    expect((await server.inject({ method: "GET", url: `/api/matches/${match.id}/raw-events` })).statusCode).toBe(403);
+    const hiddenSocket = await server.injectWS(`/api/matches/${match.id}/live`);
+    const closeCode = await new Promise<number>((resolve) => hiddenSocket.once("close", resolve));
+    expect(closeCode).toBe(1008);
+  });
   it("后台分批提交比赛事件，轮询可观察真实缓冲且不等待动画", async () => {
     const server = createArenaServer({
       databasePath: ":memory:", harnessAdapter: new DeterministicFakeHarnessAdapter(),
+      matchRunner: deterministicMatchRunner,
       matchBatchSize: 40, matchBatchDelayMs: 15,
     });
     servers.push(server);
@@ -74,7 +268,7 @@ describe("实验工作台 API", () => {
     const firstPage = await server.inject({ method: "GET", url: `/api/matches/${match.id}/events?after=0&limit=256` });
     const partial = firstPage.json<import("@maze-arena/contracts").MatchEventPage>();
     expect(partial.match.committedEventCount).toBeGreaterThan(0);
-    expect(partial.match.committedEventCount).toBeLessThan(match.totalEventCount);
+    expect(partial.match.status).toBe("running");
     expect(partial.events[0]?.sequence).toBe(1);
 
     let metadata = partial.match;
@@ -82,7 +276,138 @@ describe("实验工作台 API", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
       metadata = (await server.inject({ method: "GET", url: `/api/matches/${match.id}` })).json();
     }
-    expect(metadata).toMatchObject({ status: "completed", committedEventCount: match.totalEventCount, score: { solved: true } });
+    expect(metadata).toMatchObject({ status: "completed", score: { solved: true } });
+    expect(metadata.committedEventCount).toBe(metadata.totalEventCount);
+  });
+
+  it("延迟 runner 在完成前返回 202，并在运行中递增提交事件", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const runner = {
+      run: async (seed: string, onEvents?: (events: readonly import("@maze-arena/contracts").MatchEvent[]) => Promise<void> | void) => {
+        const result = runBaselineMatch(seed);
+        await onEvents?.(result.events.slice(0, 1));
+        await gate;
+        await onEvents?.(result.events.slice(1));
+        return result;
+      },
+    };
+    const server = createArenaServer({
+      databasePath: ":memory:", harnessAdapter: new DeterministicFakeHarnessAdapter(), matchRunner: runner,
+      matchBatchDelayMs: 0,
+    });
+    servers.push(server);
+    const experiment = await createExperiment(server, "延迟原生比赛");
+
+    const response = await Promise.race([
+      server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/matches/baseline`, payload: { seed: "slow-seed" } }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("202 未在 runner 完成前返回")), 200)),
+    ]);
+    expect(response.statusCode).toBe(202);
+    const match = response.json<import("@maze-arena/contracts").ArenaMatch>();
+    const partial = (await server.inject({ method: "GET", url: `/api/matches/${match.id}` }))
+      .json<import("@maze-arena/contracts").ArenaMatch>();
+    expect(partial).toMatchObject({ status: "running", committedEventCount: 1, totalEventCount: 1 });
+
+    release();
+    let completed = partial;
+    for (let attempt = 0; attempt < 40 && completed.status !== "completed"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      completed = (await server.inject({ method: "GET", url: `/api/matches/${match.id}` })).json();
+    }
+    expect(completed.status).toBe("completed");
+    expect(completed.committedEventCount).toBeGreaterThan(partial.committedEventCount);
+  });
+
+  it("runner 失败后保留已提交事件并写入稳定 failed 终态", async () => {
+    const runner = {
+      run: async (seed: string, onEvents?: (events: readonly import("@maze-arena/contracts").MatchEvent[]) => Promise<void> | void) => {
+        await onEvents?.(runBaselineMatch(seed).events.slice(0, 1));
+        throw new Error("受控 runner 故障");
+      },
+    };
+    const server = createArenaServer({
+      databasePath: ":memory:", harnessAdapter: new DeterministicFakeHarnessAdapter(), matchRunner: runner,
+    });
+    servers.push(server);
+    const experiment = await createExperiment(server, "失败原生比赛");
+    const started = await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/matches/baseline`, payload: {} });
+    const match = started.json<import("@maze-arena/contracts").ArenaMatch>();
+
+    let failed = match;
+    for (let attempt = 0; attempt < 40 && failed.status !== "failed"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      failed = (await server.inject({ method: "GET", url: `/api/matches/${match.id}` })).json();
+    }
+    expect(failed).toMatchObject({ status: "failed", committedEventCount: 1, totalEventCount: 1, score: null });
+  });
+
+  it("WebSocket 断线后以最后确认序号从 SQLite 补齐且不重不漏", async () => {
+    const server = createArenaServer({
+      databasePath: ":memory:", harnessAdapter: new DeterministicFakeHarnessAdapter(),
+      matchRunner: deterministicMatchRunner, matchBatchSize: 12, matchBatchDelayMs: 5,
+    });
+    servers.push(server);
+    const experiment = await createExperiment(server, "断线恢复比赛");
+    const started = await server.inject({
+      method: "POST", url: `/api/experiments/${experiment.id}/matches/baseline`, payload: { seed: "reconnect-seed" },
+    });
+    const match = started.json<import("@maze-arena/contracts").ArenaMatch>();
+    await server.ready();
+
+    const firstSocket = await server.injectWS(`/api/matches/${match.id}/live?after=0`);
+    const firstDelivery = await new Promise<import("@maze-arena/contracts").MatchEventDelivery>((resolve) => {
+      firstSocket.once("message", (data) => resolve(JSON.parse(data.toString())));
+    });
+    expect(firstDelivery.page.events[0]?.sequence).toBe(1);
+    const acknowledged = firstDelivery.page.nextSequence;
+    firstSocket.send(JSON.stringify({ type: "match.ack", sequence: acknowledged }));
+    firstSocket.close();
+
+    const secondSocket = await server.injectWS(`/api/matches/${match.id}/live?after=${acknowledged}`);
+    const received = [...firstDelivery.page.events];
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("断线恢复未收到完成事件")), 2_000);
+      secondSocket.on("message", (data) => {
+        const delivery = JSON.parse(data.toString()) as import("@maze-arena/contracts").MatchEventDelivery;
+        received.push(...delivery.page.events);
+        secondSocket.send(JSON.stringify({ type: "match.ack", sequence: delivery.page.nextSequence }));
+        if (delivery.page.match.status === "completed") {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+    });
+    secondSocket.close();
+    expect(received.map(({ sequence }) => sequence)).toEqual(
+      Array.from({ length: received.length }, (_, index) => index + 1),
+    );
+    expect(received.at(-1)?.type).toBe("match.completed");
+  });
+
+  it("比赛事件与带真实时间的审计事件分表读取", async () => {
+    const server = createTestServer(":memory:");
+    const experiment = await createExperiment(server, "审计分离实验");
+    const started = await server.inject({
+      method: "POST", url: `/api/experiments/${experiment.id}/matches/baseline`, payload: { seed: "audit-seed" },
+    });
+    const match = started.json<import("@maze-arena/contracts").ArenaMatch>();
+    let metadata = match;
+    for (let attempt = 0; attempt < 60 && metadata.status === "running"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      metadata = (await server.inject({ method: "GET", url: `/api/matches/${match.id}` })).json();
+    }
+    const events = (await server.inject({ method: "GET", url: `/api/matches/${match.id}/events` }))
+      .json<import("@maze-arena/contracts").MatchEventPage>();
+    const audit = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/audit-events` }))
+      .json<import("@maze-arena/contracts").ExperimentAuditEventPage>();
+    const remoteAudit = await server.inject({
+      method: "GET", url: `/api/experiments/${experiment.id}/audit-events`, remoteAddress: "203.0.113.10",
+    });
+    expect(events.events.every((event) => !("occurredAt" in event))).toBe(true);
+    expect(audit.events.map(({ type }) => type)).toEqual(["match.started", "match.completed"]);
+    expect(audit.events.every(({ occurredAt }) => /^\d{4}-\d{2}-\d{2}T/.test(occurredAt))).toBe(true);
+    expect(remoteAudit.statusCode).toBe(403);
   });
 
   it.each(["paused", "completed", "failed", "cancelled"] as const)("%s 实验拒绝运行基线比赛", async (status) => {
@@ -105,7 +430,7 @@ describe("实验工作台 API", () => {
     const directory = mkdtempSync(join(tmpdir(), "maze-corrupt-api-"));
     const databasePath = join(directory, "arena.sqlite");
     const server = createArenaServer({
-      databasePath, harnessAdapter: new DeterministicFakeHarnessAdapter(), matchBatchDelayMs: 10_000,
+      databasePath, harnessAdapter: new DeterministicFakeHarnessAdapter(), matchRunner: deterministicMatchRunner, matchBatchDelayMs: 25,
     });
     servers.push(server);
     const experiment = await createExperiment(server, "损坏读取实验");
@@ -140,6 +465,29 @@ describe("实验工作台 API", () => {
     expect(created.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(list.json<ExperimentListResponse>()).toEqual({ experiments: [created] });
     expect(detail.json<Experiment>()).toEqual(created);
+  });
+
+  it("可选成本上限随实验冻结并进入可信运行时预算", async () => {
+    const server = createTestServer(":memory:");
+    const created = await createExperiment(server, "成本预算实验", 0.5);
+    await validateAndConfirm(server, created.id);
+
+    expect(created.costLimit).toBe(0.5);
+    expect((await server.inject({ method: "GET", url: `/api/experiments/${created.id}/baseline-validation` })).json())
+      .toMatchObject({ frozenConfiguration: { tokenLimit: 5_000, costLimit: 0.5 } });
+    expect((await server.inject({ method: "GET", url: `/api/experiments/${created.id}/runtime` })).json())
+      .toMatchObject({ budget: { tokenLimit: 5_000, costLimit: 0.5 } });
+
+    const invalid = await server.inject({
+      method: "POST", url: "/api/experiments", payload: {
+        name: "非法成本预算", costLimit: 0, modelProfile: {
+          providerId: "fake-basic", modelId: "compact-v1", credentialRef: "dsh-credential://basic",
+          contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000,
+        },
+      },
+    });
+    expect(invalid).toMatchObject({ statusCode: 400 });
+    expect(invalid.json<DomainErrorResponse>().error.code).toBe("EXPERIMENT_BUDGET_INVALID");
   });
 
   it("暴露 Harness 模型能力，并在保存前返回逐字段配置错误", async () => {
@@ -202,7 +550,7 @@ describe("实验工作台 API", () => {
     expect(updated.statusCode).toBe(200);
     expect(updated.json<Experiment>().modelProfile).toMatchObject(replacement);
 
-    await server.inject({ method: "POST", url: `/api/experiments/${created.id}/start` });
+    await validateAndConfirm(server, created.id);
     const rejected = await server.inject({
       method: "PUT",
       url: `/api/experiments/${created.id}/model-profile`,
@@ -222,6 +570,7 @@ describe("实验工作台 API", () => {
     let enabled = true;
     const server = createArenaServer({
       databasePath: ":memory:",
+      matchRunner: deterministicMatchRunner,
       harnessAdapter: {
         listModels: () => delegate.listModels(),
         validateModelProfile: (input) => {
@@ -301,31 +650,18 @@ describe("实验工作台 API", () => {
     expect(restored.json<Experiment>()).toMatchObject({ id: "legacy-id", name: "Ticket 01 实验", modelProfile: null });
   });
 
-  it("冻结事务阻止另一连接在复验与启动之间替换配置", async () => {
+  it("基线确认后冻结配置并拒绝另一连接通过公共 API 替换", async () => {
     const directory = mkdtempSync(join(tmpdir(), "maze-arena-freeze-"));
     const databasePath = join(directory, "arena.sqlite");
     const delegate = new DeterministicFakeHarnessAdapter();
     let attack = false;
-    let targetId = "";
-    let competingWriteError = "";
     const server = createArenaServer({
       databasePath,
+      matchRunner: deterministicMatchRunner,
       harnessAdapter: {
         listModels: () => delegate.listModels(),
         validateModelProfile: (input) => {
           const validated = delegate.validateModelProfile(input);
-          if (attack) {
-            const competitor = new DatabaseSync(databasePath);
-            competitor.exec("PRAGMA busy_timeout = 1");
-            try {
-              competitor.prepare("UPDATE experiments SET model_profile_json = ? WHERE id = ?")
-                .run(JSON.stringify({ ...validated, providerId: "tampered" }), targetId);
-            } catch (error) {
-              competingWriteError = error instanceof Error ? error.message : String(error);
-            } finally {
-              competitor.close();
-            }
-          }
           return validated;
         },
       },
@@ -343,16 +679,15 @@ describe("实验工作台 API", () => {
       },
     });
     const created = createdResponse.json<Experiment>();
-    targetId = created.id;
+    await validateAndConfirm(server, created.id);
     attack = true;
-
-    const started = await server.inject({ method: "POST", url: `/api/experiments/${created.id}/start` });
-    expect(started.statusCode).toBe(200);
-    expect(competingWriteError).toMatch(/locked|busy/i);
-    expect(started.json<Experiment>()).toMatchObject({
-      status: "running",
-      modelProfile: { providerId: "fake-basic" },
+    const rejected = await server.inject({
+      method: "PUT", url: `/api/experiments/${created.id}/model-profile`,
+      payload: { modelProfile: { ...created.modelProfile, providerId: "tampered" } },
     });
+    expect(rejected.statusCode).toBe(409);
+    expect((await server.inject({ method: "GET", url: `/api/experiments/${created.id}` })).json<Experiment>())
+      .toMatchObject({ status: "draft", modelProfile: { providerId: "fake-basic" } });
   });
 
   it("生产入口只读取版本化 Harness 导出且不会暴露 fake catalog", () => {
@@ -375,44 +710,118 @@ describe("实验工作台 API", () => {
     const production = createProductionHarnessAdapter({
       DSH_HARNESS_EXPORT_PATH: exportPath,
       DSH_HARNESS_VERSION: "2026.09-preview.1",
+      DSH_EVOLUTION_COMMAND: "/bin/false",
+      DSH_SMOKE_COMMAND: "/bin/false",
     });
     expect(production.listModels().providers.map(({ id }) => id)).toEqual(["configured-provider"]);
     expect(() => createProductionHarnessAdapter({})).toThrow(/必须配置/);
+    expect(() => createProductionHarnessAdapter({
+      DSH_HARNESS_EXPORT_PATH: exportPath,
+      DSH_HARNESS_VERSION: "2026.09-preview.1",
+      DSH_EVOLUTION_COMMAND: "/bin/false",
+    })).toThrow(/DSH_SMOKE_COMMAND/);
+  });
+
+  it("生产 Harness 通过无 shell JSON 进程桥接返回可信用量与实际 reasoning", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-production-evolve-"));
+    const exportPath = join(directory, "models.json");
+    const commandPath = join(directory, "evolve.mjs");
+    const smokePath = join(directory, "smoke.mjs");
+    writeFileSync(exportPath, JSON.stringify({
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
+        reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
+      } }] }],
+    }));
+    writeFileSync(commandPath, `#!/usr/bin/env node\nlet input="";for await(const chunk of process.stdin)input+=chunk;const request=JSON.parse(input);process.stdout.write(JSON.stringify({hypothesis:request.attemptId,strategyPlan:"plan",submitted:true,usage:{tokens:321,cost:0.12},reasoning:"provider reasoning",toolActivity:"read,test"}));\n`);
+    writeFileSync(smokePath, `#!/usr/bin/env node\nlet input="";for await(const chunk of process.stdin)input+=chunk;const request=JSON.parse(input);process.stdout.write(JSON.stringify({providerText:request.modelProfile.modelId+":"+process.env.DSH_HARNESS_OPERATION}));\n`);
+    chmodSync(commandPath, 0o755);
+    chmodSync(smokePath, 0o755);
+    const adapter = createProductionHarnessAdapter({
+      DSH_HARNESS_EXPORT_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
+      DSH_EVOLUTION_COMMAND: commandPath, DSH_SMOKE_COMMAND: smokePath,
+    });
+    const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model", credentialRef: "dsh-credential://production",
+      contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+    await expect(adapter.evolvePlugin!({ experimentId: "exp", generation: 1, role: "generator", attemptId: "attempt-1",
+      modelProfile, workspace: directory, repairAttempt: 0, diagnostics: [] })).resolves.toMatchObject({
+      hypothesis: "attempt-1", usage: { tokens: 321, cost: 0.12 }, reasoning: "provider reasoning",
+    });
+    await expect(adapter.smokeModel!(modelProfile)).resolves.toMatchObject({ providerText: "model:smoke" });
+  });
+
+  it("生产 Harness 拒绝扩展响应字段并可取消活动子进程", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-production-guard-"));
+    const exportPath = join(directory, "models.json");
+    const commandPath = join(directory, "evolve.mjs");
+    writeFileSync(exportPath, JSON.stringify({
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
+        reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
+      } }] }],
+    }));
+    writeFileSync(commandPath, `#!/usr/bin/env node\nlet input="";for await(const chunk of process.stdin)input+=chunk;const request=JSON.parse(input);if(request.attemptId==="block"){setInterval(()=>{},1000);await new Promise(()=>{});}process.stdout.write(JSON.stringify({hypothesis:"h",strategyPlan:"p",submitted:true,usage:{tokens:1,cost:0,untrusted:true}}));\n`);
+    chmodSync(commandPath, 0o755);
+    const adapter = createProductionHarnessAdapter({
+      DSH_HARNESS_EXPORT_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
+      DSH_EVOLUTION_COMMAND: commandPath, DSH_SMOKE_COMMAND: "/bin/false",
+    });
+    const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model", credentialRef: "dsh-credential://production",
+      contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+    const request = { experimentId: "exp", generation: 1, role: "generator" as const,
+      modelProfile, workspace: directory, repairAttempt: 0, diagnostics: [] };
+    await expect(adapter.evolvePlugin!({ ...request, attemptId: "invalid" })).rejects.toThrow(/响应字段非法/);
+
+    const controller = new AbortController();
+    const blocked = adapter.evolvePlugin!({ ...request, attemptId: "block", signal: controller.signal });
+    setTimeout(() => controller.abort(), 20);
+    await expect(blocked).rejects.toThrow(/已取消/);
+  });
+
+  it("服务器兼容性指纹变化后拒绝恢复已冻结实验", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-fingerprint-restart-"));
+    const databasePath = join(directory, "arena.sqlite");
+    const first = createArenaServer({ databasePath, harnessAdapter: new DeterministicFakeHarnessAdapter(),
+      matchRunner: deterministicMatchRunner, compatibilityFingerprint: "compat-v1" });
+    servers.push(first);
+    const experiment = await createExperiment(first, "指纹冻结实验");
+    await validateAndConfirm(first, experiment.id);
+    await first.close();
+    servers.splice(servers.indexOf(first), 1);
+    const restarted = createArenaServer({ databasePath, harnessAdapter: new DeterministicFakeHarnessAdapter(),
+      matchRunner: deterministicMatchRunner, compatibilityFingerprint: "compat-v2" });
+    servers.push(restarted);
+    const response = await restarted.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/start` });
+    expect(response.statusCode).toBe(409);
+    expect(response.json<DomainErrorResponse>().error.message).toMatch(/兼容性指纹已变化/);
   });
 
   it("已有运行实验时拒绝启动第二个实验并返回领域错误", async () => {
-    const server = createTestServer(":memory:");
+    const server = createTestServer(":memory:", abortableBlockingAdapter);
     const first = await createExperiment(server, "实验一");
     const second = await createExperiment(server, "实验二");
 
-    const responses = await Promise.all([
-      server.inject({ method: "POST", url: `/api/experiments/${first.id}/start` }),
-      server.inject({ method: "POST", url: `/api/experiments/${second.id}/start` }),
-    ]);
-    const accepted = responses.find((response) => response.statusCode === 200);
-    const rejected = responses.find((response) => response.statusCode === 409);
-
-    expect(accepted?.json<Experiment>()).toMatchObject({ status: "running" });
-    expect(rejected?.json<DomainErrorResponse>()).toEqual({
-      error: {
-        code: "ACTIVE_EXPERIMENT_EXISTS",
-        message: "当前 Arena 已有运行中的实验",
-      },
-    });
+    await validateAndConfirm(server, first.id);
+    await validateAndConfirm(server, second.id);
+    expect((await server.inject({ method: "POST", url: `/api/experiments/${first.id}/runtime/start` })).statusCode).toBe(200);
+    const rejected = await server.inject({ method: "POST", url: `/api/experiments/${second.id}/runtime/start` });
+    expect(rejected.statusCode).toBe(409);
+    expect(rejected.json<DomainErrorResponse>().error.message).toMatch(/已有运行中的实验/);
   });
 
   it("重复启动同一实验返回稳定的非法状态转换错误", async () => {
-    const server = createTestServer(":memory:");
+    const server = createTestServer(":memory:", abortableBlockingAdapter);
     const experiment = await createExperiment(server, "重复启动实验");
-    const first = await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/start` });
-    const repeated = await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/start` });
+    await validateAndConfirm(server, experiment.id);
+    const first = await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/start` });
+    const repeated = await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/start` });
 
     expect(first.statusCode).toBe(200);
     expect(repeated.statusCode).toBe(409);
     expect(repeated.json<DomainErrorResponse>()).toEqual({
       error: {
-        code: "INVALID_EXPERIMENT_STATE",
-        message: "实验当前状态 running 不允许启动",
+        code: "RUNTIME_STATE_INVALID",
+        message: "状态 running 不允许启动或恢复",
       },
     });
   });

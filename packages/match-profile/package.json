@@ -1,0 +1,27 @@
+{
+  "name": "@maze-arena/match-profile",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./host": "./dist/host.js"
+  },
+  "files": ["dist", "cordis.patch.yml"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run --testTimeout=20000",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@babel/parser": "7.29.8",
+    "@maze-arena/contracts": "workspace:*",
+    "@maze-arena/engine": "workspace:*",
+    "npm-packlist": "10.0.4",
+    "yaml": "2.9.0"
+  },
+  "devDependencies": { "@types/node": "22.18.0", "typescript": "5.9.2", "vitest": "3.2.4" }
+}

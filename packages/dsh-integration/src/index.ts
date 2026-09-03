@@ -13,6 +13,29 @@ import type {
 export interface HarnessAdapter {
   listModels(): HarnessCatalogResponse;
   validateModelProfile(input: ModelProfileInput): ModelProfile;
+  smokeModel?(profile: ModelProfile): Promise<{ providerText?: string }>;
+  evolvePlugin?(request: HarnessEvolutionRequest): Promise<HarnessEvolutionResponse>;
+}
+
+export interface HarnessEvolutionRequest {
+  experimentId: string;
+  generation: number;
+  role: "generator" | "solver";
+  attemptId: string;
+  modelProfile: ModelProfile;
+  workspace: string;
+  repairAttempt: number;
+  diagnostics: readonly string[];
+  signal?: AbortSignal;
+}
+
+export interface HarnessEvolutionResponse {
+  hypothesis: string;
+  strategyPlan: string;
+  submitted: boolean;
+  usage: { tokens: number; cost: number };
+  reasoning?: string;
+  toolActivity?: string;
 }
 
 export interface ModelProfileIssue {
@@ -332,6 +355,21 @@ export class DeterministicFakeHarnessAdapter implements HarnessAdapter {
 
   validateModelProfile(input: ModelProfileInput): ModelProfile {
     return validateAgainstCatalog(input, catalog, fakeCredentialRefs);
+  }
+
+  async smokeModel(profile: ModelProfile): Promise<{ providerText?: string }> {
+    return { providerText: `fake-smoke:${profile.providerId}/${profile.modelId}` };
+  }
+
+  async evolvePlugin(request: HarnessEvolutionRequest): Promise<HarnessEvolutionResponse> {
+    return {
+      hypothesis: `${request.role} 第 ${request.generation} 代确定性候选`,
+      strategyPlan: `尝试 ${request.attemptId}，保持协议与资源边界。`,
+      submitted: true,
+      usage: { tokens: 100, cost: 0 },
+      reasoning: "确定性假 Harness 已完成候选分析",
+      toolActivity: "read,test,submit",
+    };
   }
 }
 

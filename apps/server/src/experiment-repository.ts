@@ -15,6 +15,7 @@ interface ExperimentRow {
   status: ExperimentStatus;
   created_at: string;
   model_profile_json: string | null;
+  cost_limit: number | null;
   generator_home: string;
   generator_workspace: string;
   solver_home: string;
@@ -56,6 +57,7 @@ function toExperiment(row: ExperimentRow): Experiment {
     status: row.status,
     createdAt: row.created_at,
     modelProfile: row.model_profile_json ? JSON.parse(row.model_profile_json) as ModelProfile : null,
+    costLimit: row.cost_limit,
     harnessEnvironments: {
       generator: { home: row.generator_home, workspace: row.generator_workspace },
       solver: { home: row.solver_home, workspace: row.solver_workspace },
@@ -79,8 +81,8 @@ export class ExperimentRepository {
 
   private migrateSchema(): void {
     const version = this.database.prepare("PRAGMA user_version").get() as { user_version: number };
-    if (version.user_version > 4) {
-      throw new Error(`数据库版本 ${version.user_version} 高于当前支持版本 4`);
+    if (version.user_version > 5) {
+      throw new Error(`数据库版本 ${version.user_version} 高于当前支持版本 5`);
     }
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -94,6 +96,7 @@ export class ExperimentRepository {
         ),
         created_at TEXT NOT NULL,
         model_profile_json TEXT,
+        cost_limit REAL,
         generator_home TEXT,
         generator_workspace TEXT,
         solver_home TEXT,
@@ -103,6 +106,7 @@ export class ExperimentRepository {
         const columns = new Set((this.database.prepare("PRAGMA table_info(experiments)").all() as Array<{ name: string }>).map(({ name }) => name));
         for (const [name, type] of [
           ["model_profile_json", "TEXT"],
+          ["cost_limit", "REAL"],
           ["generator_home", "TEXT"],
           ["generator_workspace", "TEXT"],
           ["solver_home", "TEXT"],
@@ -138,7 +142,7 @@ export class ExperimentRepository {
     }
   }
 
-  create(name: string, modelProfile: ModelProfile): Experiment {
+  create(name: string, modelProfile: ModelProfile, costLimit: number | null = null): Experiment {
     const id = randomUUID();
     const harnessEnvironments = createHarnessAgentEnvironments(this.harnessRoot, id);
     const experiment: Experiment = {
@@ -147,20 +151,22 @@ export class ExperimentRepository {
       status: "draft",
       createdAt: new Date().toISOString(),
       modelProfile,
+      costLimit,
       harnessEnvironments,
     };
 
     this.database
       .prepare(`INSERT INTO experiments (
-        id, name, status, created_at, model_profile_json,
+        id, name, status, created_at, model_profile_json, cost_limit,
         generator_home, generator_workspace, solver_home, solver_workspace
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         experiment.id,
         experiment.name,
         experiment.status,
         experiment.createdAt,
         JSON.stringify(modelProfile),
+        costLimit,
         harnessEnvironments.generator.home,
         harnessEnvironments.generator.workspace,
         harnessEnvironments.solver.home,
@@ -172,7 +178,7 @@ export class ExperimentRepository {
 
   list(): Experiment[] {
     const rows = this.database
-      .prepare(`SELECT id, name, status, created_at, model_profile_json,
+      .prepare(`SELECT id, name, status, created_at, model_profile_json, cost_limit,
         generator_home, generator_workspace, solver_home, solver_workspace
         FROM experiments ORDER BY created_at DESC, id DESC`)
       .all() as unknown as ExperimentRow[];
@@ -181,7 +187,7 @@ export class ExperimentRepository {
 
   find(id: string): Experiment | undefined {
     const row = this.database
-      .prepare(`SELECT id, name, status, created_at, model_profile_json,
+      .prepare(`SELECT id, name, status, created_at, model_profile_json, cost_limit,
         generator_home, generator_workspace, solver_home, solver_workspace
         FROM experiments WHERE id = ?`)
       .get(id) as unknown as ExperimentRow | undefined;
@@ -225,6 +231,22 @@ export class ExperimentRepository {
       .run(JSON.stringify(modelProfile), id);
     if (Number(result.changes) !== 1) throw new ModelProfileFrozenError();
     return this.find(id) as Experiment;
+  }
+
+  setStatus(id: string, status: ExperimentStatus): Experiment {
+    const existing = this.find(id);
+    if (!existing) throw new ExperimentNotFoundError(id);
+    try {
+      this.database.prepare("UPDATE experiments SET status = ? WHERE id = ?").run(status, id);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("UNIQUE constraint")) throw new ActiveExperimentExistsError();
+      throw error;
+    }
+    return this.find(id)!;
+  }
+
+  discardDraft(id: string): void {
+    this.database.prepare("DELETE FROM experiments WHERE id = ? AND status = 'draft'").run(id);
   }
 
   close(): void {

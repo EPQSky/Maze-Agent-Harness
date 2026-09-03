@@ -9,7 +9,7 @@
   "scripts": {
     "build": "pnpm -r build",
     "dev": "pnpm --parallel --filter @maze-arena/server --filter @maze-arena/web dev",
-    "test": "pnpm --filter @maze-arena/contracts --filter @maze-arena/dsh-integration --filter @maze-arena/engine build && pnpm -r test",
-    "typecheck": "pnpm --filter @maze-arena/contracts --filter @maze-arena/dsh-integration --filter @maze-arena/engine build && pnpm -r typecheck"
+    "test": "pnpm --filter @maze-arena/contracts --filter @maze-arena/dsh-integration --filter @maze-arena/engine --filter @maze-arena/generator-plugin --filter @maze-arena/solver-plugin --filter @maze-arena/match-profile --filter @maze-arena/evaluation --filter @maze-arena/lineage --filter @maze-arena/evolution --filter @maze-arena/control-plane build && pnpm -r test",
+    "typecheck": "pnpm --filter @maze-arena/contracts --filter @maze-arena/dsh-integration --filter @maze-arena/engine --filter @maze-arena/generator-plugin --filter @maze-arena/solver-plugin --filter @maze-arena/match-profile --filter @maze-arena/evaluation --filter @maze-arena/lineage --filter @maze-arena/evolution --filter @maze-arena/control-plane build && pnpm -r typecheck"
   }
 }
