@@ -28,7 +28,7 @@ import {
   ModelProfileValidationError,
   validateModelProfileSnapshot,
 } from "@maze-arena/dsh-integration";
-import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyServerOptions } from "fastify";
 import websocket from "@fastify/websocket";
 import {
   ActiveExperimentExistsError,
@@ -47,16 +47,18 @@ import { AutonomousExperimentRunner, type AutonomousEvolutionAdapter } from "./a
 import { createLocalEvolutionAdapter } from "./local-evolution-adapter.js";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { extname, join } from "node:path";
 import { runVersionedPluginMatch } from "./versioned-match-runner.js";
 
 export interface ArenaServerOptions {
   databasePath: string;
   harnessRoot?: string;
   harnessAdapter: HarnessAdapter;
-  logger?: boolean;
+  logger?: FastifyServerOptions["logger"];
+  webRoot?: string;
+  startupCommitted?: () => boolean;
   matchBatchSize?: number;
   matchBatchDelayMs?: number;
   matchRunner: ArenaMatchRunner;
@@ -65,6 +67,61 @@ export interface ArenaServerOptions {
   pluginRoots?: { generator: string; solver: string };
   autonomousEvolutionAdapter?: AutonomousEvolutionAdapter;
 }
+
+type ShutdownSignal = "SIGTERM" | "SIGINT";
+
+interface ShutdownSignalTarget {
+  on(signal: ShutdownSignal, listener: () => void): unknown;
+  off(signal: ShutdownSignal, listener: () => void): unknown;
+}
+
+export function installPersistentShutdownHandlers(
+  close: () => Promise<void>,
+  onFailure: (error: unknown) => void,
+  target: ShutdownSignalTarget = process,
+  holdOpen: () => () => void = () => {
+    const timer = setInterval(() => {}, 60_000);
+    return () => clearInterval(timer);
+  },
+): { begin: () => Promise<void> } {
+  const signals: ShutdownSignal[] = ["SIGTERM", "SIGINT"];
+  let closing: Promise<void> | undefined;
+  let failureReported = false;
+  let releaseHold: (() => void) | undefined;
+  const dispose = () => {
+    for (const signal of signals) target.off(signal, handleSignal);
+  };
+  const begin = () => {
+    releaseHold ??= holdOpen();
+    closing ??= Promise.resolve()
+      .then(close)
+      .then(() => {
+        releaseHold?.();
+        dispose();
+      }, (error) => {
+        if (!failureReported) {
+          failureReported = true;
+          onFailure(error);
+        }
+        // 关闭失败后保持信号监听与唯一 pending Promise，防止后续信号恢复 Node 默认终止行为。
+        return new Promise<void>(() => {});
+      });
+    return closing;
+  };
+  const handleSignal = () => { void begin(); };
+  for (const signal of signals) target.on(signal, handleSignal);
+  return { begin };
+}
+
+const webContentTypes: Record<string, string> = {
+  ".css": "text/css; charset=utf-8",
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".png": "image/png",
+  ".svg": "image/svg+xml",
+  ".woff2": "font/woff2",
+};
 
 function validName(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.trim().length <= 120;
@@ -80,6 +137,13 @@ function parseCostLimit(value: unknown): number | null {
 
 export function createArenaServer(options: ArenaServerOptions): FastifyInstance {
   const server = Fastify({ logger: options.logger ?? false });
+  if (options.startupCommitted) {
+    server.addHook("onRequest", async (_request, reply) => {
+      if (!options.startupCommitted!()) {
+        return reply.code(503).send({ error: { code: "STARTUP_PENDING", message: "生产服务正在等待启动确认" } });
+      }
+    });
+  }
   const harnessAdapter = options.harnessAdapter;
   const harnessRoot = options.harnessRoot ?? `${options.databasePath === ":memory:" ? "/tmp/maze-arena" : options.databasePath}.harness`;
   const experiments = new ExperimentRepository(options.databasePath, harnessRoot);
@@ -99,6 +163,12 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
   const subscribers = new Map<string, Set<{ socket: import("ws").WebSocket; delivered: number }>>();
 
   void server.register(websocket);
+
+  server.get("/api/health", async () => ({
+    status: "ok" as const,
+    instanceId: process.env.ARENA_INSTANCE_ID ?? null,
+    pid: process.pid,
+  }));
 
   function validateModelProfile(input: unknown) {
     if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -512,6 +582,22 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
   server.get<{ Params: { id: string }; Reply: MatchListResponse }>(
     "/api/experiments/:id/matches", async (request) => ({ matches: matches.listForExperiment(request.params.id).map(publicMatch) }),
   );
+
+  if (options.webRoot) {
+    const webRoot = resolve(options.webRoot);
+    server.setNotFoundHandler(async (request, reply) => {
+      if (request.method !== "GET" && request.method !== "HEAD") return reply.code(404).send();
+      const requestedPath = request.url.split("?", 1)[0] ?? "/";
+      if (requestedPath.startsWith("/api/")) return reply.code(404).send();
+      const relativePath = requestedPath === "/" ? "index.html" : requestedPath.replace(/^\/+/, "");
+      let assetPath = resolve(webRoot, relativePath);
+      if (assetPath !== webRoot && !assetPath.startsWith(`${webRoot}/`)) return reply.code(404).send();
+      if (!existsSync(assetPath) || !statSync(assetPath).isFile()) assetPath = join(webRoot, "index.html");
+      if (!existsSync(assetPath) || !statSync(assetPath).isFile()) return reply.code(404).send();
+      reply.type(webContentTypes[extname(assetPath)] ?? "application/octet-stream");
+      return reply.send(readFileSync(assetPath));
+    });
+  }
 
   return server;
 }

@@ -2,7 +2,8 @@ import { chmodSync, cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readF
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import type { Writable } from "node:stream";
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
@@ -129,9 +130,18 @@ esac`);
   writeFileSync(`${dockerState}.image-id`, `${imageId}\n`);
   writeFileSync(`${dockerState}.security`, '["name=seccomp,profile=builtin","name=cgroupns"]\n');
   executable(join(bin, "docker"), overrides.docker ?? `
+if [ -f "${join(root, "doctor-delay")}" ] && [ "\${1:-}" = "info" ]; then /bin/sleep 0.5; fi
+if [ -f "${join(root, "docker-fail")}" ] && [ "\${1:-}" = "info" ]; then
+  printf "opaque-d8e20b53\\n" >&2; exit 7
+fi
 case "\${1:-}" in
-  --version) printf "Docker version 27.1.0, build fixture\\n" ;;
+  --version)
+    if [ -f "${join(root, "docker-opaque-version")}" ]; then printf "opaque-docker-a18f73c9\\n"; else printf "Docker version 27.1.0, build fixture\\n"; fi
+    ;;
   info)
+    if [ -f "${join(root, "docker-opaque-security")}" ] && [ "\${3:-}" = "{{json .SecurityOptions}}" ]; then
+      printf "opaque-security-f41c82d7\\n"; exit 0
+    fi
     case "\${3:-}" in
       *SecurityOptions*) while IFS= read -r line; do printf '%s\\n' "$line"; done < "${dockerState}.security" ;;
       *) printf "27.1.0\\n" ;;
@@ -202,12 +212,47 @@ case "\${1:-}" in
   *) printf "unexpected docker command\\n" >&2; exit 1 ;;
 esac`);
   const dsh = join(bin, "dsh");
+  const pluginInstaller = join(root, "plugin-install.cjs");
+  writeFileSync(pluginInstaller, `
+const fs = require("node:fs");
+const path = require("node:path");
+const [home, profile, ...artifacts] = process.argv.slice(2);
+const profileRoot = path.join(home, "profiles", profile);
+const dependencies = {};
+const bundles = [];
+fs.rmSync(path.join(profileRoot, "node_modules"), { recursive: true, force: true });
+for (const artifact of artifacts) {
+  const manifest = JSON.parse(fs.readFileSync(path.join(artifact, "package.json"), "utf8"));
+  dependencies[manifest.name] = \`file:\${artifact}\`;
+  bundles.push(manifest.name);
+  const target = path.join(profileRoot, "node_modules", ...manifest.name.split("/"));
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.symlinkSync(artifact, target, "dir");
+}
+fs.writeFileSync(path.join(profileRoot, "package.json"), JSON.stringify({
+  name: \`dsh-profile-\${profile}\`, private: true, dependencies, dsh: { profile: { bundles } },
+}, null, 2) + "\\n");
+`);
   executable(dsh, overrides.dsh ?? `
-if [ "\${1:-}" = "--version" ]; then printf "dsh 2026.09.1\\n"; exit 0; fi
+if [ "\${1:-}" = "--version" ]; then
+  if [ -f "${join(root, "dsh-opaque-version")}" ]; then printf "opaque-dsh-b29e84da\\n"; else printf "dsh 2026.09.1\\n"; fi
+  exit 0
+fi
 if [ "\${1:-}" = "models" ] && [ "\${2:-}" = "export" ]; then
   printf '%s\\n' "\${DSH_HOME:-}" > "${join(root, "model-export-home")}";
   while IFS= read -r line; do printf '%s\\n' "$line"; done < "${modelExport}";
   exit 0
+fi
+if [ -f "${join(root, "plugin-fail")}" ] && [ "\${1:-}" = "plugin" ]; then
+  printf "opaque-c7d19a42\\n" >&2; exit 7
+fi
+if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "--profile" ] && [ "\${4:-}" = "add" ]; then
+  profile="$3"; shift 4
+  artifacts=""
+  for argument in "$@"; do
+    case "$argument" in file:*) artifacts="$artifacts \${argument#file:}" ;; esac
+  done
+  exec "${process.execPath}" "${pluginInstaller}" "\${DSH_HOME}" "$profile" $artifacts
 fi
 printf "unexpected dsh command\\n" >&2; exit 1`);
 
@@ -235,6 +280,129 @@ function run(fixture: Fixture, args: string[]) {
     encoding: "utf8",
     env: fixture.env,
   });
+}
+
+function runAsyncProcess(fixture: Fixture, args: string[]) {
+  const child = spawn(process.execPath, [cliPath, ...args], { env: fixture.env, stdio: ["ignore", "pipe", "pipe"] });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+  child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+  const result = new Promise<{ status: number | null; stdout: string; stderr: string }>((resolveResult, reject) => {
+    child.once("error", reject);
+    child.once("close", (status) => resolveResult({
+      status,
+      stdout: Buffer.concat(stdout).toString("utf8"),
+      stderr: Buffer.concat(stderr).toString("utf8"),
+    }));
+  });
+  return { child, result };
+}
+
+function runAsync(fixture: Fixture, args: string[]) {
+  return runAsyncProcess(fixture, args).result;
+}
+
+function runWithPrivateFd(
+  fixture: Fixture,
+  args: string[],
+  request: string,
+  endRequest: boolean,
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  const child = spawn(process.execPath, [cliPath, ...args], {
+    env: fixture.env,
+    stdio: ["ignore", "pipe", "pipe", "pipe"],
+  });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  child.stdout!.on("data", (chunk: Buffer) => stdout.push(chunk));
+  child.stderr!.on("data", (chunk: Buffer) => stderr.push(chunk));
+  const requestPipe = child.stdio[3] as Writable;
+  requestPipe.on("error", () => {});
+  requestPipe.write(request);
+  if (endRequest) requestPipe.end();
+  return new Promise((resolveResult, reject) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("伪造私有请求未在 3 秒内有界退出"));
+    }, 3_000);
+    child.once("error", reject);
+    child.once("close", (status) => {
+      clearTimeout(timer);
+      requestPipe.destroy();
+      resolveResult({
+        status,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      });
+    });
+  });
+}
+
+function runWithLockedPrivateFd(
+  fixture: Fixture,
+  args: string[],
+  request: string,
+): Promise<{ status: number | null; stdout: string; stderr: string; elapsedMs: number }> {
+  const lockPath = join(fixture.root, "state/maze-arena/run/server.lock");
+  const startedAt = Date.now();
+  const child = spawn("/usr/bin/flock", [
+    "--no-fork", "--exclusive", lockPath, process.execPath, cliPath,
+  ], { env: fixture.env, stdio: ["ignore", "pipe", "pipe", "pipe"] });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  child.stdout!.on("data", (chunk: Buffer) => stdout.push(chunk));
+  child.stderr!.on("data", (chunk: Buffer) => stderr.push(chunk));
+  const requestPipe = child.stdio[3] as Writable;
+  requestPipe.on("error", () => {});
+  requestPipe.write(request);
+  return new Promise((resolveResult, reject) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("合法持锁私有请求未在 4 秒内有界退出"));
+    }, 4_000);
+    child.once("error", reject);
+    child.once("close", (status) => {
+      clearTimeout(timer);
+      requestPipe.destroy();
+      resolveResult({
+        status,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+        elapsedMs: Date.now() - startedAt,
+      });
+    });
+  });
+}
+
+function wait(milliseconds: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function cleanupFixtureServer(fixture: Fixture): void {
+  run(fixture, ["stop"]);
+  const statePath = join(fixture.root, "state/maze-arena/run/server.json");
+  if (!existsSync(statePath)) return;
+  try {
+    const state = JSON.parse(readFileSync(statePath, "utf8")) as { pid?: unknown; procStartTime?: unknown };
+    if (!Number.isSafeInteger(state.pid) || Number(state.pid) <= 0 || typeof state.procStartTime !== "string") return;
+    const pid = Number(state.pid);
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const actualStartTime = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+    if (actualStartTime === state.procStartTime) {
+      process.kill(pid, "SIGKILL");
+      waitForProcessExit(pid);
+    }
+  } catch { /* 测试清理不得掩盖原始断言失败。 */ }
+}
+
+function waitForProcessExit(pid: number, timeout = 2_000): boolean {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    try { process.kill(pid, 0); } catch { return true; }
+    wait(20);
+  }
+  try { process.kill(pid, 0); return false; } catch { return true; }
 }
 
 function install(fixture: Fixture) {
@@ -265,10 +433,28 @@ function prepareBuiltImageFixture(): Fixture {
   expect(installAtCommit(fixture, commit).status).toBe(0);
   const result = buildImage(fixture);
   expect(result.status, result.stderr).toBe(0);
+  const sync = syncModels(fixture);
+  expect(sync.status, sync.stderr).toBe(0);
   return fixture;
 }
 
 describe("正式运行 CLI 黑盒边界", () => {
+  it("退出码为零的畸形 Docker 与 DSH 版本输出不会进入管理错误", () => {
+    const dockerFixture = createFixture();
+    writeFileSync(join(dockerFixture.root, "docker-opaque-version"), "1\n");
+    let result = install(dockerFixture);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("无法解析 Docker 版本，预期包含 major.minor.patch");
+    expect(result.stderr).not.toContain("opaque-docker-a18f73c9");
+
+    const dshFixture = createFixture();
+    writeFileSync(join(dshFixture.root, "dsh-opaque-version"), "1\n");
+    result = install(dshFixture);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("dsh 版本不匹配：期望 dsh 2026.09.1");
+    expect(result.stderr).not.toContain("opaque-dsh-b29e84da");
+  });
+
   it("从锁定 Harness 显式导出并原子发布只读多提供方目录", () => {
     const fixture = createFixture();
     expect(install(fixture).status).toBe(0);
@@ -474,6 +660,674 @@ printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
     expect(result.stdout).toContain(`检查通过：Match Profile 镜像 ${imageId}`);
   });
 
+  it("start、status 与 stop 管理回环生产服务，并处理幂等、陈旧 PID、异常退出和秘密净化", async () => {
+    const fixture = prepareBuiltImageFixture();
+    fixture.env.MAZE_ARENA_PORT = "0";
+    fixture.env.TEST_PROVIDER_API_KEY = "sk-test-secret-value-123456";
+    try {
+
+    let result = run(fixture, ["start"]);
+    expect(result.status, result.stderr).toBe(0);
+    const processStatePath = join(fixture.root, "state/maze-arena/run/server.json");
+    const firstState = JSON.parse(readFileSync(processStatePath, "utf8"));
+    const port = firstState.port;
+    expect(port).toBeGreaterThanOrEqual(1_024);
+    expect(port).toBeLessThanOrEqual(65_535);
+    expect(result.stdout).toContain(`http://127.0.0.1:${port}`);
+    expect(result.stdout).not.toContain("sk-test-secret-value-123456");
+
+    result = run(fixture, ["start"]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("已在运行");
+
+    result = run(fixture, ["status"]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("进程：运行中");
+    expect(result.stdout).toContain("HTTP：健康");
+    expect(result.stdout).toContain(`数据库：${join(fixture.root, "data/maze-arena/maze-arena.sqlite")}`);
+    expect(result.stdout).toContain(`Harness：dsh 2026.09.1 @ ${git(fixture.harness, ["rev-parse", "HEAD"])}`);
+    expect(result.stdout).toContain(`镜像摘要：${imageId}`);
+
+    const web = spawnSync(process.execPath, ["-e", `fetch("http://127.0.0.1:${port}/").then(async r => {
+      const text = await r.text(); if (r.status !== 200 || !text.includes("Maze Arena")) process.exit(1);
+    }).catch(() => process.exit(1));`]);
+    expect(web.status).toBe(0);
+
+    const requestSecrets = [
+      "opaque-a7f31d9c",
+      "opaque-b8e42a0d",
+      "opaque-c9f53b1e",
+      "opaque-d0a64c2f",
+      "opaque-e1b75d30",
+      "opaque-f2c86e41",
+      "opaque-a3d97f52",
+      "opaque-b4e08a63",
+      "opaque-c5f19b74",
+    ];
+    const encodedPathSecret = [...requestSecrets[8]!]
+      .map((character) => `%${character.charCodeAt(0).toString(16).padStart(2, "0")}`).join("");
+    const loggedRequest = spawnSync(process.execPath, ["-e", `
+      const urls = [
+        "http://127.0.0.1:${port}/api/health?API%5FKEY=${requestSecrets[0]}",
+        "http://127.0.0.1:${port}/api/health?access_token=${requestSecrets[1]}&access_token=${requestSecrets[2]}",
+        "http://127.0.0.1:${port}/api/health?client_secret=${requestSecrets[3]}",
+        "http://127.0.0.1:${port}/api/health?ClIeNt_SeCrEt=${requestSecrets[4]}",
+        "http://127.0.0.1:${port}/api/health?foo=ok;access_token=${requestSecrets[5]}",
+        "http://127.0.0.1:${port}/api/health?%2561pi_key=${requestSecrets[6]}",
+        "http://127.0.0.1:${port}/${encodedPathSecret}",
+      ];
+      const hostRequest = new Promise((resolve, reject) => {
+        const net = require("node:net");
+        const socket = net.createConnection({ host: "127.0.0.1", port: ${port} }, () => {
+          socket.end("GET /api/health HTTP/1.1\\r\\nHost: ${requestSecrets[7]}\\r\\nConnection: close\\r\\n\\r\\n");
+        });
+        let response = "";
+        socket.on("data", chunk => { response += chunk; });
+        socket.on("error", reject);
+        socket.on("close", () => response.includes(" 200 ") ? resolve() : reject(new Error(response)));
+      });
+      Promise.all([...urls.map(url => fetch(url).then(response => {
+        if (response.status !== 200) throw new Error(String(response.status));
+      })), hostRequest]).then(() => process.exit(0)).catch(() => process.exit(1));
+    `]);
+    expect(loggedRequest.status).toBe(0);
+
+    expect(realpathSync(firstState.databasePath).startsWith(realpathSync(repositoryRoot))).toBe(false);
+    expect(readFileSync(firstState.logPath, "utf8")).not.toContain("sk-test-secret-value-123456");
+
+    result = run(fixture, ["stop"]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("已安全停止");
+    const productionLog = readFileSync(firstState.logPath, "utf8");
+    expect(productionLog).not.toContain("sk-test-secret-value-123456");
+    for (const requestSecret of requestSecrets) expect(productionLog).not.toContain(requestSecret);
+    expect(productionLog).not.toContain(encodedPathSecret);
+    expect(productionLog).toContain("[REDACTED]");
+    expect(run(fixture, ["stop"]).stdout).toContain("已停止");
+
+    result = run(fixture, ["status"]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("进程：已停止");
+    expect(result.stdout).toContain(`数据库：${join(fixture.root, "data/maze-arena/maze-arena.sqlite")}`);
+    expect(result.stdout).toContain(`Harness：dsh 2026.09.1 @ ${git(fixture.harness, ["rev-parse", "HEAD"])}`);
+    expect(result.stdout).toContain("模型目录版本：");
+    expect(result.stdout).toContain(`镜像摘要：${imageId}`);
+
+    writeFileSync(processStatePath, `${JSON.stringify({ ...firstState, pid: 999_999, procStartTime: "stale" })}\n`, { mode: 0o600 });
+    result = run(fixture, ["status"]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("进程：已停止");
+    expect(result.stdout).toContain(`数据库：${join(fixture.root, "data/maze-arena/maze-arena.sqlite")}`);
+    expect(result.stdout).toContain(`Harness：dsh 2026.09.1 @ ${git(fixture.harness, ["rev-parse", "HEAD"])}`);
+    expect(result.stdout).toContain("模型目录版本：");
+    expect(result.stdout).toContain(`镜像摘要：${imageId}`);
+    expect(existsSync(processStatePath)).toBe(false);
+
+    const restarted = run(fixture, ["start"]);
+    expect(restarted.status, restarted.stderr).toBe(0);
+    const secondState = JSON.parse(readFileSync(processStatePath, "utf8"));
+    const secondStat = readFileSync(`/proc/${secondState.pid}/stat`, "utf8");
+    const secondStartTime = secondStat.slice(secondStat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+    expect(secondStartTime).toBe(secondState.procStartTime);
+    process.kill(secondState.pid, "SIGKILL");
+    for (let attempt = 0; attempt < 50 && existsSync(`/proc/${secondState.pid}`); attempt += 1) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+    result = run(fixture, ["status"]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("进程：已停止");
+    } finally {
+      cleanupFixtureServer(fixture);
+    }
+  }, 60_000);
+
+  it("流式健康响应在墙钟截止后失败并释放运行管理锁", async () => {
+    const fixture = prepareBuiltImageFixture();
+    fixture.env.MAZE_ARENA_PORT = "0";
+    try {
+    expect(run(fixture, ["start"]).status).toBe(0);
+    const statePath = join(fixture.root, "state/maze-arena/run/server.json");
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    const port = state.port;
+    expect(run(fixture, ["stop"]).status).toBe(0);
+
+    const streaming = spawn(process.execPath, ["-e", `
+      const http = require("node:http");
+      http.createServer((_request, response) => {
+        response.writeHead(200, { "content-type": "application/json" });
+        const timer = setInterval(() => response.write(" "), 10);
+        response.on("close", () => clearInterval(timer));
+      }).listen(${port}, "127.0.0.1");
+    `], { stdio: "ignore" });
+    try {
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        const ready = spawnSync(process.execPath, ["-e", `require("node:http").get("http://127.0.0.1:${port}", r => {
+          r.destroy(); process.exit(0);
+        }).on("error", () => process.exit(1));`]);
+        if (ready.status === 0) break;
+        wait(20);
+      }
+      const procStat = readFileSync(`/proc/${streaming.pid}/stat`, "utf8");
+      const procStartTime = procStat.slice(procStat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+      writeFileSync(statePath, `${JSON.stringify({ ...state, pid: streaming.pid, procStartTime })}\n`, { mode: 0o600 });
+      const startedAt = Date.now();
+      const checked = run(fixture, ["status"]);
+      expect(checked.status, checked.stderr).toBe(0);
+      expect(checked.stdout).toContain("HTTP：异常");
+      expect(Date.now() - startedAt).toBeLessThan(3_000);
+      const recovered = run(fixture, ["status"]);
+      expect(recovered.status, recovered.stderr).toBe(0);
+      expect(recovered.stderr).not.toContain("另一个运行管理命令正在执行");
+    } finally {
+      if (streaming.exitCode === null && streaming.signalCode === null) {
+        const closed = new Promise<void>((resolveClosed) => streaming.once("close", () => resolveClosed()));
+        streaming.kill("SIGKILL");
+        await closed;
+      }
+    }
+    } finally {
+      cleanupFixtureServer(fixture);
+    }
+  }, 30_000);
+
+  it("stop 健康检查期间进程身份变化时不向替代身份发送信号或等待超时", () => {
+    const fixture = prepareBuiltImageFixture();
+    fixture.env.MAZE_ARENA_PORT = "0";
+    const statePath = join(fixture.root, "state/maze-arena/run/server.json");
+    const signalMarker = join(fixture.root, "unexpected-stop-signal");
+    const originalPrelude = readFileSync(fixture.nodePrelude, "utf8");
+    expect(run(fixture, ["start"]).status).toBe(0);
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    try {
+      writeFileSync(fixture.nodePrelude, `${originalPrelude}
+const fs = require("node:fs");
+const moduleBuiltin = require("node:module");
+const originalReadFileSync = fs.readFileSync;
+const originalKill = process.kill.bind(process);
+const targetPid = Number(process.env.MAZE_TEST_IDENTITY_PID);
+let targetStatReads = 0;
+fs.readFileSync = function(path, ...args) {
+  const value = originalReadFileSync(path, ...args);
+  if (String(path) !== "/proc/" + targetPid + "/stat" || typeof value !== "string") return value;
+  targetStatReads += 1;
+  if (targetStatReads < 2) return value;
+  const close = value.lastIndexOf(")");
+  const fields = value.slice(close + 2).trim().split(/\\s+/);
+  fields[19] = String(BigInt(fields[19]) + 1n);
+  return value.slice(0, close + 2) + fields.join(" ");
+};
+process.kill = function(pid, signal) {
+  if (pid === targetPid && signal !== undefined && signal !== 0) {
+    fs.writeFileSync(process.env.MAZE_TEST_SIGNAL_MARKER, String(signal));
+    const error = new Error("replacement identity must not be signaled");
+    error.code = "ESRCH";
+    throw error;
+  }
+  return originalKill(pid, signal);
+};
+moduleBuiltin.syncBuiltinESMExports();
+`);
+      fixture.env.MAZE_TEST_IDENTITY_PID = String(state.pid);
+      fixture.env.MAZE_TEST_SIGNAL_MARKER = signalMarker;
+      const startedAt = Date.now();
+      const result = run(fixture, ["stop"]);
+      expect(result.status, result.stderr).toBe(0);
+      expect(Date.now() - startedAt).toBeLessThan(3_000);
+      expect(existsSync(signalMarker)).toBe(false);
+      expect(existsSync(statePath)).toBe(false);
+      expect(() => process.kill(state.pid, 0)).not.toThrow();
+    } finally {
+      writeFileSync(fixture.nodePrelude, originalPrelude);
+      delete fixture.env.MAZE_TEST_IDENTITY_PID;
+      delete fixture.env.MAZE_TEST_SIGNAL_MARKER;
+      if (!existsSync(statePath)) writeFileSync(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+      cleanupFixtureServer(fixture);
+    }
+  }, 30_000);
+
+  it("正式入口在活动原子步骤期间合并重复 stop 与交错信号，完成后才退出", async () => {
+    const fixture = prepareBuiltImageFixture();
+    fixture.env.MAZE_ARENA_PORT = "0";
+    const statePath = join(fixture.root, "state/maze-arena/run/server.json");
+    const closeMarker = join(fixture.root, "long-atomic-step-close");
+    const exitTrigger = join(fixture.root, "finish-long-atomic-step");
+    const originalPrelude = readFileSync(fixture.nodePrelude, "utf8");
+    let state: { pid: number; procStartTime: string } | undefined;
+    let released = false;
+    try {
+      writeFileSync(fixture.nodePrelude, `${originalPrelude}
+if (process.env.ARENA_INSTANCE_ID && process.env.ARENA_STARTUP_HANDSHAKE_FD === "3") {
+  const fs = require("node:fs");
+  const http = require("node:http");
+  const originalClose = http.Server.prototype.close;
+  http.Server.prototype.close = function(callback) {
+    fs.appendFileSync(${JSON.stringify(closeMarker)}, "close\\n");
+    const server = this;
+    const timer = setInterval(() => {
+      if (!fs.existsSync(${JSON.stringify(exitTrigger)})) return;
+      clearInterval(timer);
+      originalClose.call(server, callback);
+    }, 20);
+    return server;
+  };
+}
+`);
+      const started = run(fixture, ["start"]);
+      expect(started.status, started.stderr).toBe(0);
+      const stateText = readFileSync(statePath, "utf8");
+      const runningState = JSON.parse(stateText) as { pid: number; procStartTime: string };
+      state = runningState;
+
+      // Server 已加载上面的正式入口故障注入；后续 CLI 进程仅缩短 30 秒等待窗口。
+      writeFileSync(fixture.nodePrelude, `${readFileSync(fixture.nodePrelude, "utf8")}
+if (process.env.MAZE_TEST_FAST_STOP === "1") {
+  const originalDateNow = Date.now;
+  let offset = 0;
+  Date.now = () => {
+    const value = originalDateNow() + offset;
+    offset += 31_000;
+    return value;
+  };
+}
+`);
+      fixture.env.MAZE_TEST_FAST_STOP = "1";
+
+      const startedAt = Date.now();
+      let result = run(fixture, ["stop"]);
+      expect(result.status).toBe(1);
+      expect(Date.now() - startedAt).toBeLessThan(3_000);
+      expect(result.stderr).toContain("未能安全停止");
+      expect(result.stderr).toContain("活动原子步骤");
+      expect(result.stdout).not.toContain("安全停止");
+      expect(existsSync(statePath)).toBe(true);
+      expect(readFileSync(statePath, "utf8")).toBe(stateText);
+      expect(() => process.kill(runningState.pid, 0)).not.toThrow();
+      expect(readFileSync(closeMarker, "utf8")).toBe("close\n");
+
+      process.kill(runningState.pid, "SIGINT");
+      result = run(fixture, ["stop"]);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("活动原子步骤");
+      expect(result.stdout).not.toContain("安全停止");
+      expect(readFileSync(closeMarker, "utf8")).toBe("close\n");
+      expect(existsSync(statePath)).toBe(true);
+      expect(readFileSync(statePath, "utf8")).toBe(stateText);
+      expect(() => process.kill(runningState.pid, 0)).not.toThrow();
+
+      const stormStartedAt = Date.now();
+      for (let index = 0; index < 100; index += 1) {
+        process.kill(runningState.pid, index % 2 === 0 ? "SIGTERM" : "SIGINT");
+      }
+      wait(100);
+      expect(Date.now() - stormStartedAt).toBeLessThan(2_000);
+      expect(readFileSync(closeMarker, "utf8")).toBe("close\n");
+      expect(readFileSync(statePath, "utf8")).toBe(stateText);
+      expect(() => process.kill(runningState.pid, 0)).not.toThrow();
+
+      writeFileSync(exitTrigger, "done\n");
+      released = true;
+      expect(waitForProcessExit(runningState.pid, 3_000)).toBe(true);
+      result = run(fixture, ["status"]);
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("进程：已停止");
+      expect(existsSync(statePath)).toBe(false);
+    } finally {
+      if (!released) writeFileSync(exitTrigger, "done\n");
+      writeFileSync(fixture.nodePrelude, originalPrelude);
+      delete fixture.env.MAZE_TEST_FAST_STOP;
+      if (state) waitForProcessExit(state.pid, 3_000);
+      cleanupFixtureServer(fixture);
+    }
+  }, 30_000);
+
+  it("活动 Server 的缺失或非法 procStartTime 关闭失败并保留状态，恢复身份后可安全停止", () => {
+    const fixture = prepareBuiltImageFixture();
+    fixture.env.MAZE_ARENA_PORT = "0";
+    const statePath = join(fixture.root, "state/maze-arena/run/server.json");
+    const originalPrelude = readFileSync(fixture.nodePrelude, "utf8");
+    try {
+      expect(run(fixture, ["start"]).status).toBe(0);
+      const originalStateText = readFileSync(statePath, "utf8");
+      const state = JSON.parse(originalStateText);
+      const invalidValues: unknown[] = [undefined, null, "", "0", "01", "-1", "not-a-start-time", 123];
+      for (const procStartTime of invalidValues) {
+        const invalidState = { ...state, procStartTime };
+        if (procStartTime === undefined) delete invalidState.procStartTime;
+        const invalidStateText = `${JSON.stringify(invalidState)}\n`;
+        for (const command of ["start", "status", "stop"] as const) {
+          writeFileSync(statePath, invalidStateText, { mode: 0o600 });
+          const result = run(fixture, [command]);
+          expect(result.status).toBe(1);
+          expect(result.stderr).toContain("缺少有效启动时间");
+          expect(result.stderr).toContain("状态文件已保留");
+          expect(readFileSync(statePath, "utf8")).toBe(invalidStateText);
+          expect(() => process.kill(state.pid, 0)).not.toThrow();
+        }
+      }
+
+      writeFileSync(statePath, originalStateText, { mode: 0o600 });
+      writeFileSync(fixture.nodePrelude, `${originalPrelude}
+if (process.env.MAZE_TEST_UNREADABLE_PROCESS_IDENTITY) {
+  const fs = require("node:fs");
+  const moduleBuiltin = require("node:module");
+  const originalReadFileSync = fs.readFileSync;
+  fs.readFileSync = function(path, ...args) {
+    if (String(path) === "/proc/" + process.env.MAZE_TEST_UNREADABLE_PROCESS_IDENTITY + "/stat") {
+      const error = new Error("identity unavailable");
+      error.code = "EACCES";
+      throw error;
+    }
+    return originalReadFileSync(path, ...args);
+  };
+  moduleBuiltin.syncBuiltinESMExports();
+}
+`);
+      fixture.env.MAZE_TEST_UNREADABLE_PROCESS_IDENTITY = String(state.pid);
+      for (const command of ["start", "status", "stop"] as const) {
+        const result = run(fixture, [command]);
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("无法验证运行进程身份");
+        expect(result.stderr).toContain("状态文件已保留");
+        expect(readFileSync(statePath, "utf8")).toBe(originalStateText);
+        expect(() => process.kill(state.pid, 0)).not.toThrow();
+      }
+      writeFileSync(fixture.nodePrelude, originalPrelude);
+      delete fixture.env.MAZE_TEST_UNREADABLE_PROCESS_IDENTITY;
+
+      const status = run(fixture, ["status"]);
+      expect(status.status, status.stderr).toBe(0);
+      expect(status.stdout).toContain("HTTP：健康");
+      expect(run(fixture, ["stop"]).status).toBe(0);
+
+      writeFileSync(statePath, `${JSON.stringify({ ...state, pid: 2_147_483_647, procStartTime: null })}\n`, { mode: 0o600 });
+      const stale = run(fixture, ["status"]);
+      expect(stale.status, stale.stderr).toBe(0);
+      expect(stale.stdout).toContain("进程：已停止");
+      expect(existsSync(statePath)).toBe(false);
+    } finally {
+      writeFileSync(fixture.nodePrelude, originalPrelude);
+      delete fixture.env.MAZE_TEST_UNREADABLE_PROCESS_IDENTITY;
+      cleanupFixtureServer(fixture);
+    }
+  }, 30_000);
+
+  it("外部命令失败不回显 opaque stderr", async () => {
+    const fixture = prepareBuiltImageFixture();
+    try {
+    writeFileSync(join(fixture.root, "docker-fail"), "fail\n");
+    let result = run(fixture, ["doctor"]);
+    expect(result.status).toBe(1);
+    expect(`${result.stdout}${result.stderr}`).not.toContain("opaque-d8e20b53");
+    expect(result.stderr).toContain("docker 检查失败（退出码 7）");
+
+    rmSync(join(fixture.root, "docker-fail"));
+    writeFileSync(join(fixture.root, "plugin-fail"), "fail\n");
+    fixture.env.MAZE_ARENA_PORT = "0";
+    result = run(fixture, ["start"]);
+    expect(result.status).toBe(1);
+    expect(`${result.stdout}${result.stderr}`).not.toContain("opaque-c7d19a42");
+    const logsRoot = join(fixture.root, "state/maze-arena/logs");
+    const logs = readdirSync(logsRoot).map((name) => readFileSync(join(logsRoot, name), "utf8")).join("\n");
+    expect(logs).not.toContain("opaque-c7d19a42");
+    expect(logs).toContain("dsh 退出码 7");
+    } finally {
+      cleanupFixtureServer(fixture);
+    }
+  }, 30_000);
+
+  it("Docker 成功退出但返回畸形结构化输出时不回显原文", () => {
+    const fixture = prepareBuiltImageFixture();
+    writeFileSync(join(fixture.root, "docker-opaque-security"), "1\n");
+    const result = run(fixture, ["doctor"]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("无法解析 Docker 安全能力，预期为字符串数组 JSON");
+    expect(`${result.stdout}${result.stderr}`).not.toContain("opaque-security-f41c82d7");
+  });
+
+  it("并发双 start、start/status 与 start/stop 由同一内核锁串行化", async () => {
+    const fixture = prepareBuiltImageFixture();
+    fixture.env.MAZE_ARENA_PORT = "0";
+    try {
+    const lockPath = join(fixture.root, "state/maze-arena/run/server.lock");
+    writeFileSync(lockPath, "stale-owner\n", { mode: 0o600 });
+    expect(run(fixture, ["status"]).stdout).toContain("进程：已停止");
+    writeFileSync(join(fixture.root, "doctor-delay"), "delay\n");
+
+    for (const contender of ["start", "status", "stop"] as const) {
+      const first = runAsync(fixture, ["start"]);
+      wait(100);
+      const forged = run(fixture, ["--runtime-lock-held", contender]);
+      expect(forged.status).toBe(1);
+      expect(forged.stderr).toContain("用法：maze-arena");
+      expect(forged.stdout).not.toMatch(/Maze Arena 已|进程：|HTTP：/);
+      if (contender === "status") {
+        const request = JSON.stringify({ schemaVersion: 1, args: ["status"] });
+        const injected = await runWithPrivateFd(fixture, ["status"], request, true);
+        expect(injected.status).toBe(1);
+        expect(injected.stderr).toContain("未持有目标互斥锁");
+        expect(injected.stdout).not.toMatch(/进程：|HTTP：/);
+        const unbounded = await runWithPrivateFd(fixture, ["status"], request, false);
+        expect(unbounded.status).toBe(1);
+        expect(unbounded.stderr).toContain("未持有目标互斥锁");
+        expect(unbounded.stdout).not.toMatch(/进程：|HTTP：/);
+      }
+      const collision = run(fixture, [contender]);
+      expect(collision.status).toBe(1);
+      expect(collision.stderr).toContain("另一个运行管理命令正在执行");
+      const started = await first;
+      expect(started.status, started.stderr).toBe(0);
+      expect(run(fixture, ["status"]).stdout).toContain("HTTP：健康");
+      expect(run(fixture, ["stop"]).status).toBe(0);
+    }
+    } finally {
+      cleanupFixtureServer(fixture);
+    }
+  }, 60_000);
+
+  it("锁持有者在 doctor 期间异常终止时 action 同步终止且后续命令可恢复", async () => {
+    const fixture = prepareBuiltImageFixture();
+    fixture.env.MAZE_ARENA_PORT = "0";
+    writeFileSync(join(fixture.root, "doctor-delay"), "delay\n");
+    try {
+
+    const pending = runAsyncProcess(fixture, ["start"]);
+    let lockOwner = 0;
+    for (let attempt = 0; attempt < 50 && lockOwner === 0; attempt += 1) {
+      wait(20);
+      try {
+        lockOwner = Number(readFileSync(`/proc/${pending.child.pid}/task/${pending.child.pid}/children`, "utf8").trim().split(/\s+/)[0]);
+      } catch {}
+    }
+    expect(lockOwner).toBeGreaterThan(0);
+    process.kill(lockOwner, "SIGKILL");
+    const interrupted = await pending.result;
+    expect(interrupted.status).not.toBe(0);
+    expect(existsSync(join(fixture.root, "state/maze-arena/run/server.json"))).toBe(false);
+
+    rmSync(join(fixture.root, "doctor-delay"));
+    expect(run(fixture, ["start"]).status).toBe(0);
+    expect(run(fixture, ["status"]).stdout).toContain("HTTP：健康");
+    expect(run(fixture, ["stop"]).status).toBe(0);
+    } finally {
+      cleanupFixtureServer(fixture);
+    }
+  }, 60_000);
+
+  it("Server ready 后写状态前杀死实际锁持有者会关闭未确认实例且允许后续启动", async () => {
+    const fixture = prepareBuiltImageFixture();
+    fixture.env.MAZE_ARENA_PORT = "0";
+    const statePath = join(fixture.root, "state/maze-arena/run/server.json");
+    const beforeStateMarker = join(fixture.root, "before-server-state-write.json");
+    const originalPrelude = readFileSync(fixture.nodePrelude, "utf8");
+    let lockOwner = 0;
+    let serverPid = 0;
+    const pending = (() => {
+      writeFileSync(fixture.nodePrelude, `${originalPrelude}
+if (process.env.MAZE_TEST_BLOCK_BEFORE_STATE_WRITE === "1") {
+  const fs = require("node:fs");
+  const moduleBuiltin = require("node:module");
+  const originalWriteFileSync = fs.writeFileSync;
+  fs.writeFileSync = function(path, ...args) {
+    if (String(path).startsWith(${JSON.stringify(join(fixture.root, "state/maze-arena/run/.server."))})
+      && String(path).endsWith(".tmp")) {
+      originalWriteFileSync(${JSON.stringify(beforeStateMarker)}, JSON.stringify({
+        ownerPid: process.pid,
+        state: JSON.parse(String(args[0])),
+      }));
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60_000);
+    }
+    return originalWriteFileSync(path, ...args);
+  };
+  moduleBuiltin.syncBuiltinESMExports();
+}
+`);
+      fixture.env.MAZE_TEST_BLOCK_BEFORE_STATE_WRITE = "1";
+      return runAsyncProcess(fixture, ["start"]);
+    })();
+    try {
+      for (let attempt = 0; attempt < 500 && !existsSync(beforeStateMarker); attempt += 1) wait(20);
+      expect(existsSync(beforeStateMarker)).toBe(true);
+      const beforeState = JSON.parse(readFileSync(beforeStateMarker, "utf8"));
+      lockOwner = Number(beforeState.ownerPid);
+      expect(lockOwner).toBeGreaterThan(0);
+      expect(lockOwner).not.toBe(pending.child.pid);
+      serverPid = Number(beforeState.state.pid);
+      expect(serverPid).toBeGreaterThan(0);
+      expect(existsSync(statePath)).toBe(false);
+      const pendingHealth = spawnSync(process.execPath, ["-e", `fetch("http://127.0.0.1:${String(beforeState.state.port)}/api/health")
+        .then(async response => {
+          const body = await response.json();
+          process.exit(response.status === 503 && body.error?.code === "STARTUP_PENDING" ? 0 : 1);
+        }).catch(() => process.exit(1));`]);
+      expect(pendingHealth.status).toBe(0);
+
+      process.kill(lockOwner, "SIGKILL");
+      const interrupted = await Promise.race([
+        pending.result,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("锁持有者未在 SIGKILL 后退出")), 3_000)),
+      ]);
+      expect(interrupted.status).not.toBe(0);
+      expect(waitForProcessExit(serverPid, 3_000)).toBe(true);
+      expect(existsSync(statePath)).toBe(false);
+      expect(readdirSync(dirname(statePath)).some((name) => name.startsWith(".server.") && name.endsWith(".tmp"))).toBe(false);
+
+      writeFileSync(fixture.nodePrelude, originalPrelude);
+      delete fixture.env.MAZE_TEST_BLOCK_BEFORE_STATE_WRITE;
+      const restarted = run(fixture, ["start"]);
+      expect(restarted.status, restarted.stderr).toBe(0);
+      expect(run(fixture, ["status"]).stdout).toContain("HTTP：健康");
+      expect(run(fixture, ["stop"]).status).toBe(0);
+    } finally {
+      writeFileSync(fixture.nodePrelude, originalPrelude);
+      delete fixture.env.MAZE_TEST_BLOCK_BEFORE_STATE_WRITE;
+      if (lockOwner > 0) {
+        try { process.kill(lockOwner, "SIGKILL"); } catch {}
+      }
+      if (serverPid > 0 && !waitForProcessExit(serverPid, 1_000)) {
+        try { process.kill(serverPid, "SIGKILL"); } catch {}
+      }
+      cleanupFixtureServer(fixture);
+    }
+  }, 60_000);
+
+  it.each([
+    ["非法", "invalid"],
+    ["超限", "oversized"],
+    ["超时", "dropped"],
+  ] as const)("Server 对%s commit 确认关闭失败并清理未确认实例", (_label, mode) => {
+    const fixture = prepareBuiltImageFixture();
+    fixture.env.MAZE_ARENA_PORT = "0";
+    const statePath = join(fixture.root, "state/maze-arena/run/server.json");
+    const serverMarker = join(fixture.root, `startup-commit-${mode}.pid`);
+    const originalPrelude = readFileSync(fixture.nodePrelude, "utf8");
+    try {
+      writeFileSync(fixture.nodePrelude, `${originalPrelude}
+if (process.env.MAZE_TEST_STARTUP_COMMIT_MODE) {
+  const fs = require("node:fs");
+  const net = require("node:net");
+  const originalWrite = net.Socket.prototype.write;
+  net.Socket.prototype.write = function(chunk, ...args) {
+    const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+    if (!text.includes('"phase":"commit"')) return originalWrite.call(this, chunk, ...args);
+    const record = JSON.parse(text);
+    fs.writeFileSync(${JSON.stringify(serverMarker)}, String(record.pid));
+    if (process.env.MAZE_TEST_STARTUP_COMMIT_MODE === "dropped") {
+      for (const argument of args) if (typeof argument === "function") queueMicrotask(argument);
+      return true;
+    }
+    const replacement = process.env.MAZE_TEST_STARTUP_COMMIT_MODE === "oversized"
+      ? "x".repeat(9 * 1024) + "\\n"
+      : JSON.stringify({ ...record, phase: "invalid" }) + "\\n";
+    return originalWrite.call(this, replacement, ...args);
+  };
+}
+`);
+      fixture.env.MAZE_TEST_STARTUP_COMMIT_MODE = mode;
+      const startedAt = Date.now();
+      const result = run(fixture, ["start"]);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("生产 Server 启动");
+      expect(Date.now() - startedAt).toBeLessThan(15_000);
+      expect(existsSync(statePath)).toBe(false);
+      const serverPid = Number(readFileSync(serverMarker, "utf8"));
+      expect(waitForProcessExit(serverPid, 3_000)).toBe(true);
+    } finally {
+      writeFileSync(fixture.nodePrelude, originalPrelude);
+      delete fixture.env.MAZE_TEST_STARTUP_COMMIT_MODE;
+      cleanupFixtureServer(fixture);
+    }
+  }, 30_000);
+
+  it("拒绝伪造、越界、超长和悬挂的 Server 启动握手且不留下状态或进程", () => {
+    const fixture = prepareBuiltImageFixture();
+    fixture.env.MAZE_ARENA_PORT = "0";
+    const serverEntry = join(repositoryRoot, "apps/server/dist/index.js");
+    const originalEntry = readFileSync(serverEntry);
+    const cases = [
+      { name: "wrong-instance", payload: '{schemaVersion:1,phase:"ready",instanceId:"wrong-instance",pid:process.pid,port:43210}' },
+      { name: "wrong-pid", payload: '{schemaVersion:1,phase:"ready",instanceId:process.env.ARENA_INSTANCE_ID,pid:process.pid+1,port:43210}' },
+      { name: "invalid-port", payload: '{schemaVersion:1,phase:"ready",instanceId:process.env.ARENA_INSTANCE_ID,pid:process.pid,port:0}' },
+      { name: "extra-field", payload: '{schemaVersion:1,phase:"ready",instanceId:process.env.ARENA_INSTANCE_ID,pid:process.pid,port:43210,secret:"opaque-handshake-secret"}' },
+      { name: "oversized", payload: '"x".repeat(9*1024)' },
+      { name: "hanging", payload: undefined },
+    ] as const;
+    try {
+      for (const handshakeCase of cases) {
+        const marker = join(fixture.root, `handshake-${handshakeCase.name}.pid`);
+        writeFileSync(serverEntry, `
+import { closeSync, writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(marker)}, String(process.pid));
+const descriptor = Number(process.env.ARENA_STARTUP_HANDSHAKE_FD);
+${handshakeCase.payload === undefined ? "" : `writeFileSync(descriptor, JSON.stringify(${handshakeCase.payload}) + "\\n"); closeSync(descriptor);`}
+setInterval(() => {}, 1000);
+`);
+        const result = run(fixture, ["start"]);
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("生产 Server 启动握手");
+        expect(`${result.stdout}${result.stderr}`).not.toContain("opaque-handshake-secret");
+        expect(existsSync(join(fixture.root, "state/maze-arena/run/server.json"))).toBe(false);
+        const pid = Number(readFileSync(marker, "utf8"));
+        expect(waitForProcessExit(pid), `${handshakeCase.name} 残留 PID ${pid}`).toBe(true);
+      }
+    } finally {
+      writeFileSync(serverEntry, originalEntry);
+      cleanupFixtureServer(fixture);
+    }
+  }, 60_000);
+
+  it("合法锁持有者的悬挂私有请求超时后关闭 FD 并释放运行锁", async () => {
+    const fixture = prepareBuiltImageFixture();
+    const request = JSON.stringify({ schemaVersion: 1, args: ["status"] });
+    const hanging = await runWithLockedPrivateFd(fixture, ["status"], request);
+    expect(hanging.status).toBe(1);
+    expect(hanging.stderr).toContain("私有请求读取超时");
+    expect(hanging.elapsedMs).toBeGreaterThanOrEqual(1_800);
+    expect(hanging.elapsedMs).toBeLessThan(4_000);
+    const recovered = run(fixture, ["status"]);
+    expect(recovered.status, recovered.stderr).toBe(0);
+    expect(recovered.stdout).toContain("进程：已停止");
+  }, 30_000);
+
   it("从锁定 Harness 与当前构建产物构建镜像并保存 Docker 实际摘要", () => {
     const { fixture, commit } = initializeRuntimeHarnessRepository(createFixture());
     expect(installAtCommit(fixture, commit).status).toBe(0);
@@ -563,7 +1417,8 @@ printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
 
     const result = buildImage(fixture);
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("profile load failed");
+    expect(result.stderr).toContain("docker 检查失败（退出码 1）");
+    expect(result.stderr).not.toContain("profile load failed");
     const manifest = JSON.parse(readFileSync(join(fixture.root, "config/maze-arena/install-manifest.json"), "utf8"));
     expect(manifest.matchProfile).toBeUndefined();
   });
@@ -575,7 +1430,8 @@ printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
 
     const result = buildImage(fixture);
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("solver profile load failed");
+    expect(result.stderr).toContain("docker 检查失败（退出码 1）");
+    expect(result.stderr).not.toContain("solver profile load failed");
     expect(readFileSync(join(fixture.root, "docker-state.handshake-roles"), "utf8")).toBe("generator\n");
     const manifest = JSON.parse(readFileSync(join(fixture.root, "config/maze-arena/install-manifest.json"), "utf8"));
     expect(manifest.matchProfile).toBeUndefined();

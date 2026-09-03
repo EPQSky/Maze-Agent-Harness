@@ -193,7 +193,8 @@ describe("Match Profile 进程协议", () => {
     const marker = join(mkdtempSync(join(tmpdir(), "maze-cleanup-permission-")), "container");
     const client = new MatchProfileProcess(cleanupCommand("timeout", marker, "permission"), "solver", 50);
     await expect(client.request(startRequest())).rejects.toSatisfy((error: AggregateError) =>
-      error instanceof AggregateError && error.errors.some((nested) => String(nested).includes("permission denied")));
+      error instanceof AggregateError && error.errors.some((nested) => String(nested).includes("退出码 2"))
+        && !String(error).includes("permission denied"));
   });
 
   it("create 与首次 rm 竞态时会再次强制清理并稳定确认消失", async () => {
@@ -398,6 +399,14 @@ describe("原生插件与正式隔离策略", () => {
       expect(manifest.dsh.profile.bundles).toEqual([]);
       expect(manifest.dependencies).toEqual({});
     }
+  });
+
+  it("重复准备正式 Profile 会安全替换上一轮只读快照", async () => {
+    const { home, installer } = await installProfiles();
+    const before = readFileSync(join(home, "snapshots/solver.sha256"), "utf8");
+    await expect(installer.prepare()).resolves.toBeUndefined();
+    expect(readFileSync(join(home, "snapshots/solver.sha256"), "utf8")).toBe(before);
+    expect(statSync(join(home, "snapshots/solver")).mode & 0o222).toBe(0);
   });
 
   it("结构化 pack 清单不执行生命周期并对可信 lineage 基线关闭失败", async () => {

@@ -1,8 +1,9 @@
-import { chmodSync, cpSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import { EventEmitter } from "node:events";
 import type {
   CreateExperimentRequest,
   DomainErrorResponse,
@@ -14,13 +15,23 @@ import {
   ModelProfileValidationError,
 } from "@maze-arena/dsh-integration";
 import { afterEach, describe, expect, it } from "vitest";
-import { createArenaServer } from "./app.js";
+import { createArenaServer, installPersistentShutdownHandlers } from "./app.js";
 import { createProductionHarnessAdapter } from "./production-harness.js";
 import { runBaselineMatch } from "@maze-arena/engine";
 import type { AutonomousEvolutionAdapter } from "./autonomous-runner.js";
 
 const servers: ReturnType<typeof createArenaServer>[] = [];
 const deterministicMatchRunner = { run: async (seed: string) => runBaselineMatch(seed) };
+
+function findHostProcess(marker: string): number | undefined {
+  for (const entry of readdirSync("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      if (readFileSync(`/proc/${entry}/cmdline`).toString("utf8").includes(marker)) return Number(entry);
+    } catch { /* 进程可能在枚举期间退出。 */ }
+  }
+  return undefined;
+}
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => server.close()));
@@ -73,6 +84,90 @@ const abortableBlockingAdapter: AutonomousEvolutionAdapter = {
 };
 
 describe("实验工作台 API", () => {
+  it("持久关闭处理器合并交错信号风暴且仅在关闭成功后卸载", async () => {
+    const signals = new EventEmitter();
+    let closeCalls = 0;
+    let holdCalls = 0;
+    let releaseCalls = 0;
+    let resolveClose: (() => void) | undefined;
+    const closing = new Promise<void>((resolveClosing) => { resolveClose = resolveClosing; });
+    const shutdown = installPersistentShutdownHandlers(
+      () => { closeCalls += 1; return closing; },
+      () => { throw new Error("关闭不应失败"); },
+      signals,
+      () => { holdCalls += 1; return () => { releaseCalls += 1; }; },
+    );
+
+    for (let index = 0; index < 1_000; index += 1) signals.emit(index % 2 === 0 ? "SIGTERM" : "SIGINT");
+    await Promise.resolve();
+    expect(closeCalls).toBe(1);
+    expect(holdCalls).toBe(1);
+    expect(releaseCalls).toBe(0);
+    expect(signals.listenerCount("SIGTERM")).toBe(1);
+    expect(signals.listenerCount("SIGINT")).toBe(1);
+    expect(shutdown.begin()).toBe(shutdown.begin());
+
+    resolveClose!();
+    await shutdown.begin();
+    expect(releaseCalls).toBe(1);
+    expect(signals.listenerCount("SIGTERM")).toBe(0);
+    expect(signals.listenerCount("SIGINT")).toBe(0);
+  });
+
+  it("关闭拒绝后保持持久监听与唯一关闭 Promise", async () => {
+    const signals = new EventEmitter();
+    const failure = new Error("close rejected");
+    let closeCalls = 0;
+    let failureCalls = 0;
+    let releaseCalls = 0;
+    const shutdown = installPersistentShutdownHandlers(
+      async () => { closeCalls += 1; throw failure; },
+      (error) => { expect(error).toBe(failure); failureCalls += 1; },
+      signals,
+      () => () => { releaseCalls += 1; },
+    );
+
+    signals.emit("SIGTERM");
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    for (let index = 0; index < 1_000; index += 1) signals.emit(index % 2 === 0 ? "SIGINT" : "SIGTERM");
+    await Promise.resolve();
+    expect(closeCalls).toBe(1);
+    expect(failureCalls).toBe(1);
+    expect(releaseCalls).toBe(0);
+    expect(signals.listenerCount("SIGTERM")).toBe(1);
+    expect(signals.listenerCount("SIGINT")).toBe(1);
+    expect(shutdown.begin()).toBe(shutdown.begin());
+  });
+
+  it("生产健康端点携带实例身份并从构建目录交付 Web", async () => {
+    const root = mkdtempSync(join(tmpdir(), "maze-production-web-"));
+    const webRoot = join(root, "web");
+    mkdirSync(join(webRoot, "assets"), { recursive: true });
+    writeFileSync(join(webRoot, "index.html"), "<title>Maze Arena Production</title>");
+    writeFileSync(join(webRoot, "assets/app.js"), "globalThis.mazeArena = true;");
+    const previousInstance = process.env.ARENA_INSTANCE_ID;
+    process.env.ARENA_INSTANCE_ID = "instance-test";
+    const server = createArenaServer({
+      databasePath: ":memory:", harnessAdapter: new DeterministicFakeHarnessAdapter(),
+      matchRunner: deterministicMatchRunner, webRoot,
+    });
+    servers.push(server);
+    try {
+      expect((await server.inject({ method: "GET", url: "/api/health" })).json()).toMatchObject({
+        status: "ok", instanceId: "instance-test", pid: process.pid,
+      });
+      expect((await server.inject({ method: "GET", url: "/" })).body).toContain("Maze Arena Production");
+      expect((await server.inject({ method: "GET", url: "/assets/app.js" })).headers["content-type"]).toContain("text/javascript");
+      expect((await server.inject({ method: "GET", url: "/workbench/deep-link" })).body).toContain("Maze Arena Production");
+      expect((await server.inject({ method: "GET", url: "/api/not-found" })).statusCode).toBe(404);
+    } finally {
+      if (previousInstance === undefined) delete process.env.ARENA_INSTANCE_ID;
+      else process.env.ARENA_INSTANCE_ID = previousInstance;
+    }
+  });
+
   it("监督基线验收通过并确认后才创建就绪运行时，重启仍保持冻结事实", async () => {
     const directory = mkdtempSync(join(tmpdir(), "maze-baseline-api-"));
     const databasePath = join(directory, "arena.sqlite");
@@ -833,6 +928,59 @@ describe("实验工作台 API", () => {
     await expect(adapter.smokeModel!(modelProfile)).resolves.toMatchObject({ providerText: "model:smoke" });
   });
 
+  it("生产 Harness 模型调用失败不回显第三方 stderr", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-production-stderr-"));
+    const exportPath = join(directory, "models.json");
+    const commandPath = join(directory, "fail.mjs");
+    writeFileSync(exportPath, JSON.stringify({
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
+        reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
+      } }] }],
+    }));
+    writeFileSync(commandPath, "#!/usr/bin/env node\nprocess.stderr.write('opaque-e9f31c64\\n');process.exit(7);\n");
+    chmodSync(commandPath, 0o755);
+    const adapter = createProductionHarnessAdapter({
+      ARENA_MODEL_CATALOG_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
+      DSH_EVOLUTION_COMMAND: commandPath, DSH_SMOKE_COMMAND: commandPath,
+    });
+    const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model",
+      credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+    let message = "";
+    try {
+      await adapter.evolvePlugin!({ experimentId: "exp", generation: 1, role: "generator", attemptId: "attempt",
+        modelProfile, workspace: directory, repairAttempt: 0, diagnostics: [] });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("退出码 7");
+    expect(message).not.toContain("opaque-e9f31c64");
+  });
+
+  it("生产 Harness 无法建立 PID namespace 时关闭失败且不执行目标命令", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-production-no-namespace-"));
+    const exportPath = join(directory, "models.json");
+    const markerPath = join(directory, "executed");
+    const commandPath = join(directory, "must-not-run.mjs");
+    writeFileSync(exportPath, JSON.stringify({
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
+        reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
+      } }] }],
+    }));
+    writeFileSync(commandPath, `#!/usr/bin/env node\nimport {writeFileSync} from "node:fs";writeFileSync(${JSON.stringify(markerPath)}, "1");\n`);
+    chmodSync(commandPath, 0o755);
+    const adapter = createProductionHarnessAdapter({
+      ARENA_MODEL_CATALOG_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
+      DSH_EVOLUTION_COMMAND: commandPath, DSH_SMOKE_COMMAND: commandPath,
+      DSH_UNSHARE_EXECUTABLE: "/bin/false",
+    });
+    const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model",
+      credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+    await expect(adapter.smokeModel!(modelProfile)).rejects.toThrow(/无法建立受控 PID namespace/);
+    expect(existsSync(markerPath)).toBe(false);
+  });
+
   it("生产 Harness 拒绝扩展响应字段并可取消活动子进程", async () => {
     const directory = mkdtempSync(join(tmpdir(), "maze-production-guard-"));
     const exportPath = join(directory, "models.json");
@@ -860,6 +1008,82 @@ describe("实验工作台 API", () => {
     setTimeout(() => controller.abort(), 20);
     await expect(blocked).rejects.toThrow(/已取消/);
   });
+
+  it("生产 Harness 在取消、超时和输出超限时终止并确认整个派生工具进程组退出", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-production-tree-stop-"));
+    const exportPath = join(directory, "models.json");
+    const commandPath = join(directory, "process-tree.mjs");
+    writeFileSync(exportPath, JSON.stringify({
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
+        reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
+      } }] }],
+    }));
+    writeFileSync(commandPath, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+let input = "";
+for await (const chunk of process.stdin) input += chunk;
+const request = JSON.parse(input);
+const marker = ${JSON.stringify(directory)} + ":" + request.attemptId;
+spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)", marker], {
+  stdio: "ignore",
+  detached: true,
+});
+writeFileSync(${JSON.stringify(directory)} + "/" + request.attemptId + ".ready", marker);
+process.on("SIGTERM", () => {});
+setTimeout(() => {
+  if (request.attemptId === "stdout-limit") process.stdout.write(Buffer.alloc(1024 * 1024 + 1, 0x78));
+  if (request.attemptId === "stderr-limit") process.stderr.write(Buffer.alloc(1024 * 1024 + 1, 0x78));
+  if (request.attemptId === "error") process.exit(7);
+  if (request.attemptId === "success") {
+    process.stdout.write(JSON.stringify({ hypothesis: "h", strategyPlan: "p", submitted: true, usage: { tokens: 1, cost: 0 } }));
+    process.exit(0);
+  }
+}, 100);
+setInterval(() => {}, 1000);
+`);
+    chmodSync(commandPath, 0o755);
+    const adapter = createProductionHarnessAdapter({
+      ARENA_MODEL_CATALOG_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
+      DSH_EVOLUTION_COMMAND: commandPath, DSH_SMOKE_COMMAND: commandPath,
+      DSH_EVOLUTION_TIMEOUT_MS: "1000",
+    });
+    const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model",
+      credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+    const assertTreeStopped = async (attemptId: "success" | "cancel" | "timeout" | "stdout-limit" | "stderr-limit" | "error") => {
+      const controller = new AbortController();
+      const running = adapter.evolvePlugin!({ experimentId: "exp", generation: 1, role: "generator", attemptId,
+        modelProfile, workspace: directory, repairAttempt: 0, diagnostics: [], signal: controller.signal });
+      const readyPath = join(directory, `${attemptId}.ready`);
+      for (let attempt = 0; attempt < 100 && !existsSync(readyPath); attempt += 1) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+      }
+      expect(existsSync(readyPath)).toBe(true);
+      const marker = readFileSync(readyPath, "utf8");
+      let escapedPid: number | undefined;
+      for (let attempt = 0; attempt < 100 && escapedPid === undefined; attempt += 1) {
+        escapedPid = findHostProcess(marker);
+        if (escapedPid === undefined) await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+      }
+      expect(escapedPid).toBeDefined();
+      if (attemptId === "cancel") controller.abort();
+      const expected = attemptId === "cancel" ? /已取消/
+        : attemptId === "timeout" ? /超时限制/
+          : attemptId === "error" ? /退出码 7/
+            : new RegExp(`${attemptId.replace("-limit", "")} 超过`);
+      if (attemptId === "success") await expect(running).resolves.toMatchObject({ hypothesis: "h", submitted: true });
+      else await expect(running).rejects.toThrow(expected);
+      expect(existsSync(`/proc/${escapedPid}`)).toBe(false);
+    };
+
+    await assertTreeStopped("success");
+    await assertTreeStopped("cancel");
+    await assertTreeStopped("timeout");
+    await assertTreeStopped("stdout-limit");
+    await assertTreeStopped("stderr-limit");
+    await assertTreeStopped("error");
+  }, 15_000);
 
   it("服务器兼容性指纹变化后拒绝恢复已冻结实验", async () => {
     const directory = mkdtempSync(join(tmpdir(), "maze-fingerprint-restart-"));

@@ -6,6 +6,7 @@
 
 - Node.js 22.12 或更高的 Node.js 22 版本
 - pnpm 10
+- 支持非特权用户 PID namespace 的 Linux，以及 util-linux `/usr/bin/unshare`
 
 ## 命令
 
@@ -34,12 +35,20 @@ pnpm arena install \
 pnpm arena image build \
   --base-image 'node@sha256:<64-character-digest>' \
   --image-name maze-arena/match-profile:local
+pnpm arena models sync
 pnpm arena doctor
+pnpm arena start
+pnpm arena status
+pnpm arena stop
 ```
 
 默认安装清单位于 `~/.config/maze-arena/install-manifest.json`，运行数据目录位于 `~/.local/share/maze-arena/`，日志与进程状态目录位于 `~/.local/state/maze-arena/`。命令遵守 `XDG_CONFIG_HOME`、`XDG_DATA_HOME` 和 `XDG_STATE_HOME` 覆盖；清单只记录 Harness 源码提交、可执行文件 SHA-256 和精确版本，不保存 API Key。
 
 `image build` 只接受带完整 SHA-256 摘要的基础镜像，使用已校验的 Harness 提交、`dsh` 可执行文件和当前可信项目构建产物在本机构建 Match Profile 镜像。Docker 返回的实际镜像 ID 会作为不可变引用写入安装清单；正式 `doctor` 会拒绝缺失、被替换或构建身份漂移的镜像，并检查 Docker 的 seccomp 与 cgroup namespace 安全能力。
+
+`start` 必须在完整 `doctor` 预检通过后启动生产 Server 和已构建 Web，并只监听 `127.0.0.1`。`status` 报告进程、HTTP、数据库、Harness、模型目录与镜像身份；`stop` 会等待活动原子步骤安全结束。重复执行这些命令是幂等的，默认端口为 `3000`，可通过 `MAZE_ARENA_PORT` 选择其他本机端口。
+
+每次正式 Harness 调用都运行在独立 PID namespace 中；namespace init 退出时由内核终止其中全部派生工具进程。`doctor` 无法建立该边界时会关闭失败，系统不会降级为仅依赖进程组的运行方式。
 
 ## Harness 模型导出
 

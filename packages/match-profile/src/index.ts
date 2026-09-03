@@ -105,7 +105,7 @@ export class HarnessMatchProfileInstaller {
     for (const role of ["generator", "solver"] as const) {
       const profile = profileName(role);
       const result = this.run(["plugin", "--profile", profile, "remove", packageName(this.options.roleBundles[role]), packageName(this.options.protocolBundle)]);
-      if (result.status !== 0) throw new Error(`无法卸载 ${profile}：${result.stderr.trim()}`);
+      if (result.status !== 0) throw new Error(`无法卸载 ${profile}（dsh 退出码 ${result.status ?? "未知"}）`);
       const manifest = readProfile(this.options.home, profile);
       if (Object.keys(manifest.dependencies ?? {}).length !== 0 || (manifest.dsh?.profile?.bundles ?? []).length !== 0) {
         throw new Error(`${profile} 卸载后仍残留能力 bundle`);
@@ -132,7 +132,7 @@ export class HarnessMatchProfileInstaller {
       "plugin", "--profile", profile, "add", "--offline", "--save-exact",
       `file:${protocolArtifact}`, `file:${roleArtifact}`,
     ]);
-    if (result.status !== 0) throw new Error(`无法安装 ${profile}：${result.stderr.trim()}`);
+    if (result.status !== 0) throw new Error(`无法安装 ${profile}（dsh 退出码 ${result.status ?? "未知"}）`);
     const manifest = readProfile(this.options.home, profile);
     const protocolName = packageName(protocolArtifact);
     const roleName = packageName(roleArtifact);
@@ -210,6 +210,12 @@ export class DockerMatchProfileCommandFactory implements MatchProfileCommandFact
 function freezeProfileSnapshot(home: string, role: MatchPluginRole): void {
   const root = resolve(home);
   const snapshot = join(root, "snapshots", role);
+  if (existsSync(snapshot)) {
+    // 上一轮快照刻意只读；正式服务重启时仅解冻待替换副本，不改变内容校验边界。
+    for (const path of walk(snapshot)) chmodSync(path, 0o600);
+    for (const directory of walkDirectories(snapshot).sort((left, right) => right.length - left.length)) chmodSync(directory, 0o700);
+    chmodSync(snapshot, 0o700);
+  }
   rmSync(snapshot, { recursive: true, force: true });
   cpSync(join(root, "artifacts"), join(snapshot, "artifacts"), { recursive: true, dereference: true });
   const sourceProfile = join(root, "profiles", profileName(role));
@@ -458,7 +464,7 @@ export class MatchProfileProcess {
       const pidResult = await runCleanupCommand(monitor.resolvePid);
       const pid = Number(pidResult.stdout.trim());
       if (pidResult.code !== 0 || !Number.isSafeInteger(pid) || pid <= 0) {
-        throw new MatchProfileError("NON_ZERO_EXIT", `无法取得 Match Profile 容器 PID：${pidResult.stderr.trim()}`);
+        throw new MatchProfileError("NON_ZERO_EXIT", `无法取得 Match Profile 容器 PID（docker 退出码 ${pidResult.code ?? "未知"}）`);
       }
       const procRoot = resolve(monitor.procRoot ?? "/proc");
       const cgroupRoot = resolve(monitor.cgroupRoot ?? "/sys/fs/cgroup");
@@ -966,7 +972,7 @@ interface CleanupResult { code: number | null; signal: NodeJS.Signals | null; st
 async function cleanupContainer(cleanup: NonNullable<MatchProfileCommand["cleanup"]>): Promise<void> {
   const removal = await runCleanupCommand(cleanup.remove);
   if (removal.code !== 0 && !explicitlyAbsent(removal) && !removalInProgress(removal)) {
-    throw new MatchProfileError("NON_ZERO_EXIT", `无法强制清理 Match Profile 容器 ${cleanup.identity}：${removal.stderr.trim()}`);
+    throw new MatchProfileError("NON_ZERO_EXIT", `无法强制清理 Match Profile 容器 ${cleanup.identity}（退出码 ${removal.code ?? "未知"}）`);
   }
   const deadline = Date.now() + MATCH_PROFILE_POLICY.cleanupTimeoutMs;
   let stableAbsent = 0;
@@ -976,11 +982,11 @@ async function cleanupContainer(cleanup: NonNullable<MatchProfileCommand["cleanu
       stableAbsent = 0;
       const retry = await runCleanupCommand(cleanup.remove);
       if (retry.code !== 0 && !explicitlyAbsent(retry) && !removalInProgress(retry)) {
-        throw new MatchProfileError("NON_ZERO_EXIT", `无法强制清理竞态创建的 Match Profile 容器 ${cleanup.identity}：${retry.stderr.trim()}`);
+        throw new MatchProfileError("NON_ZERO_EXIT", `无法强制清理竞态创建的 Match Profile 容器 ${cleanup.identity}（退出码 ${retry.code ?? "未知"}）`);
       }
     }
     else if (explicitlyAbsent(verification)) stableAbsent += 1;
-    else throw new MatchProfileError("NON_ZERO_EXIT", `无法确认 Match Profile 容器已清理：${verification.stderr.trim()}`);
+    else throw new MatchProfileError("NON_ZERO_EXIT", `无法确认 Match Profile 容器已清理（退出码 ${verification.code ?? "未知"}）`);
     if (stableAbsent >= 2) return;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }

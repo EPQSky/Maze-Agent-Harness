@@ -1,12 +1,15 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   cpSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdtempSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -18,7 +21,10 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { request } from "node:http";
+import { Socket } from "node:net";
+import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { parseHarnessModelCatalog } from "@maze-arena/dsh-integration";
 
@@ -35,6 +41,41 @@ interface RuntimePaths {
   stateRoot: string;
   manifest: string;
   protectedDirectories: string[];
+  runtime: string;
+  logs: string;
+  processState: string;
+  processLock: string;
+}
+
+interface ProcessState {
+  schemaVersion: 1;
+  pid: number;
+  procStartTime: string;
+  instanceId: string;
+  port: number;
+  startedAt: string;
+  databasePath: string;
+  harnessCommit: string;
+  harnessVersion: string;
+  modelCatalogRelease: string;
+  imageDigest: string;
+  logPath: string;
+}
+
+interface StartupHandshake {
+  schemaVersion: 1;
+  phase: "ready";
+  instanceId: string;
+  pid: number;
+  port: number;
+}
+
+interface StartupConfirmation {
+  schemaVersion: 1;
+  phase: "commit" | "committed";
+  instanceId: string;
+  pid: number;
+  port: number;
 }
 
 interface InstallManifest {
@@ -86,6 +127,7 @@ const matchProfilePolicy = {
 const digestPattern = /^sha256:[0-9a-f]{64}$/;
 const imageNameSegmentPattern = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/;
 const registrySegmentPattern = /^[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?$/;
+const unshareExecutable = "/usr/bin/unshare";
 
 class CliError extends Error {}
 
@@ -122,6 +164,8 @@ function runtimePaths(environment: NodeJS.ProcessEnv): RuntimePaths {
   const configRoot = join(environment.XDG_CONFIG_HOME || join(home, ".config"), "maze-arena");
   const dataRoot = join(environment.XDG_DATA_HOME || join(home, ".local/share"), "maze-arena");
   const stateRoot = join(environment.XDG_STATE_HOME || join(home, ".local/state"), "maze-arena");
+  const runtime = join(stateRoot, "run");
+  const logs = join(stateRoot, "logs");
   for (const [label, path] of [["配置", configRoot], ["数据", dataRoot], ["状态", stateRoot]] as const) {
     const canonical = canonicalizeFuturePath(path);
     if (isInsideRepository(canonical)) throw new CliError(`${label}目录不得位于 Maze Arena 源码仓库内：${path}`);
@@ -141,8 +185,13 @@ function runtimePaths(environment: NodeJS.ProcessEnv): RuntimePaths {
       join(dataRoot, "lineages/solver"),
       join(dataRoot, "backups"),
       stateRoot,
-      join(stateRoot, "logs"),
+      logs,
+      runtime,
     ],
+    runtime,
+    logs,
+    processState: join(runtime, "server.json"),
+    processLock: join(runtime, "server.lock"),
   };
 }
 
@@ -157,15 +206,14 @@ function runWithInput(command: string, args: string[], input: string | undefined
   }
   if (result.error) throw new CliError(`无法执行 ${command}：${result.error.message}`);
   if (result.status !== 0) {
-    const detail = (result.stderr || result.stdout).trim();
-    throw new CliError(`${command} 检查失败${detail ? `：${detail}` : ""}`);
+    throw new CliError(`${command} 检查失败（退出码 ${result.status ?? "未知"}）`);
   }
   return result.stdout.trim();
 }
 
 function parseDigest(value: string, label: string): string {
   const normalized = value.trim().toLowerCase();
-  if (!digestPattern.test(normalized)) throw new CliError(`${label}不是有效 SHA-256 摘要：${value}`);
+  if (!digestPattern.test(normalized)) throw new CliError(`${label}格式无效，预期 sha256 后跟 64 位小写十六进制字符`);
   return normalized;
 }
 
@@ -183,7 +231,7 @@ function validateImmutableImageReference(value: string, label = "Match Profile �
 
 function parseVersion(label: string, output: string): [number, number, number] {
   const match = output.match(/(?:^|\s|v)(\d+)\.(\d+)\.(\d+)/);
-  if (!match) throw new CliError(`无法解析 ${label} 版本：${output}`);
+  if (!match) throw new CliError(`无法解析 ${label} 版本，预期包含 major.minor.patch`);
   return [Number(match[1]), Number(match[2]), Number(match[3])];
 }
 
@@ -204,27 +252,32 @@ function validateTools(): string[] {
     throw new CliError(`Node.js 版本不受支持：${process.version}，要求 >=${requirements.node.minimum} <${requirements.node.maximumExclusive}`);
   }
   if (nodeOutput !== process.version) {
-    throw new CliError(`Node.js 执行身份不一致：当前进程 ${process.version}，PATH 中为 ${nodeOutput}`);
+    throw new CliError("Node.js 执行身份不一致：PATH 中版本与当前进程版本不同");
   }
 
   const pnpmOutput = run("pnpm", ["--version"]);
   if (pnpmOutput !== requirements.pnpm.exact) {
-    throw new CliError(`pnpm 版本不受支持：${pnpmOutput}，要求 ${requirements.pnpm.exact}`);
+    throw new CliError(`pnpm 版本不受支持，要求 ${requirements.pnpm.exact}`);
   }
 
   const gitOutput = run("git", ["--version"]);
   if (compareVersion(parseVersion("Git", gitOutput), requirements.git.minimum) < 0) {
-    throw new CliError(`Git 版本不受支持：${gitOutput}，要求 >=${requirements.git.minimum}`);
+    throw new CliError(`Git 版本不受支持，要求 >=${requirements.git.minimum}`);
   }
 
   const dockerOutput = run("docker", ["--version"]);
   if (compareVersion(parseVersion("Docker", dockerOutput), requirements.docker.minimum) < 0) {
-    throw new CliError(`Docker 版本不受支持：${dockerOutput}，要求 >=${requirements.docker.minimum}`);
+    throw new CliError(`Docker 版本不受支持，要求 >=${requirements.docker.minimum}`);
   }
   const dockerDaemon = run("docker", ["info", "--format", "{{.ServerVersion}}"]);
   if (compareVersion(parseVersion("Docker daemon", dockerDaemon), requirements.docker.minimum) < 0) {
-    throw new CliError(`Docker daemon 版本不受支持：${dockerDaemon}，要求 >=${requirements.docker.minimum}`);
+    throw new CliError(`Docker daemon 版本不受支持，要求 >=${requirements.docker.minimum}`);
   }
+
+  run(unshareExecutable, [
+    "--user", "--map-current-user", "--pid", "--fork", "--kill-child=SIGKILL", "--mount-proc",
+    "/bin/sh", "-c", "test \"$$\" -eq 1",
+  ]);
 
   return [
     `检查通过：Node.js ${nodeOutput}`,
@@ -232,6 +285,7 @@ function validateTools(): string[] {
     `检查通过：${gitOutput}`,
     `检查通过：Docker ${dockerOutput}`,
     `检查通过：Docker daemon ${dockerDaemon}`,
+    "检查通过：Harness PID namespace 隔离可用",
   ];
 }
 
@@ -349,7 +403,7 @@ function currentHarnessCommit(sourceDirectory: string): string {
 
 function validateCleanHarnessWorktree(sourceDirectory: string): void {
   const status = run("git", ["-C", sourceDirectory, "status", "--porcelain=v1", "--untracked-files=all"]);
-  if (status) throw new CliError(`Harness 源码工作树不干净：${status}`);
+  if (status) throw new CliError("Harness 源码工作树不干净");
 }
 
 function validateCommit(commit: string): void {
@@ -481,7 +535,7 @@ function install(args: string[], environment: NodeJS.ProcessEnv): void {
   const executablePath = resolveFile(options["--dsh-executable"]!, "dsh 可执行文件");
   const expectedVersion = options["--dsh-version"]!;
   const actualVersion = run(executablePath, ["--version"]);
-  if (actualVersion !== expectedVersion) throw new CliError(`dsh 版本不匹配：期望 ${expectedVersion}，实际 ${actualVersion}`);
+  if (actualVersion !== expectedVersion) throw new CliError(`dsh 版本不匹配：期望 ${expectedVersion}`);
 
   const paths = runtimePaths(environment);
   ensureDirectories(paths);
@@ -662,14 +716,14 @@ function buildMatchProfileImage(args: string[], environment: NodeJS.ProcessEnv):
       let ready: unknown;
       try {
         ready = JSON.parse(firstFrame ?? "");
-      } catch (error) {
-        throw new CliError(`${role} Match Profile ready 握手不是有效 JSON：${(error as Error).message}`);
+      } catch {
+        throw new CliError(`${role} Match Profile ready 握手不是有效 JSON，预期单行 match-profile.ready`);
       }
       if (!ready || typeof ready !== "object"
         || (ready as Record<string, unknown>).type !== "match-profile.ready"
         || (ready as Record<string, unknown>).protocolVersion !== 1
         || (ready as Record<string, unknown>).role !== role) {
-        throw new CliError(`${role} Match Profile ready 握手无效：${firstFrame}`);
+        throw new CliError(`${role} Match Profile ready 握手字段无效，预期 protocolVersion=1 且角色匹配`);
       }
     }
     manifest.matchProfile = {
@@ -707,7 +761,7 @@ function validateDockerSecurityCapabilities(): void {
     value = JSON.parse(run("docker", ["info", "--format", "{{json .SecurityOptions}}"]));
   } catch (error) {
     if (error instanceof CliError) throw error;
-    throw new CliError(`无法解析 Docker 安全能力：${(error as Error).message}`);
+    throw new CliError("无法解析 Docker 安全能力，预期为字符串数组 JSON");
   }
   if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
     throw new CliError("Docker 安全能力响应结构无效");
@@ -733,7 +787,7 @@ function validateMatchProfileImage(manifest: InstallManifest): void {
   }
   const actualImageId = parseDigest(inspectedImageId, "Docker inspect 镜像 ID");
   if (actualImageId !== expectedImageId) {
-    throw new CliError(`Match Profile 镜像摘要漂移：期望 ${expectedImageId}，实际 ${actualImageId}`);
+    throw new CliError(`Match Profile 镜像摘要漂移：期望 ${expectedImageId}`);
   }
   if (matchProfile.harnessCommit !== manifest.harness.commit
     || matchProfile.dshExecutableSha256 !== manifest.harness.executable.sha256) {
@@ -748,7 +802,7 @@ function validateMatchProfileImage(manifest: InstallManifest): void {
     labels = JSON.parse(run("docker", ["image", "inspect", imageReference, "--format", "{{json .Config.Labels}}"]));
   } catch (error) {
     if (error instanceof CliError) throw error;
-    throw new CliError(`无法解析 Match Profile 镜像标签：${(error as Error).message}`);
+    throw new CliError("无法解析 Match Profile 镜像标签，预期为 JSON 对象");
   }
   const expectedLabels = {
     "org.maze-arena.harness-commit": manifest.harness.commit,
@@ -762,6 +816,479 @@ function validateMatchProfileImage(manifest: InstallManifest): void {
   if (JSON.stringify(matchProfile.resourcePolicy) !== JSON.stringify(matchProfilePolicy)) {
     throw new CliError("Match Profile 资源与安全策略摘要不受支持");
   }
+}
+
+function validateModelCatalog(paths: RuntimePaths, manifest: InstallManifest): { path: string; release: string } {
+  const modelsRoot = join(paths.dataRoot, "models");
+  const current = join(modelsRoot, "current");
+  if (!existsSync(current) || !lstatSync(current).isSymbolicLink()) {
+    throw new CliError("Harness 模型目录尚未同步，请先运行 models sync");
+  }
+  const release = realpathSync(current);
+  const releasesRoot = realpathSync(join(modelsRoot, "releases"));
+  if (!release.startsWith(`${releasesRoot}${sep}`) || dirname(release) !== releasesRoot) {
+    throw new CliError("Harness 模型目录 current 未指向受控只读发布");
+  }
+  const catalogPath = join(release, "catalog.json");
+  try {
+    const releaseStat = lstatSync(release);
+    const catalogStat = lstatSync(catalogPath);
+    if (!releaseStat.isDirectory() || releaseStat.isSymbolicLink() || (releaseStat.mode & 0o777) !== 0o500
+      || !catalogStat.isFile() || catalogStat.isSymbolicLink() || (catalogStat.mode & 0o777) !== 0o400) {
+      throw new Error("invalid permissions");
+    }
+    parseHarnessModelCatalog(JSON.parse(readFileSync(catalogPath, "utf8")), manifest.harness.executable.version);
+  } catch (error) {
+    throw new CliError(`Harness 模型目录无效：${error instanceof Error ? error.message : "未知错误"}`);
+  }
+  return { path: catalogPath, release: basename(release) };
+}
+
+function validateProductionBuild(): { serverEntry: string; webRoot: string } {
+  const serverEntry = resolveFile(join(repositoryRoot, "apps/server/dist/index.js"), "生产 Server 构建入口");
+  const webRoot = resolveDirectory(join(repositoryRoot, "apps/web/dist"), "生产 Web 构建目录");
+  resolveFile(join(webRoot, "index.html"), "生产 Web index.html");
+  return { serverEntry, webRoot };
+}
+
+function processStartTime(pid: number): string | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+    const startTime = fields[19];
+    return startTime && /^[1-9]\d*$/.test(startTime) ? startTime : null;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForProcessStartTime(pid: number, timeout = 1_000): Promise<string | null> {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const startTime = processStartTime(pid);
+    if (startTime !== null) return startTime;
+    if (!processExists(pid)) return null;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+  }
+  return processStartTime(pid);
+}
+
+function processExists(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+type ExactProcessStatus = "running" | "exited" | "unknown";
+
+function exactProcessStatus(pid: number, procStartTime: string): ExactProcessStatus {
+  const actualStartTime = processStartTime(pid);
+  if (actualStartTime !== null) return actualStartTime === procStartTime ? "running" : "exited";
+  return processExists(pid) ? "unknown" : "exited";
+}
+
+function recordedProcessStatus(state: ProcessState): ExactProcessStatus {
+  return exactProcessStatus(state.pid, state.procStartTime);
+}
+
+function requireKnownProcessStatus(state: ProcessState): Exclude<ExactProcessStatus, "unknown"> {
+  const status = recordedProcessStatus(state);
+  if (status === "unknown") {
+    throw new CliError(`无法验证运行进程身份：PID ${state.pid} 仍存在但启动时间不可读取；状态文件已保留`);
+  }
+  return status;
+}
+
+function readProcessState(paths: RuntimePaths): ProcessState | undefined {
+  if (!existsSync(paths.processState)) return undefined;
+  try {
+    const value = JSON.parse(readFileSync(paths.processState, "utf8")) as Partial<ProcessState>;
+    if (value.schemaVersion !== 1 || !Number.isSafeInteger(value.pid) || Number(value.pid) <= 0
+      || typeof value.instanceId !== "string" || !Number.isSafeInteger(value.port)
+      || Number(value.port) < 1_024 || Number(value.port) > 65_535
+      || typeof value.databasePath !== "string" || typeof value.logPath !== "string") throw new Error("invalid state");
+    if (typeof value.procStartTime !== "string" || !/^[1-9]\d*$/.test(value.procStartTime)) {
+      if (!processExists(Number(value.pid))) {
+        rmSync(paths.processState, { force: true });
+        return undefined;
+      }
+      throw new CliError(`运行进程状态缺少有效启动时间，PID ${String(value.pid)} 仍存在，无法证明原实例已退出；状态文件已保留`);
+    }
+    return value as ProcessState;
+  } catch (error) {
+    if (error instanceof CliError) throw error;
+    throw new CliError(`运行进程状态文件无效：${paths.processState}`);
+  }
+}
+
+function writeProcessState(paths: RuntimePaths, state: ProcessState): void {
+  const temporary = join(paths.runtime, `.server.${process.pid}.tmp`);
+  try {
+    writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    renameSync(temporary, paths.processState);
+    chmodSync(paths.processState, 0o600);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+function flockExecutable(): string {
+  for (const candidate of ["/usr/bin/flock", "/bin/flock"]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new CliError("正式运行管理需要 util-linux flock 提供进程互斥");
+}
+
+interface PrivateRuntimeRequest {
+  schemaVersion: 1;
+  args: string[];
+}
+
+function currentProcessOwnsRuntimeLock(lockPath: string): boolean {
+  let lock: ReturnType<typeof statSync>;
+  try {
+    lock = statSync(lockPath);
+  } catch {
+    return false;
+  }
+  try {
+    for (const entry of readdirSync("/proc/self/fd")) {
+      const descriptor = Number(entry);
+      if (!Number.isSafeInteger(descriptor) || descriptor < 4) continue;
+      try {
+        const candidate = fstatSync(descriptor);
+        if (candidate.dev !== lock.dev || candidate.ino !== lock.ino) continue;
+        const fdInfo = readFileSync(`/proc/self/fdinfo/${descriptor}`, "utf8");
+        if (fdInfo.split(/\r?\n/).some((line) => {
+          const match = /^lock:\s+\d+:\s+FLOCK\s+ADVISORY\s+WRITE\s+(\d+)\s+[0-9a-f]+:[0-9a-f]+:(\d+)\s/i.exec(line);
+          return match?.[1] === String(process.pid) && match[2] === String(lock.ino);
+        })) return true;
+      } catch {}
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function readBoundedPrivateRequest(descriptor: number): Promise<string> {
+  return new Promise((resolveRequest, reject) => {
+    const stream = new Socket({ fd: descriptor, readable: true, writable: false });
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      stream.destroy();
+      callback();
+    };
+    const timer = setTimeout(() => finish(() => reject(new CliError("运行管理私有请求读取超时"))), 2_000);
+    stream.on("data", (chunk: string | Buffer) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.length;
+      if (bytes > 8 * 1024) {
+        finish(() => reject(new CliError("运行管理私有请求超过 8 KiB 限制")));
+        return;
+      }
+      chunks.push(buffer);
+    });
+    stream.once("end", () => finish(() => resolveRequest(Buffer.concat(chunks).toString("utf8"))));
+    stream.once("error", (error) => finish(() => reject(error)));
+  });
+}
+
+async function readPrivateRuntimeRequest(paths: RuntimePaths): Promise<PrivateRuntimeRequest | undefined> {
+  try {
+    const requestChannel = fstatSync(3);
+    if (!requestChannel.isFIFO() && !requestChannel.isSocket()) return undefined;
+    if (!currentProcessOwnsRuntimeLock(paths.processLock)) {
+      throw new CliError("运行管理私有请求进程未持有目标互斥锁");
+    }
+    const value = JSON.parse(await readBoundedPrivateRequest(3)) as Partial<PrivateRuntimeRequest>;
+    if (value.schemaVersion !== 1 || !Array.isArray(value.args)
+      || !value.args.every((argument) => typeof argument === "string")) {
+      throw new CliError("运行管理私有请求结构无效");
+    }
+    return value as PrivateRuntimeRequest;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EBADF") return undefined;
+    if (error instanceof CliError) throw error;
+    throw new CliError("运行管理私有请求无法读取");
+  }
+}
+
+async function runWithRuntimeLock(args: string[], paths: RuntimePaths, environment: NodeJS.ProcessEnv): Promise<number> {
+  const descriptor = openSync(paths.processLock, "a", 0o600);
+  closeSync(descriptor);
+  chmodSync(paths.processLock, 0o600);
+  const cliEntry = fileURLToPath(import.meta.url);
+  const child = spawn(flockExecutable(), [
+    "--no-fork", "--exclusive", "--nonblock", "--conflict-exit-code", "75", paths.processLock,
+    process.execPath, cliEntry,
+  ], { stdio: ["inherit", "inherit", "inherit", "pipe"], env: environment });
+  const requestPipe = child.stdio[3];
+  if (!requestPipe || !("end" in requestPipe)) {
+    child.kill("SIGKILL");
+    throw new CliError("无法建立运行管理私有请求管道");
+  }
+  requestPipe.on("error", () => {});
+  requestPipe.end(JSON.stringify({ schemaVersion: 1, args } satisfies PrivateRuntimeRequest));
+  return new Promise<number>((resolveCode, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => resolveCode(code ?? 1));
+  });
+}
+
+function parseRuntimePort(environment: NodeJS.ProcessEnv): number {
+  const value = environment.MAZE_ARENA_PORT ?? "3000";
+  const port = Number(value);
+  if (!Number.isSafeInteger(port) || (port !== 0 && (port < 1_024 || port > 65_535))) {
+    throw new CliError("MAZE_ARENA_PORT 必须是 0 或 1024 到 65535 之间的整数");
+  }
+  return port;
+}
+
+function readStartupFrame(
+  stream: Duplex,
+  description: string,
+  timeout: number,
+): Promise<Record<string, unknown>> {
+  return new Promise((resolveFrame, reject) => {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(deadline);
+      stream.off("data", onData);
+      stream.off("end", onEnd);
+      stream.off("error", onError);
+      stream.off("close", onClose);
+      stream.pause();
+    };
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback();
+    };
+    const fail = (detail: string) => finish(() => reject(new CliError(`${description}${detail}`)));
+    const onData = (chunk: string | Buffer) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.length;
+      if (bytes > 8 * 1024) {
+        fail("超过 8 KiB 限制");
+        return;
+      }
+      chunks.push(buffer);
+      const payload = Buffer.concat(chunks);
+      const newline = payload.indexOf(0x0a);
+      if (newline < 0) return;
+      if (payload.subarray(newline + 1).length !== 0) {
+        fail("结构无效");
+        return;
+      }
+      let value: unknown;
+      try {
+        value = JSON.parse(payload.subarray(0, newline).toString("utf8"));
+      } catch {
+        fail("结构无效");
+        return;
+      }
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        fail("结构无效");
+        return;
+      }
+      finish(() => resolveFrame(value as Record<string, unknown>));
+    };
+    const onEnd = () => fail("在完成前关闭");
+    const onError = () => fail("无法读取");
+    const onClose = () => fail("在完成前关闭");
+    const deadline = setTimeout(() => fail("超时"), timeout);
+    stream.on("data", onData);
+    stream.once("end", onEnd);
+    stream.once("error", onError);
+    stream.once("close", onClose);
+    stream.resume();
+  });
+}
+
+function writeStartupFrame(stream: Duplex, value: object, description: string): Promise<void> {
+  const frame = `${JSON.stringify(value)}\n`;
+  if (Buffer.byteLength(frame) > 8 * 1024) return Promise.reject(new CliError(`${description}超过 8 KiB 限制`));
+  return new Promise((resolveWrite, reject) => {
+    const onError = () => finish(() => reject(new CliError(`${description}无法写入`)));
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      stream.off("error", onError);
+      callback();
+    };
+    stream.once("error", onError);
+    stream.write(frame, (error) => {
+      if (error) finish(() => reject(new CliError(`${description}无法写入`)));
+      else finish(resolveWrite);
+    });
+  });
+}
+
+async function readStartupHandshake(
+  stream: Duplex,
+  expectedInstanceId: string,
+  expectedPid: number,
+  timeout = 10_000,
+): Promise<StartupHandshake> {
+  const record = await readStartupFrame(stream, "生产 Server 启动握手", timeout);
+  const keys = Object.keys(record).sort();
+  if (keys.join("\n") !== ["instanceId", "phase", "pid", "port", "schemaVersion"].sort().join("\n")
+    || record.schemaVersion !== 1 || record.phase !== "ready" || record.instanceId !== expectedInstanceId
+    || record.pid !== expectedPid || !Number.isSafeInteger(record.port)
+    || Number(record.port) < 1_024 || Number(record.port) > 65_535) {
+    throw new CliError("生产 Server 启动握手身份或端口无效");
+  }
+  return record as unknown as StartupHandshake;
+}
+
+async function commitStartupHandshake(stream: Duplex, handshake: StartupHandshake, timeout = 10_000): Promise<void> {
+  const identity = {
+    schemaVersion: 1,
+    instanceId: handshake.instanceId,
+    pid: handshake.pid,
+    port: handshake.port,
+  } as const;
+  await writeStartupFrame(stream, { ...identity, phase: "commit" } satisfies StartupConfirmation, "生产 Server 启动确认");
+  const record = await readStartupFrame(stream, "生产 Server 启动确认回执", timeout);
+  const keys = Object.keys(record).sort();
+  if (keys.join("\n") !== ["instanceId", "phase", "pid", "port", "schemaVersion"].sort().join("\n")
+    || record.schemaVersion !== 1 || record.phase !== "committed" || record.instanceId !== handshake.instanceId
+    || record.pid !== handshake.pid || record.port !== handshake.port) {
+    throw new CliError("生产 Server 启动确认回执身份无效");
+  }
+}
+
+async function terminateExactProcess(
+  pid: number,
+  procStartTime: string,
+  gracefulTimeout = 5_000,
+  forcedTimeout = 1_000,
+): Promise<boolean> {
+  let status = exactProcessStatus(pid, procStartTime);
+  if (status === "exited") return true;
+  if (status === "unknown") return false;
+  try { process.kill(pid, "SIGTERM"); } catch {}
+  let deadline = Date.now() + gracefulTimeout;
+  while ((status = exactProcessStatus(pid, procStartTime)) === "running" && Date.now() < deadline) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  }
+  status = exactProcessStatus(pid, procStartTime);
+  if (status === "exited") return true;
+  if (status === "unknown") return false;
+  try { process.kill(pid, "SIGKILL"); } catch {}
+  deadline = Date.now() + forcedTimeout;
+  while ((status = exactProcessStatus(pid, procStartTime)) === "running" && Date.now() < deadline) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+  }
+  status = exactProcessStatus(pid, procStartTime);
+  return status === "exited";
+}
+
+async function stopExactProcessGracefully(pid: number, procStartTime: string, timeout = 30_000): Promise<boolean> {
+  let status = exactProcessStatus(pid, procStartTime);
+  if (status === "exited") return true;
+  if (status === "unknown") return false;
+  try { process.kill(pid, "SIGTERM"); } catch {}
+  const deadline = Date.now() + timeout;
+  while ((status = exactProcessStatus(pid, procStartTime)) === "running" && Date.now() < deadline) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+  }
+  status = exactProcessStatus(pid, procStartTime);
+  return status === "exited";
+}
+
+function healthCheck(port: number, instanceId: string, timeout = 1_000): Promise<boolean> {
+  return new Promise((resolveHealth) => {
+    let settled = false;
+    let healthResponse: import("node:http").IncomingMessage | undefined;
+    const finish = (healthy: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      healthResponse?.destroy();
+      healthRequest.destroy();
+      resolveHealth(healthy);
+    };
+    const healthRequest = request({ host: "127.0.0.1", port, path: "/api/health", method: "GET" }, (response) => {
+      healthResponse = response;
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      response.on("data", (chunk: Buffer) => {
+        bytes += chunk.length;
+        if (bytes > 16 * 1024) {
+          finish(false);
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.once("error", () => finish(false));
+      response.once("aborted", () => finish(false));
+      response.once("end", () => {
+        try {
+          const value = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { status?: unknown; instanceId?: unknown };
+          finish(response.statusCode === 200 && value.status === "ok" && value.instanceId === instanceId);
+        } catch { finish(false); }
+      });
+    });
+    const deadline = setTimeout(() => finish(false), timeout);
+    healthRequest.once("error", () => finish(false));
+    healthRequest.end();
+  });
+}
+
+async function waitForHealth(state: ProcessState, timeout: number): Promise<boolean> {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const processStatus = recordedProcessStatus(state);
+    if (processStatus === "exited") return false;
+    if (processStatus === "unknown") throw new CliError(`无法验证生产 Server 进程身份：PID ${state.pid}`);
+    if (await healthCheck(state.port, state.instanceId)) return true;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+  }
+  return false;
+}
+
+function formalRuntimeEnvironment(
+  environment: NodeJS.ProcessEnv,
+  paths: RuntimePaths,
+  manifest: InstallManifest,
+  catalogPath: string,
+  webRoot: string,
+  port: number,
+  instanceId: string,
+): NodeJS.ProcessEnv {
+  const inherited = ["HOME", "LANG", "LC_ALL", "NODE_OPTIONS", "PATH", "TMPDIR"]
+    .flatMap((name) => environment[name] === undefined ? [] : [[name, environment[name]!]]);
+  return {
+    ...Object.fromEntries(inherited),
+    NODE_ENV: "production",
+    PORT: String(port),
+    ARENA_INSTANCE_ID: instanceId,
+    ARENA_STARTUP_HANDSHAKE_FD: "3",
+    ARENA_DATABASE_PATH: join(paths.dataRoot, "maze-arena.sqlite"),
+    ARENA_MODEL_CATALOG_PATH: catalogPath,
+    ARENA_MATCH_IMAGE: manifest.matchProfile!.imageReference,
+    ARENA_MATCH_TRUSTED_ROOT: join(paths.dataRoot, "harness"),
+    ARENA_MATCH_PROTOCOL_PACKAGE: join(repositoryRoot, "packages/match-profile"),
+    ARENA_GENERATOR_PLUGIN_PACKAGE: join(repositoryRoot, "packages/generator-plugin"),
+    ARENA_SOLVER_PLUGIN_PACKAGE: join(repositoryRoot, "packages/solver-plugin"),
+    ARENA_WEB_ROOT: webRoot,
+    DSH_EXECUTABLE: manifest.harness.executable.path,
+    DSH_HOME: join(paths.dataRoot, "harness"),
+    DSH_HARNESS_VERSION: manifest.harness.executable.version,
+    DSH_EVOLUTION_COMMAND: manifest.harness.executable.path,
+    DSH_SMOKE_COMMAND: manifest.harness.executable.path,
+    DSH_UNSHARE_EXECUTABLE: unshareExecutable,
+  };
 }
 
 function doctor(environment: NodeJS.ProcessEnv): void {
@@ -782,32 +1309,184 @@ function doctor(environment: NodeJS.ProcessEnv): void {
   }
   const actualVersion = run(executablePath, ["--version"]);
   if (actualVersion !== manifest.harness.executable.version) {
-    throw new CliError(`dsh 版本漂移：期望 ${manifest.harness.executable.version}，实际 ${actualVersion}`);
+    throw new CliError(`dsh 版本漂移：期望 ${manifest.harness.executable.version}`);
   }
   validateDockerSecurityCapabilities();
   validateMatchProfileImage(manifest);
+  const catalog = validateModelCatalog(paths, manifest);
+  validateProductionBuild();
   for (const diagnostic of diagnostics) process.stdout.write(`${diagnostic}\n`);
   process.stdout.write("检查通过：正式运行目录权限正确\n");
   process.stdout.write("检查通过：DeepSeek Harness 身份未漂移\n");
   process.stdout.write(`检查通过：Match Profile 镜像 ${manifest.matchProfile!.imageReference}\n`);
+  process.stdout.write(`检查通过：Harness 模型目录 ${catalog.release}\n`);
+  process.stdout.write("检查通过：生产 Server 与 Web 构建产物可用\n");
   process.stdout.write("检查通过：Docker seccomp 与 cgroupns 安全能力可用\n");
 }
 
-function usage(): never {
-  throw new CliError("用法：maze-arena <install|image build|models sync|doctor> [参数]");
+async function start(environment: NodeJS.ProcessEnv): Promise<void> {
+  const paths = runtimePaths(environment);
+  const existing = readProcessState(paths);
+  if (existing) {
+    const processStatus = requireKnownProcessStatus(existing);
+    if (processStatus === "running") {
+      const healthy = await healthCheck(existing.port, existing.instanceId);
+      if (!healthy) throw new CliError(`Maze Arena 进程仍存在但 HTTP 健康检查失败：PID ${existing.pid}`);
+      process.stdout.write(`Maze Arena 已在运行：PID ${existing.pid}，http://127.0.0.1:${existing.port}\n`);
+      return;
+    }
+    rmSync(paths.processState, { force: true });
+  }
+
+  // start 复用公开 doctor 的全部关闭失败检查，不维护第二套较弱预检。
+  doctor(environment);
+  const manifest = readManifest(paths);
+  const catalog = validateModelCatalog(paths, manifest);
+  const build = validateProductionBuild();
+  const port = parseRuntimePort(environment);
+  const instanceId = randomUUID();
+  const logPath = join(paths.logs, `server-${new Date().toISOString().replace(/[:.]/g, "-")}.log`);
+  const logDescriptor = openSync(logPath, "a", 0o600);
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(process.execPath, [build.serverEntry], {
+      detached: true,
+      stdio: ["ignore", logDescriptor, logDescriptor, "pipe"],
+      env: formalRuntimeEnvironment(environment, paths, manifest, catalog.path, build.webRoot, port, instanceId),
+    });
+  } finally {
+    closeSync(logDescriptor);
+  }
+  if (!child.pid) throw new CliError("生产 Server 进程未能启动");
+  const startupPipe = child.stdio[3] as Duplex | null;
+  const procStartTime = await waitForProcessStartTime(child.pid);
+  if (!startupPipe || procStartTime === null) {
+    startupPipe?.destroy();
+    // 这里只能使用刚创建的 ChildProcess 句柄温和终止；缺少 /proc 身份时禁止按裸 PID 强杀。
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    throw new CliError("无法建立生产 Server 启动身份与私有握手管道");
+  }
+  let state: ProcessState | undefined;
+  try {
+    const handshake = await readStartupHandshake(startupPipe, instanceId, child.pid);
+    state = {
+      schemaVersion: 1,
+      pid: child.pid,
+      procStartTime,
+      instanceId,
+      port: handshake.port,
+      startedAt: new Date().toISOString(),
+      databasePath: join(paths.dataRoot, "maze-arena.sqlite"),
+      harnessCommit: manifest.harness.commit,
+      harnessVersion: manifest.harness.executable.version,
+      modelCatalogRelease: catalog.release,
+      imageDigest: manifest.matchProfile!.imageReference,
+      logPath,
+    };
+    writeProcessState(paths, state);
+    await commitStartupHandshake(startupPipe, handshake);
+    startupPipe.destroy();
+    child.unref();
+    if (!await waitForHealth(state, 15_000)) {
+      throw new CliError(`生产 Server 未通过启动健康检查，请查看净化日志：${logPath}`);
+    }
+  } catch (error) {
+    startupPipe.destroy();
+    const stopped = await terminateExactProcess(child.pid, procStartTime);
+    if (stopped) rmSync(paths.processState, { force: true });
+    else throw new CliError(`生产 Server 启动失败且无法安全清理，运行状态已保留；请查看净化日志：${logPath}`);
+    throw error;
+  }
+  process.stdout.write(`Maze Arena 已启动：PID ${state.pid}，http://127.0.0.1:${state.port}\n`);
+  process.stdout.write(`数据库：${state.databasePath}\n日志：${state.logPath}\n`);
 }
 
-function main(args: string[], environment: NodeJS.ProcessEnv): void {
+async function stop(environment: NodeJS.ProcessEnv): Promise<void> {
+  const paths = runtimePaths(environment);
+  const state = readProcessState(paths);
+  if (!state) {
+    rmSync(paths.processState, { force: true });
+    process.stdout.write("Maze Arena 已停止\n");
+    return;
+  }
+  const processStatus = requireKnownProcessStatus(state);
+  if (processStatus === "exited") {
+    rmSync(paths.processState, { force: true });
+    process.stdout.write("Maze Arena 已停止\n");
+    return;
+  }
+  await healthCheck(state.port, state.instanceId);
+  if (!await stopExactProcessGracefully(state.pid, state.procStartTime)) {
+    throw new CliError("Maze Arena 未能安全停止，可能仍有活动原子步骤；运行状态已保留，可稍后重试 stop 或检查 status");
+  }
+  rmSync(paths.processState, { force: true });
+  process.stdout.write("Maze Arena 已安全停止\n");
+}
+
+async function status(environment: NodeJS.ProcessEnv): Promise<void> {
+  const paths = runtimePaths(environment);
+  const state = readProcessState(paths);
+  if (!state || requireKnownProcessStatus(state) === "exited") {
+    if (state) rmSync(paths.processState, { force: true });
+    const manifest = readManifest(paths);
+    const catalog = validateModelCatalog(paths, manifest);
+    if (!manifest.matchProfile) throw new CliError("Match Profile 镜像尚未构建，请先运行 image build");
+    process.stdout.write("进程：已停止\nHTTP：不可用\n");
+    process.stdout.write(`数据库：${join(paths.dataRoot, "maze-arena.sqlite")}\n`);
+    process.stdout.write(`Harness：${manifest.harness.executable.version} @ ${manifest.harness.commit}\n`);
+    process.stdout.write(`模型目录版本：${catalog.release}\n`);
+    process.stdout.write(`镜像摘要：${manifest.matchProfile.imageReference}\n`);
+    return;
+  }
+  const healthy = await healthCheck(state.port, state.instanceId);
+  process.stdout.write(`进程：运行中（PID ${state.pid}）\n`);
+  process.stdout.write(`HTTP：${healthy ? "健康" : "异常"}（http://127.0.0.1:${state.port}）\n`);
+  process.stdout.write(`数据库：${state.databasePath}\n`);
+  process.stdout.write(`Harness：${state.harnessVersion} @ ${state.harnessCommit}\n`);
+  process.stdout.write(`模型目录版本：${state.modelCatalogRelease}\n`);
+  process.stdout.write(`镜像摘要：${state.imageDigest}\n`);
+}
+
+function usage(): never {
+  throw new CliError("用法：maze-arena <install|image build|models sync|doctor|start|stop|status> [参数]");
+}
+
+async function main(args: string[], environment: NodeJS.ProcessEnv): Promise<void> {
+  const paths = runtimePaths(environment);
+  const privateRequest = await readPrivateRuntimeRequest(paths);
+  const locked = privateRequest !== undefined;
+  if (privateRequest) args = privateRequest.args;
   const [command, ...rest] = args;
   if (command === "install") return install(rest, environment);
   if (command === "image" && rest[0] === "build") return buildMatchProfileImage(rest.slice(1), environment);
   if (command === "models" && rest[0] === "sync" && rest.length === 1) return syncHarnessModels(environment);
   if (command === "doctor" && rest.length === 0) return doctor(environment);
+  if (command === "start" && rest.length === 0) {
+    if (locked) return start(environment);
+    const code = await runWithRuntimeLock(args, paths, environment);
+    if (code === 75) throw new CliError("另一个运行管理命令正在执行");
+    if (code !== 0) process.exitCode = code;
+    return;
+  }
+  if (command === "stop" && rest.length === 0) {
+    if (locked) return stop(environment);
+    const code = await runWithRuntimeLock(args, paths, environment);
+    if (code === 75) throw new CliError("另一个运行管理命令正在执行");
+    if (code !== 0) process.exitCode = code;
+    return;
+  }
+  if (command === "status" && rest.length === 0) {
+    if (locked) return status(environment);
+    const code = await runWithRuntimeLock(args, paths, environment);
+    if (code === 75) throw new CliError("另一个运行管理命令正在执行");
+    if (code !== 0) process.exitCode = code;
+    return;
+  }
   return usage();
 }
 
 try {
-  main(process.argv.slice(2), process.env);
+  await main(process.argv.slice(2), process.env);
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`错误：${message}\n`);
