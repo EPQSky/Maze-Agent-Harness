@@ -19,7 +19,11 @@ function baseOptions(session: EvolutionHarnessSession, lineage: PluginLineageRep
   return {
     experimentId: "exp", generation: 2, attemptId: "attempt-1", role: "generator" as const,
     championRoot, isolatedRoot: mkdtempSync(join(tmpdir(), "maze-evolution-")), lineage,
-    input: { lineagePlans: [], trustedResults: [], publicTraces: [], hiddenAggregate: { failures: 0 } },
+    input: { lineagePlans: [], trustedResults: [], publicTraces: [], hiddenAggregate: {
+      completedAttemptCount: 0, metricAvailableAttemptCount: 0, metricUnavailableAttemptCount: 0,
+      promotedAttemptCount: 0, failedAttemptCount: 0, tieAttemptCount: 0,
+      evaluatedHiddenCaseCount: 0, metricTotals: {},
+    } },
     createSession: () => session,
   };
 }
@@ -33,19 +37,22 @@ describe("自主进化闭环", () => {
     };
     const { lineage, commitCandidate } = fakeLineage();
     let publicCalls = 0;
+    const beginRepairAttempt = vi.fn();
     const hiddenEvaluate = vi.fn(async () => ({ promote: true, resultSummary: "隐藏评测胜出" }));
     const options = baseOptions(session, lineage);
     const result = await runEvolutionAttempt({
       ...options,
+      beginRepairAttempt,
       publicGate: async () => ({ passed: ++publicCalls >= 3, diagnostics: ["公开门禁失败"] }),
       hiddenEvaluate,
     });
     expect(result).toMatchObject({ status: "evaluated", repairs: 2, hiddenEvaluationCount: 1, promoted: true });
     expect(hiddenEvaluate).toHaveBeenCalledTimes(1);
+    expect(beginRepairAttempt.mock.calls).toEqual([[0], [1], [2]]);
     expect(requests).toHaveLength(3);
     expect(requests[0]).toMatchObject({
       allowedTools: ["read", "edit", "search", "shell", "test", "public-check", "submit"],
-      input: { role: "generator", hiddenAggregate: { failures: 0 } },
+      input: { role: "generator", hiddenAggregate: { completedAttemptCount: 0 } },
     });
     expect(JSON.stringify(requests)).not.toContain("network");
     expect(JSON.stringify(requests)).not.toContain("subagent");
@@ -139,7 +146,7 @@ describe("自主进化闭环", () => {
       expect(() => assertNoPrivateEvolutionData({ role: "solver", [field]: "secret" })).toThrow(/禁止字段/);
     }
     expect(() => assertNoPrivateEvolutionData({
-      role: "solver", publicTraces: [{ position: { x: 0, y: 0 }, openDirections: ["east"], remainingSteps: 10 }],
+      role: "solver", publicTraces: [{ events: [{ type: "solver.decision", direction: "east" }] }],
     })).not.toThrow();
   });
 
@@ -182,8 +189,9 @@ describe("自主进化闭环", () => {
     const session: EvolutionHarnessSession = {
       run: async (request) => {
         expect(request.input.role).toBe("solver");
-        expect(request.input.publicTraces[0]?.observations?.[0]).toEqual({
-          position: { x: 0, y: 0 }, openDirections: ["east"], remainingSteps: 10, moved: null,
+        expect(request.input.publicTraces[0]?.events[0]).toEqual({
+          type: "solver.decision", position: { x: 0, y: 0 }, openDirections: ["east"],
+          remainingSteps: 10, direction: "east", kind: "move",
         });
         return { hypothesis: "局部记忆优化", strategyPlan: "只依据局部观察", submitted: true };
       }, close: () => undefined,
@@ -195,8 +203,9 @@ describe("自主进化闭环", () => {
       input: {
         ...options.input,
         publicTraces: [{
-          caseId: "public-1", outcome: "success", actions: 12, illegalActions: 0,
-          observations: [{ position: { x: 0, y: 0 }, openDirections: ["east"], remainingSteps: 10, moved: null }],
+          attemptId: "attempt-0", generation: 1, traceId: "public-trace-1", outcome: "success",
+          metrics: { solved: 1, actions: 1, illegalActions: 0 },
+          events: [{ type: "solver.decision", position: { x: 0, y: 0 }, openDirections: ["east"], remainingSteps: 10, direction: "east", kind: "move" }],
         }],
       },
       createSession: (environment) => { environments.push(environment); return session; },

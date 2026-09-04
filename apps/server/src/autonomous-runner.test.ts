@@ -44,6 +44,7 @@ function result(role: EvolutionRole, champion: string, outcome: "promoted" | "fa
     publicProgress: 1,
     hiddenProgress: 1,
     aggregate: { primary: outcome === "promoted" ? 2 : 1 },
+    hiddenCandidateAggregate: { primary: outcome === "promoted" ? 2 : 1 },
   };
 }
 

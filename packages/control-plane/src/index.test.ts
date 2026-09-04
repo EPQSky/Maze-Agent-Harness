@@ -81,6 +81,7 @@ const roleResult = (role: "generator" | "solver", outcome: "promoted" | "failed"
   championAfter: outcome === "promoted" ? `${role}-candidate` : `${role}-champion`, outcome,
   promotionTag: outcome === "promoted" ? `promotion/exp/${role}/g0001` : null,
   publicProgress: 1, hiddenProgress: 1, aggregate: { primary: outcome === "promoted" ? 2 : 1 },
+  hiddenCandidateAggregate: { primary: outcome === "promoted" ? 2 : 1 },
 });
 
 describe("同步进化运行控制", () => {
@@ -169,9 +170,12 @@ describe("同步进化运行控制", () => {
     first.start("exp");
     const result = roleResult("generator", "tie");
     first.saveRoleCheckpoint({ experimentId: "exp", generation: 1, role: "generator", attemptId: "g1-generator", result, tokens: 123, cost: 0.25 });
+    first.saveRoleCheckpoint({ experimentId: "exp", generation: 2, role: "generator", attemptId: "g2-generator", result, tokens: 0, cost: 0 });
+    first.saveRoleCheckpoint({ experimentId: "exp", generation: 1, role: "solver", attemptId: "g1-solver", result: roleResult("solver", "failed"), tokens: 0, cost: 0 });
     first.close();
     const restarted = new ExperimentRuntimeRepository(databasePath);
     expect(restarted.getRoleCheckpoint("exp", 1, "generator")).toEqual({ attemptId: "g1-generator", result, tokens: 123, cost: 0.25 });
+    expect(restarted.listRoleCheckpoints("exp", "generator", 2)).toEqual([{ generation: 1, attemptId: "g1-generator", result }]);
     restarted.saveRoleCheckpoint({ experimentId: "exp", generation: 1, role: "generator", attemptId: "g1-generator", result, tokens: 123, cost: 0.25 });
     expect(restarted.get("exp")?.usage).toEqual({ tokens: 123, cost: 0.25 });
     restarted.close();

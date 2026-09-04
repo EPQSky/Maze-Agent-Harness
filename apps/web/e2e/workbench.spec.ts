@@ -14,8 +14,8 @@ const runtime = {
   evaluationSuiteId: "suite-1", sealGroupId: "group-1", sealed: true, evolutionPermitted: true,
   compatibilityFingerprint: "maze-arena-v1",
   generations: [{ generation: 1, status: "completed", stagnationCount: 0, exhibitionMatchId: "match-exhibition",
-    generator: { candidateCommit: "c".repeat(40), championBefore: "a".repeat(40), championAfter: "c".repeat(40), outcome: "promoted", promotionTag: "promotion/e2e/generator/g0001", publicProgress: 2, hiddenProgress: 1, aggregate: { primary: 2 } },
-    solver: { candidateCommit: "d".repeat(40), championBefore: "b".repeat(40), championAfter: "b".repeat(40), outcome: "tie", promotionTag: null, publicProgress: 2, hiddenProgress: 1, aggregate: { primary: 1 } } }],
+    generator: { candidateCommit: "c".repeat(40), championBefore: "a".repeat(40), championAfter: "c".repeat(40), outcome: "promoted", promotionTag: "promotion/e2e/generator/g0001", publicProgress: 2, hiddenProgress: 1, aggregate: { primary: 2 }, hiddenCandidateAggregate: { primary: 2 } },
+    solver: { candidateCommit: "d".repeat(40), championBefore: "b".repeat(40), championAfter: "b".repeat(40), outcome: "tie", promotionTag: null, publicProgress: 2, hiddenProgress: 1, aggregate: { primary: 1 }, hiddenCandidateAggregate: { primary: 1 } } }],
 };
 const match = { id: "match-exhibition", experimentId: experiment.id, seed: "public-e2e", protocolVersion: 1,
   status: "completed", committedEventCount: 3, totalEventCount: 3,

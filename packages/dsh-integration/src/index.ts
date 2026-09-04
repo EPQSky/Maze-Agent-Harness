@@ -36,6 +36,18 @@ export interface HarnessAdapter {
 export const HARNESS_EVOLUTION_PROTOCOL_VERSION = 1 as const;
 export const HARNESS_EVOLUTION_REQUEST_TYPE = "maze-arena.harness-evolution.request" as const;
 export const HARNESS_EVOLUTION_RESPONSE_TYPE = "maze-arena.harness-evolution.response" as const;
+/** 完整协议请求必须严格小于该字节数。 */
+export const HARNESS_EVOLUTION_MAX_REQUEST_BYTES = 1024 * 1024;
+/** 为会话、模型配置和诊断信息保留固定余量，可信反馈最多占用请求预算的一半。 */
+export const HARNESS_EVOLUTION_MAX_FEEDBACK_BYTES = 512 * 1024;
+/** 进化反馈仅保留最近的可信尝试，避免长实验令协议请求无界增长。 */
+export const HARNESS_EVOLUTION_MAX_TRUSTED_RESULTS = 64;
+export const HARNESS_EVOLUTION_MAX_LINEAGE_PLANS = 16;
+export const HARNESS_EVOLUTION_MAX_PUBLIC_TRACES = 16;
+export const HARNESS_EVOLUTION_MAX_AGGREGATE_METRICS = 64;
+export const HARNESS_EVOLUTION_MAX_TRACE_METRICS = 64;
+export const HARNESS_EVOLUTION_MAX_TRACE_EVENTS = 128;
+export const HARNESS_EVOLUTION_MAX_STRATEGY_PLAN_BYTES = 8 * 1024;
 export const HARNESS_EVOLUTION_ALLOWED_TOOLS = Object.freeze([
   "read", "edit", "search", "shell", "test", "public-check", "submit",
 ] as const);
@@ -435,21 +447,45 @@ export type HarnessExecutionKind = "fake" | "deterministic-fixture" | "real-prov
 export interface HarnessEvolutionTrustedInput {
   role: "generator" | "solver";
   championRoot: string;
-  lineagePlans: readonly { attemptId: string; hypothesis: string }[];
-  trustedResults: readonly { generation: number; promoted: boolean; primaryMetric: number }[];
-  publicTraces: readonly {
-    caseId: string;
-    outcome: "success" | "failure";
-    actions: number;
-    illegalActions: number;
-    observations?: readonly {
-      position: { x: number; y: number };
-      openDirections: readonly string[];
-      remainingSteps: number;
-      moved: boolean | null;
-    }[];
+  lineagePlans: readonly { attemptId: string; strategyPlan: string }[];
+  trustedResults: readonly {
+    attemptId: string;
+    generation: number;
+    role: "generator" | "solver";
+    outcome: "promoted" | "failed" | "tie";
+    publicCaseCount: number;
+    hiddenCaseCount: number;
+    totalCandidateAggregate: Readonly<Record<string, number>>;
+    /** 旧协议输入可缺省；存在时仅包含去身份化的隐藏指标汇总。 */
+    hiddenCandidateAggregate?: Readonly<Record<string, number>>;
   }[];
-  hiddenAggregate: Readonly<Record<string, number>>;
+  publicTraces: readonly {
+    attemptId: string;
+    generation: number;
+    traceId: string;
+    outcome: "success" | "failure" | "tie";
+    metrics: Readonly<Record<string, number>>;
+    events: readonly (
+      | { type: "maze.carved"; from: { x: number; y: number }; to: { x: number; y: number } }
+      | { type: "maze.completed"; passageCount: number }
+      | { type: "solver.decision"; position: { x: number; y: number }; openDirections: readonly ("north" | "east" | "south" | "west")[]; remainingSteps: number; direction: "north" | "east" | "south" | "west"; kind: "move" | "backtrack" }
+    )[];
+  }[];
+  hiddenAggregate: {
+    completedAttemptCount: number;
+    metricAvailableAttemptCount: number;
+    metricUnavailableAttemptCount: number;
+    promotedAttemptCount: number;
+    failedAttemptCount: number;
+    tieAttemptCount: number;
+    evaluatedHiddenCaseCount: number;
+    metricTotals: Readonly<Record<string, number>>;
+  };
+}
+
+/** 以生产协议实际发送的完整可信输入对象计算 UTF-8 JSON 字节数。 */
+export function harnessEvolutionTrustedInputBytes(input: HarnessEvolutionTrustedInput): number {
+  return Buffer.byteLength(JSON.stringify(input), "utf8");
 }
 
 export interface HarnessEvolutionRequest {

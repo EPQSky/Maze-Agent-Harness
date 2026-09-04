@@ -1,4 +1,4 @@
-import { cpSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -88,6 +88,22 @@ describe("插件 Git 谱系与晋级标签", () => {
 
     expect(repeated).toEqual(first);
     expect(repository.listHistory("exp-retry", "generator")).toHaveLength(2);
+  });
+
+  it("只从己方候选提交读取按 attemptId 命名的策略记录", async () => {
+    const { root, repository } = setup();
+    await repository.initialize("exp-strategy", "generator", fixture);
+    const source = candidate(root, "strategy");
+    mkdirSync(join(source, "lineage"));
+    writeFileSync(join(source, "lineage/g0001-generator.md"), "先降低无效回溯，再比较公开指标。", "utf8");
+    await repository.commitCandidate({
+      experimentId: "exp-strategy", role: "generator", sourceRoot: source, attemptId: "g0001-generator",
+      hypothesis: "记录策略", resultSummary: "平局", outcome: "tie",
+    });
+
+    expect(repository.listStrategyRecords("exp-strategy", "generator")).toEqual([{
+      attemptId: "g0001-generator", strategyPlan: "先降低无效回溯，再比较公开指标。",
+    }]);
   });
 
   it("幂等恢复晋级候选时仍要求有效代次", async () => {

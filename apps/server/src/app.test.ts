@@ -11,20 +11,30 @@ import type {
   DomainErrorResponse,
   Experiment,
   ExperimentListResponse,
+  EvolutionRole,
+  GenerationRoleResult,
 } from "@maze-arena/contracts";
 import {
   DeterministicFakeHarnessAdapter,
   HARNESS_EVOLUTION_ALLOWED_TOOLS,
+  HARNESS_EVOLUTION_MAX_AGGREGATE_METRICS,
+  HARNESS_EVOLUTION_MAX_FEEDBACK_BYTES,
+  HARNESS_EVOLUTION_MAX_REQUEST_BYTES,
+  HARNESS_EVOLUTION_MAX_STRATEGY_PLAN_BYTES,
+  HARNESS_EVOLUTION_MAX_TRACE_EVENTS,
+  harnessEvolutionTrustedInputBytes,
   hashHarnessRuntimePayload,
   ModelProfileValidationError,
   type HarnessEvolutionRequest,
 } from "@maze-arena/dsh-integration";
+import { ExperimentRuntimeRepository } from "@maze-arena/control-plane";
 import { afterEach, describe, expect, it } from "vitest";
 import { createArenaServer, installPersistentShutdownHandlers } from "./app.js";
 import { createProductionHarnessAdapter } from "./production-harness.js";
 import { HarnessInvocationError } from "./harness-invocation-error.js";
 import { runBaselineMatch } from "@maze-arena/engine";
 import type { AutonomousEvolutionAdapter } from "./autonomous-runner.js";
+import { assembleTrustedEvolutionFeedback } from "./trusted-evolution-feedback.js";
 
 const servers: ReturnType<typeof createArenaServer>[] = [];
 const deterministicMatchRunner = { run: async (seed: string) => runBaselineMatch(seed) };
@@ -66,7 +76,11 @@ function productionEvolutionRequest(
       lineagePlans: [],
       trustedResults: [],
       publicTraces: [],
-      hiddenAggregate: {},
+      hiddenAggregate: {
+        completedAttemptCount: 0, metricAvailableAttemptCount: 0, metricUnavailableAttemptCount: 0,
+        promotedAttemptCount: 0, failedAttemptCount: 0, tieAttemptCount: 0,
+        evaluatedHiddenCaseCount: 0, metricTotals: {},
+      },
     },
     allowedTools: HARNESS_EVOLUTION_ALLOWED_TOOLS,
   };
@@ -253,6 +267,7 @@ describe("实验工作台 API", () => {
     const delegate = new DeterministicFakeHarnessAdapter();
     const packagesRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../../packages");
     const providerCalls = { generator: 0, solver: 0 };
+    const secondGenerationInput = new Map<EvolutionRole, HarnessEvolutionRequest["input"]>();
     const server = createArenaServer({
       databasePath,
       matchRunner: deterministicMatchRunner,
@@ -262,16 +277,21 @@ describe("实验工作台 API", () => {
         smokeModel: (profile) => delegate.smokeModel(profile),
         evolvePlugin: async (request) => {
           if (request.generation > 1) {
-            await new Promise((_resolve, reject) => {
-              if (request.signal?.aborted) { reject(new Error("自治任务已取消")); return; }
-              request.signal?.addEventListener("abort", () => reject(new Error("自治任务已取消")), { once: true });
-            });
+            secondGenerationInput.set(request.role, structuredClone(request.input));
+            if (request.role === "solver") {
+              await new Promise((_resolve, reject) => {
+                if (request.signal?.aborted) { reject(new Error("自治任务已取消")); return; }
+                request.signal?.addEventListener("abort", () => reject(new Error("自治任务已取消")), { once: true });
+              });
+            }
           }
           providerCalls[request.role] += 1;
           if (providerCalls[request.role] > 1) {
             cpSync(join(packagesRoot, `${request.role}-plugin/dist`), join(request.workspace, "dist"), { recursive: true });
           }
-          return delegate.evolvePlugin(request);
+          const response = await delegate.evolvePlugin(request);
+          return { ...response, strategyPlan: `允许的己方策略-${request.role}`, reasoning: "forbidden-reasoning-secret",
+            toolActivity: "forbidden-tool-activity-secret" };
         },
       },
     });
@@ -286,26 +306,113 @@ describe("实验工作台 API", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
       snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json();
     }
+    for (let attempt = 0; attempt < 400 && secondGenerationInput.size < 2 && snapshot.state !== "failed"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json();
+    }
+    expect(secondGenerationInput.size).toBe(2);
     await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/pause` });
     snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json();
-    expect(snapshot).toMatchObject({ state: "paused", generation: 1, usage: { tokens: 400, cost: 0 } });
-    expect(providerCalls).toEqual({ generator: 2, solver: 2 });
+    expect(snapshot).toMatchObject({ state: "paused", generation: 1, usage: { tokens: 500, cost: 0 } });
+    expect(providerCalls).toEqual({ generator: 3, solver: 2 });
     expect(snapshot.generations[0]).toMatchObject({
       generator: { outcome: "tie", publicProgress: 8, hiddenProgress: 24 },
       solver: { outcome: "tie", publicProgress: 8, hiddenProgress: 24 },
     });
+    for (const role of ["generator", "solver"] as const) {
+      const feedback = secondGenerationInput.get(role);
+      expect(feedback).toBeDefined();
+      expect(feedback?.lineagePlans).toEqual([{ attemptId: `g0001-${role}`, strategyPlan: `允许的己方策略-${role}` }]);
+      expect(feedback?.trustedResults).toEqual([expect.objectContaining({
+        attemptId: `g0001-${role}`, generation: 1, role, outcome: "tie", publicCaseCount: 8, hiddenCaseCount: 24,
+        totalCandidateAggregate: expect.any(Object),
+      })]);
+      expect(feedback?.publicTraces).toHaveLength(8);
+      expect(feedback?.publicTraces.every((trace) => trace.attemptId === `g0001-${role}`
+        && trace.generation === 1 && trace.events.length > 0)).toBe(true);
+      expect(feedback?.hiddenAggregate).toMatchObject({
+        completedAttemptCount: 1, promotedAttemptCount: 0, failedAttemptCount: 0, tieAttemptCount: 1,
+        evaluatedHiddenCaseCount: 24,
+      });
+      const serialized = JSON.stringify(feedback);
+      const opponentRole = role === "generator" ? "solver" : "generator";
+      for (const forbidden of [
+        "hidden-", "sealed:", "forbidden-reasoning-secret", "forbidden-tool-activity-secret",
+        `允许的己方策略-${opponentRole}`, `g0001-${opponentRole}`,
+        "opponent", "opponentSource", "opponentStderr", "prompt", "reasoning", "toolActivity", "comments",
+      ]) expect(serialized).not.toContain(forbidden);
+    }
     const audit = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/audit-events` }))
       .json<import("@maze-arena/contracts").ExperimentAuditEventPage>();
     const allHarnessEvents = audit.events.filter(({ type }) => type === "harness.activity");
     const harnessEvents = allHarnessEvents.filter(({ details }) => details.outcome === "succeeded");
-    expect(harnessEvents).toHaveLength(4);
+    expect(harnessEvents).toHaveLength(5);
     expect(harnessEvents.every(({ details }) => details.executionKind === "fake" && details.protocolVersion === 1)).toBe(true);
-    expect(new Set(harnessEvents.map(({ details }) => details.sessionId)).size).toBe(2);
-    for (const role of ["generator", "solver"] as const) {
-      expect(new Set(harnessEvents.filter(({ details }) => details.role === role).map(({ details }) => details.sessionId)).size).toBe(1);
-    }
+    expect(new Set(harnessEvents.map(({ details }) => details.sessionId)).size).toBe(3);
+    expect(new Set(harnessEvents.filter(({ details }) => details.role === "generator").map(({ details }) => details.sessionId)).size).toBe(2);
+    expect(new Set(harnessEvents.filter(({ details }) => details.role === "solver").map(({ details }) => details.sessionId)).size).toBe(1);
     expect(allHarnessEvents.some(({ details }) => details.outcome === "failed" && details.failureKind === "unknown")).toBe(true);
   }, 20_000);
+
+  it("恢复 Ticket 05 旧检查点时向第二代 Harness 传递公开事实并标记隐藏指标不可用", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-legacy-feedback-"));
+    const databasePath = join(directory, "arena.sqlite");
+    const first = createArenaServer({ databasePath, harnessAdapter: new DeterministicFakeHarnessAdapter(), matchRunner: deterministicMatchRunner });
+    servers.push(first);
+    const experiment = await createExperiment(first, "旧检查点恢复实验");
+    await validateAndConfirm(first, experiment.id);
+    await first.close();
+    servers.splice(servers.indexOf(first), 1);
+
+    const runtime = new ExperimentRuntimeRepository(databasePath);
+    const ready = runtime.get(experiment.id)!;
+    runtime.start(experiment.id);
+    const legacyResult = (role: EvolutionRole): import("@maze-arena/contracts").GenerationRoleResult => ({
+      candidateCommit: ready.champions[role], championBefore: ready.champions[role], championAfter: ready.champions[role],
+      outcome: "tie", promotionTag: null, publicProgress: 8, hiddenProgress: 24, aggregate: { legacyTotal: 32 },
+    });
+    const generator = legacyResult("generator");
+    const solver = legacyResult("solver");
+    runtime.saveRoleCheckpoint({ experimentId: experiment.id, generation: 1, role: "generator",
+      attemptId: "g0001-generator", result: generator, tokens: 100, cost: 0 });
+    runtime.saveRoleCheckpoint({ experimentId: experiment.id, generation: 1, role: "solver",
+      attemptId: "g0001-solver", result: solver, tokens: 100, cost: 0 });
+    runtime.requestPause(experiment.id);
+    runtime.commitGeneration({ experimentId: experiment.id, generator, solver, checkpointKey: "generation-1" });
+    runtime.close();
+
+    const observed = new Map<EvolutionRole, HarnessEvolutionRequest["input"]>();
+    const delegate = new DeterministicFakeHarnessAdapter();
+    const restarted = createArenaServer({
+      databasePath, matchRunner: deterministicMatchRunner,
+      harnessAdapter: {
+        listModels: () => delegate.listModels(),
+        validateModelProfile: (input) => delegate.validateModelProfile(input),
+        smokeModel: (profile) => delegate.smokeModel(profile),
+        evolvePlugin: (request) => new Promise((_resolve, reject) => {
+          observed.set(request.role, structuredClone(request.input));
+          if (request.signal?.aborted) { reject(new Error("自治任务已取消")); return; }
+          request.signal?.addEventListener("abort", () => reject(new Error("自治任务已取消")), { once: true });
+        }),
+      },
+    });
+    servers.push(restarted);
+    expect((await restarted.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/resume` })).statusCode).toBe(200);
+    for (let attempt = 0; attempt < 200 && !observed.has("generator"); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(observed.get("generator")).toMatchObject({
+      trustedResults: [{ attemptId: "g0001-generator", outcome: "tie", totalCandidateAggregate: { legacyTotal: 32 } }],
+      publicTraces: [],
+      hiddenAggregate: {
+        completedAttemptCount: 1, metricAvailableAttemptCount: 0, metricUnavailableAttemptCount: 1,
+        evaluatedHiddenCaseCount: 24, metricTotals: {},
+      },
+    });
+    expect((await restarted.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json())
+      .toMatchObject({ state: "running", generation: 1, compatibilityFingerprint: "maze-arena-v1" });
+    await restarted.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/pause` });
+  }, 15_000);
 
   it.each([
     ["protocol", 2, 107, 0.27],
@@ -1139,6 +1246,233 @@ process.stdin.on("end", () => process.stdout.write(JSON.stringify({ providerText
       execution: { kind: "deterministic-fixture", protocolVersion: 1, harnessVersion: "2026.09.2" },
     });
     expect(response.execution.sessionId).toMatch(/^[0-9a-f-]{36}$/);
+
+    const forbidden = productionEvolutionRequest({
+      experimentId: "exp", generation: 2, role: "generator", attemptId: "deterministic-2",
+      modelProfile, workspace, repairAttempt: 0, diagnostics: [],
+    });
+    forbidden.input = { ...forbidden.input, opponentSource: "forbidden-opponent-source" } as never;
+    await expect(adapter.evolvePlugin!(forbidden)).rejects.toThrow(/反馈协议字段非法/);
+  });
+
+  it.each(["generator", "solver"] as const)("生产 Harness 严格校验 %s 反馈身份与隐藏聚合不变量", async (role) => {
+    const directory = mkdtempSync(join(tmpdir(), `maze-feedback-protocol-${role}-`));
+    const exportPath = join(directory, "models.json");
+    const workspace = join(directory, `workspace-${role}-临界`);
+    mkdirSync(join(workspace, "src"), { recursive: true });
+    writeFileSync(join(workspace, "package.json"), JSON.stringify({ name: "fixture-plugin", version: "1.0.0" }));
+    writeFileSync(join(workspace, "src/index.ts"), "export const baseline = true;\n");
+    writeFileSync(exportPath, JSON.stringify({
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
+        reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
+      } }] }],
+    }));
+    const adapter = createProductionHarnessAdapter({
+      ARENA_MODEL_CATALOG_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
+      DSH_EVOLUTION_COMMAND: resolve(dirname(fileURLToPath(import.meta.url)), "../test/fixtures/deterministic-evolution-harness.mjs"),
+      DSH_SMOKE_COMMAND: "/bin/false", DSH_EVOLUTION_EXECUTION_KIND: "deterministic-fixture",
+    });
+    const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model",
+      credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+    const attemptId = `g0001-${role}`;
+    const hiddenMetrics: Record<string, number> = role === "generator"
+      ? { gateFailures: 0, failedCases: 1, extraActions: 2, structuralNovelty: 3 }
+      : { solvedCases: 1, extraActions: 2, illegalActions: 0 };
+    const validInput: HarnessEvolutionRequest["input"] = {
+      role, championRoot: workspace,
+      lineagePlans: [{ attemptId, strategyPlan: `己方策略-${role}` }],
+      trustedResults: [{ attemptId, generation: 1, role, outcome: "tie", publicCaseCount: 8, hiddenCaseCount: 24,
+        totalCandidateAggregate: { primary: 1 }, hiddenCandidateAggregate: hiddenMetrics }],
+      publicTraces: [{ attemptId, generation: 1, traceId: "public-01", outcome: "success", metrics: { primary: 1 },
+        events: [{ type: "maze.completed", passageCount: 960 }] }],
+      hiddenAggregate: { completedAttemptCount: 1, metricAvailableAttemptCount: 1, metricUnavailableAttemptCount: 0,
+        promotedAttemptCount: 0, failedAttemptCount: 0, tieAttemptCount: 1,
+        evaluatedHiddenCaseCount: 24, metricTotals: hiddenMetrics },
+    };
+    const request = (input: unknown, generation = 3) => {
+      const value = productionEvolutionRequest({ experimentId: "exp", generation, role,
+        attemptId: `protocol-${role}`, modelProfile, workspace, repairAttempt: 0, diagnostics: [] });
+      value.input = input as HarnessEvolutionRequest["input"];
+      return value;
+    };
+    const otherRole = role === "generator" ? "solver" : "generator";
+    const foreignHiddenMetric = role === "generator" ? { solvedCases: 1 } : { failedCases: 1 };
+    await expect(adapter.evolvePlugin!(request({
+      ...validInput,
+      lineagePlans: [{ attemptId, strategyPlan: `${"策".repeat(2_730)}ab` }],
+    }))).resolves.toMatchObject({ submitted: true });
+    const invalidInputs: unknown[] = [
+      { ...validInput, trustedResults: [{ ...validInput.trustedResults[0], unknownNested: { opponentText: "禁止的对手文本" } }] },
+      { ...validInput, publicTraces: [{ ...validInput.publicTraces[0], events: [{ ...validInput.publicTraces[0]!.events[0], opponentComments: "禁止的对手注释" }] }] },
+      { ...validInput, trustedResults: [{ ...validInput.trustedResults[0], attemptId: `g0001-${otherRole}` }] },
+      { ...validInput, trustedResults: [{ ...validInput.trustedResults[0], role: otherRole }] },
+      { ...validInput, trustedResults: [{ ...validInput.trustedResults[0], generation: 3, attemptId: `g0003-${role}` }] },
+      { ...validInput, publicTraces: [{ ...validInput.publicTraces[0], attemptId: `g0001-${otherRole}` }] },
+      { ...validInput, hiddenAggregate: { ...validInput.hiddenAggregate,
+        metricAvailableAttemptCount: 0, metricUnavailableAttemptCount: 1, metricTotals: { forgedHiddenTotal: 1 } } },
+      { ...validInput, hiddenAggregate: { ...validInput.hiddenAggregate,
+        promotedAttemptCount: 1, failedAttemptCount: 0, tieAttemptCount: 1 } },
+      { ...validInput, hiddenAggregate: { ...validInput.hiddenAggregate, completedAttemptCount: 0,
+        metricAvailableAttemptCount: 0, promotedAttemptCount: 0, tieAttemptCount: 0,
+        evaluatedHiddenCaseCount: 0, metricTotals: {} } },
+      { ...validInput, hiddenAggregate: { ...validInput.hiddenAggregate, evaluatedHiddenCaseCount: 23 } },
+      { ...validInput, hiddenAggregate: { ...validInput.hiddenAggregate, metricTotals: { ...hiddenMetrics, extraActions: 3 } } },
+      { ...validInput, trustedResults: [{ ...validInput.trustedResults[0], hiddenCandidateAggregate: { caseId: 12345 } }] },
+      { ...validInput, trustedResults: [{ ...validInput.trustedResults[0], hiddenCandidateAggregate: foreignHiddenMetric }] },
+      { ...validInput, trustedResults: [{ ...validInput.trustedResults[0], hiddenCandidateAggregate: { extraActions: 0.1 } }] },
+      { ...validInput, trustedResults: [{ ...validInput.trustedResults[0], hiddenCaseCount: 0 }],
+        hiddenAggregate: { completedAttemptCount: 0, metricAvailableAttemptCount: 0, metricUnavailableAttemptCount: 0,
+          promotedAttemptCount: 0, failedAttemptCount: 0, tieAttemptCount: 0, evaluatedHiddenCaseCount: 0, metricTotals: {} } },
+      { ...validInput, publicTraces: [validInput.publicTraces[0], { ...validInput.publicTraces[0] }] },
+      { ...validInput, trustedResults: [validInput.trustedResults[0], { ...validInput.trustedResults[0] }] },
+      { ...validInput, lineagePlans: [{ attemptId, strategyPlan: "策".repeat(HARNESS_EVOLUTION_MAX_STRATEGY_PLAN_BYTES / 3 + 1) }] },
+      { ...validInput, trustedResults: [{ ...validInput.trustedResults[0], totalCandidateAggregate: Object.fromEntries(
+        Array.from({ length: HARNESS_EVOLUTION_MAX_AGGREGATE_METRICS + 1 }, (_, index) => [`metric${index}`, index]),
+      ) }] },
+      { ...validInput, publicTraces: [{ ...validInput.publicTraces[0], events: Array.from(
+        { length: HARNESS_EVOLUTION_MAX_TRACE_EVENTS + 1 }, () => ({ type: "maze.completed", passageCount: 960 }),
+      ) }] },
+      { ...validInput, trustedResults: [], lineagePlans: [], publicTraces: [] },
+      { ...validInput, role: otherRole },
+    ];
+
+    for (const input of invalidInputs) {
+      await expect(adapter.evolvePlugin!(request(input))).rejects.toThrow(/反馈协议字段非法|输入角色或冠军工作区/);
+    }
+
+    await expect(adapter.evolvePlugin!(request({
+      ...validInput,
+      trustedResults: validInput.trustedResults.map(({ hiddenCandidateAggregate: _hidden, ...legacy }) => legacy),
+      hiddenAggregate: { ...validInput.hiddenAggregate,
+        metricAvailableAttemptCount: 0, metricUnavailableAttemptCount: 1, metricTotals: {} },
+    }))).resolves.toMatchObject({ submitted: true });
+    await expect(adapter.evolvePlugin!(request({
+      ...validInput, trustedResults: [], lineagePlans: [], publicTraces: [],
+      hiddenAggregate: { completedAttemptCount: 0, metricAvailableAttemptCount: 0, metricUnavailableAttemptCount: 0,
+        promotedAttemptCount: 0, failedAttemptCount: 0, tieAttemptCount: 0,
+        evaluatedHiddenCaseCount: 0, metricTotals: {} },
+    }))).resolves.toMatchObject({ submitted: true });
+    const mixedResults = [
+      validInput.trustedResults[0],
+      { attemptId: `g0002-${role}`, generation: 2, role, outcome: "failed" as const,
+        publicCaseCount: 8, hiddenCaseCount: 4, totalCandidateAggregate: { primary: 0 } },
+    ];
+    await expect(adapter.evolvePlugin!(request({
+      ...validInput, trustedResults: mixedResults,
+      hiddenAggregate: { completedAttemptCount: 2, metricAvailableAttemptCount: 1, metricUnavailableAttemptCount: 1,
+        promotedAttemptCount: 0, failedAttemptCount: 1, tieAttemptCount: 1,
+        evaluatedHiddenCaseCount: 28, metricTotals: hiddenMetrics },
+    }))).resolves.toMatchObject({ submitted: true });
+    await expect(adapter.evolvePlugin!(request({
+      ...validInput, trustedResults: mixedResults,
+      hiddenAggregate: { completedAttemptCount: 2, metricAvailableAttemptCount: 1, metricUnavailableAttemptCount: 1,
+        promotedAttemptCount: 0, failedAttemptCount: 0, tieAttemptCount: 2,
+        evaluatedHiddenCaseCount: 28, metricTotals: hiddenMetrics },
+    }))).rejects.toThrow(/反馈协议字段非法/);
+    await expect(adapter.evolvePlugin!(request({
+      ...validInput, trustedResults: [...mixedResults].reverse(),
+      hiddenAggregate: { completedAttemptCount: 2, metricAvailableAttemptCount: 1, metricUnavailableAttemptCount: 1,
+        promotedAttemptCount: 0, failedAttemptCount: 1, tieAttemptCount: 1,
+        evaluatedHiddenCaseCount: 28, metricTotals: hiddenMetrics },
+    }))).rejects.toThrow(/反馈协议字段非法/);
+    await expect(adapter.evolvePlugin!(request({
+      ...validInput,
+      trustedResults: [
+        { ...validInput.trustedResults[0], hiddenCaseCount: Number.MAX_SAFE_INTEGER },
+        { ...mixedResults[1], hiddenCaseCount: 1 },
+      ],
+    }))).rejects.toThrow(/反馈协议字段非法/);
+    const nonAssociativeValues = [10 ** 16, 1, -(10 ** 16)];
+    const nonAssociativeResults = nonAssociativeValues.map((value, index) => ({
+      attemptId: `g${String(index + 1).padStart(4, "0")}-${role}`,
+      generation: index + 1, role, outcome: "tie" as const, publicCaseCount: 8, hiddenCaseCount: 1,
+      totalCandidateAggregate: {}, hiddenCandidateAggregate: { extraActions: value },
+    }));
+    const nonAssociativeAggregate = {
+      completedAttemptCount: 3, metricAvailableAttemptCount: 3, metricUnavailableAttemptCount: 0,
+      promotedAttemptCount: 0, failedAttemptCount: 0, tieAttemptCount: 3,
+      evaluatedHiddenCaseCount: 3, metricTotals: { extraActions: 0 },
+    };
+    await expect(adapter.evolvePlugin!(request({ ...validInput, lineagePlans: [], publicTraces: [],
+      trustedResults: nonAssociativeResults, hiddenAggregate: nonAssociativeAggregate }, 4)))
+      .rejects.toThrow(/反馈协议字段非法/);
+    await expect(adapter.evolvePlugin!(request({ ...validInput, lineagePlans: [], publicTraces: [],
+      trustedResults: [...nonAssociativeResults].reverse(), hiddenAggregate: nonAssociativeAggregate }, 4)))
+      .rejects.toThrow(/反馈协议字段非法/);
+    const overWindowResults = Array.from({ length: 65 }, (_, index) => ({
+      attemptId: `g${String(index + 1).padStart(4, "0")}-${role}`,
+      generation: index + 1, role, outcome: "failed" as const,
+      publicCaseCount: 0, hiddenCaseCount: 0, totalCandidateAggregate: {},
+    }));
+    const emptyHiddenAggregate = {
+      completedAttemptCount: 0, metricAvailableAttemptCount: 0, metricUnavailableAttemptCount: 0,
+      promotedAttemptCount: 0, failedAttemptCount: 0, tieAttemptCount: 0,
+      evaluatedHiddenCaseCount: 0, metricTotals: {},
+    };
+    await expect(adapter.evolvePlugin!(request({
+      ...validInput, lineagePlans: [], publicTraces: [], trustedResults: overWindowResults.slice(0, 64),
+      hiddenAggregate: emptyHiddenAggregate,
+    }, 66))).resolves.toMatchObject({ submitted: true });
+    await expect(adapter.evolvePlugin!(request({
+      ...validInput, lineagePlans: [], publicTraces: [], trustedResults: overWindowResults,
+      hiddenAggregate: emptyHiddenAggregate,
+    }, 66))).rejects.toThrow(/反馈协议字段非法/);
+
+    const boundaryMetrics = Object.fromEntries(Array.from(
+      { length: HARNESS_EVOLUTION_MAX_AGGREGATE_METRICS },
+      (_, index) => [`m${String(index).padStart(2, "0")}${"x".repeat(51)}`, Number.MAX_VALUE],
+    ));
+    const boundaryCheckpoints = Array.from({ length: 64 }, (_, index) => {
+      const generation = index + 1;
+      const checkpointAttemptId = `g${String(generation).padStart(4, "0")}-${role}`;
+      const result: GenerationRoleResult = {
+        candidateCommit: `${checkpointAttemptId}-candidate`, championBefore: "g0", championAfter: "g0",
+        outcome: "tie", promotionTag: null, publicProgress: 8, hiddenProgress: 0, aggregate: boundaryMetrics,
+        trustedPublicTraces: [{
+          attemptId: checkpointAttemptId, generation, traceId: `public-${generation}`, outcome: "tie",
+          metrics: boundaryMetrics,
+          events: Array.from({ length: HARNESS_EVOLUTION_MAX_TRACE_EVENTS },
+            () => ({ type: "maze.completed" as const, passageCount: 960 })),
+        }],
+      };
+      return { generation, attemptId: checkpointAttemptId, result };
+    });
+    const strategyRecords = boundaryCheckpoints.slice(-16).map(({ attemptId: checkpointAttemptId }) => ({
+      attemptId: checkpointAttemptId, strategyPlan: "",
+    }));
+    const assembleBoundary = () => assembleTrustedEvolutionFeedback({
+      experimentId: "exp", generation: 65, role, championRoot: workspace, frozenChampion: "g0",
+      runtime: {
+        get: () => ({ champions: { generator: "g0", solver: "g0" } }) as never,
+        listRoleCheckpoints: () => boundaryCheckpoints,
+      },
+      lineage: { listStrategyRecords: () => strategyRecords },
+    });
+    const emptyBoundary = assembleBoundary();
+    let remainingBytes = HARNESS_EVOLUTION_MAX_FEEDBACK_BYTES
+      - harnessEvolutionTrustedInputBytes({ role, championRoot: workspace, ...emptyBoundary });
+    expect(remainingBytes).toBeGreaterThan(0);
+    for (const record of strategyRecords) {
+      const bytes = Math.min(remainingBytes, HARNESS_EVOLUTION_MAX_STRATEGY_PLAN_BYTES);
+      record.strategyPlan = "x".repeat(bytes);
+      remainingBytes -= bytes;
+    }
+    expect(remainingBytes).toBe(0);
+    const exactBoundary = assembleBoundary();
+    const exactBoundaryInput = { role, championRoot: workspace, ...exactBoundary };
+    expect(harnessEvolutionTrustedInputBytes(exactBoundaryInput)).toBe(HARNESS_EVOLUTION_MAX_FEEDBACK_BYTES);
+    await expect(adapter.evolvePlugin!(request(exactBoundaryInput, 65))).resolves.toMatchObject({ submitted: true });
+
+    strategyRecords.at(-1)!.strategyPlan += "x";
+    expect(assembleBoundary).toThrow(/反馈超过协议字节预算/);
+    const overBoundaryInput = structuredClone(exactBoundaryInput);
+    overBoundaryInput.lineagePlans.at(-1)!.strategyPlan += "x";
+    await expect(adapter.evolvePlugin!(request(overBoundaryInput, 65))).rejects.toThrow(/反馈协议字段非法/);
+
+    const oversizedRequest = request(validInput);
+    oversizedRequest.diagnostics = ["x".repeat(HARNESS_EVOLUTION_MAX_REQUEST_BYTES)];
+    await expect(adapter.evolvePlugin!(oversizedRequest)).rejects.toThrow(/请求超过 1 MiB 限制/);
   });
 
   it("生产 Harness 隐藏宿主运行时 socket 且仍允许 Session 目录读写", async () => {

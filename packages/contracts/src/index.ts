@@ -60,9 +60,23 @@ export interface GenerationRoleResult {
   publicProgress: number;
   hiddenProgress: number;
   aggregate: Record<string, number>;
+  /** 早期已持久化检查点没有该字段；缺失表示隐藏指标不可用。 */
+  hiddenCandidateAggregate?: Record<string, number>;
   hypothesis?: string;
   diffSummary?: string;
   gateDiagnostics?: string[];
+  trustedPublicTraces?: Array<{
+    attemptId: string;
+    generation: number;
+    traceId: string;
+    outcome: "success" | "failure" | "tie";
+    metrics: Record<string, number>;
+    events: Array<
+      | { type: "maze.carved"; from: Coordinate; to: Coordinate }
+      | { type: "maze.completed"; passageCount: number }
+      | { type: "solver.decision"; position: Coordinate; openDirections: MazeDirection[]; remainingSteps: number; direction: MazeDirection; kind: "move" | "backtrack" }
+    >;
+  }>;
 }
 
 export interface GenerationRecord {

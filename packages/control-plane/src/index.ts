@@ -373,6 +373,21 @@ export class ExperimentRuntimeRepository {
     return row ? { attemptId: row.attempt_id, result: JSON.parse(row.result_json) as GenerationRoleResult, tokens: row.tokens, cost: row.cost } : undefined;
   }
 
+  listRoleCheckpoints(experimentId: string, role: EvolutionRole, beforeGeneration: number): Array<{
+    generation: number; attemptId: string; result: GenerationRoleResult;
+  }> {
+    if (!Number.isSafeInteger(beforeGeneration) || beforeGeneration < 1) throw new Error("反馈代次边界非法");
+    const rows = this.database.prepare(`SELECT generation, attempt_id, result_json
+      FROM generation_role_checkpoints
+      WHERE experiment_id = ? AND role = ? AND generation < ? ORDER BY generation`)
+      .all(experimentId, role, beforeGeneration) as Array<{ generation: number; attempt_id: string; result_json: string }>;
+    return rows.map((row) => ({
+      generation: row.generation,
+      attemptId: row.attempt_id,
+      result: JSON.parse(row.result_json) as GenerationRoleResult,
+    }));
+  }
+
   running(): ExperimentRuntimeSnapshot[] {
     const rows = this.database.prepare("SELECT experiment_id FROM experiment_runtime WHERE state = 'running'").all() as Array<{ experiment_id: string }>;
     return rows.map(({ experiment_id }) => this.get(experiment_id)!).filter(Boolean);

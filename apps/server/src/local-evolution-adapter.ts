@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import type { Experiment, GeneratorCapability, MazeDirection, SolverCapability } from "@maze-arena/contracts";
+import type { Experiment, GenerationRoleResult, GeneratorCapability, MazeDirection, SolverCapability } from "@maze-arena/contracts";
 import { HARNESS_EVOLUTION_PROTOCOL_VERSION, type HarnessAdapter, type HarnessEvolutionResponse } from "@maze-arena/dsh-integration";
 import { runEvolutionAttempt } from "@maze-arena/evolution";
 import {
@@ -23,6 +23,10 @@ import type { AuditRepository } from "./audit-repository.js";
 import type { AutonomousEvolutionAdapter } from "./autonomous-runner.js";
 import type { ExperimentRepository } from "./experiment-repository.js";
 import { HarnessInvocationError } from "./harness-invocation-error.js";
+import { assembleTrustedEvolutionFeedback } from "./trusted-evolution-feedback.js";
+import { CandidateEvaluationFacts } from "./candidate-evaluation-facts.js";
+
+const MAX_PUBLIC_TRACE_EVENTS = 128;
 
 export function createLocalEvolutionAdapter(options: {
   harness: HarnessAdapter;
@@ -42,15 +46,14 @@ export function createLocalEvolutionAdapter(options: {
       const scratch = mkdtempSync(join(tmpdir(), `maze-evolve-${input.role}-`));
       const championRoot = join(scratch, "champion");
       const opponentRoot = join(scratch, "opponent");
+      const isolatedRoot = join(scratch, "attempts");
+      const attemptWorkspace = join(isolatedRoot, input.attemptId, "workspace");
       options.lineage.materialize(input.experimentId, input.role, input.frozenChampions[input.role], championRoot);
       const opponentRole = input.role === "generator" ? "solver" : "generator";
       options.lineage.materialize(input.experimentId, opponentRole, input.frozenChampions[opponentRole], opponentRoot);
       let provider: HarnessEvolutionResponse | undefined;
       const trustedUsage = { tokens: 0, cost: 0 };
-      let publicProgress = 0;
-      let hiddenProgress = 0;
-      let evaluatedOutcome: "promoted" | "failed" | "tie" = "failed";
-      let aggregate: Record<string, number> = {};
+      const evaluationFacts = new CandidateEvaluationFacts();
       const context: FrozenEvaluationContext = {
         opponentVersion: input.frozenChampions[opponentRole],
         imageDigest: "versioned-local-plugin-v1",
@@ -59,6 +62,15 @@ export function createLocalEvolutionAdapter(options: {
       const { publicCases, hiddenCases } = createFrozenEvaluationCases(
         options.runtime, input.experimentId, input.generation, input.role,
       );
+      const feedback = assembleTrustedEvolutionFeedback({
+        experimentId: input.experimentId,
+        generation: input.generation,
+        role: input.role,
+        championRoot: attemptWorkspace,
+        frozenChampion: input.frozenChampions[input.role],
+        runtime: options.runtime,
+        lineage: options.lineage,
+      });
       const allCases = [...publicCases, ...hiddenCases];
       try {
         const attempt = await runEvolutionAttempt({
@@ -67,8 +79,9 @@ export function createLocalEvolutionAdapter(options: {
           attemptId: input.attemptId,
           role: input.role,
           championRoot,
-          isolatedRoot: join(scratch, "attempts"),
-          input: { lineagePlans: [], trustedResults: [], publicTraces: [], hiddenAggregate: {} },
+          isolatedRoot,
+          input: feedback,
+          beginRepairAttempt: () => evaluationFacts.beginRepairAttempt(),
           createSession: () => {
             const sessionId = randomUUID();
             return {
@@ -134,21 +147,27 @@ export function createLocalEvolutionAdapter(options: {
           publicGate: async (workspace) => {
             try {
               await validatePluginPackage(workspace);
-              const evaluation = await evaluateRole(input.role, workspace, championRoot, opponentRoot, publicCases, context);
-              publicProgress = publicCases.length;
-              return { passed: !evaluation.publicRegressed, diagnostics: evaluation.publicRegressed ? ["公开配对评测发生首要指标退化"] : [] };
+              const evaluation = await evaluateRole(input.role, input.attemptId, input.generation, workspace, championRoot, opponentRoot, publicCases, context);
+              const diagnostics = evaluationFacts.recordPublicSuccess({
+                caseCount: publicCases.length, aggregate: evaluation.aggregate,
+                traces: evaluation.publicTraces, regressed: evaluation.publicRegressed,
+              });
+              return { passed: !evaluation.publicRegressed, diagnostics };
             }
-            catch (error) { return { passed: false, diagnostics: [error instanceof Error ? error.message : "公开门禁失败"] }; }
+            catch {
+              return { passed: false, diagnostics: evaluationFacts.recordPublicFailure() };
+            }
           },
           hiddenEvaluate: async (workspace) => {
             try {
-              const evaluation = await evaluateRole(input.role, workspace, championRoot, opponentRoot, allCases, context);
-              hiddenProgress = hiddenCases.length;
-              evaluatedOutcome = evaluation.outcome;
-              aggregate = evaluation.aggregate;
+              const evaluation = await evaluateRole(input.role, input.attemptId, input.generation, workspace, championRoot, opponentRoot, allCases, context);
+              evaluationFacts.recordHiddenSuccess({
+                caseCount: hiddenCases.length, outcome: evaluation.outcome, aggregate: evaluation.aggregate,
+                hiddenCandidateAggregate: evaluation.hiddenCandidateAggregate,
+              });
               return { promote: evaluation.outcome === "promoted", outcome: evaluation.outcome, resultSummary: evaluation.summary };
             } catch (error) {
-              evaluatedOutcome = "failed";
+              evaluationFacts.recordHiddenFailure();
               return { promote: false, resultSummary: error instanceof Error ? error.message : "隐藏评测失败" };
             }
           },
@@ -159,10 +178,11 @@ export function createLocalEvolutionAdapter(options: {
         return {
           result: {
             candidateCommit, championBefore, championAfter: attempt.promoted ? candidateCommit : championBefore,
-            outcome: attempt.status === "evaluated" ? evaluatedOutcome : "failed",
-            promotionTag: attempt.candidate?.promotionTag ?? null, publicProgress,
-            hiddenProgress, aggregate,
-            hypothesis: provider?.hypothesis, gateDiagnostics: attempt.status === "public-gate-failed" ? ["公开门禁失败"] : [],
+            outcome: attempt.status === "evaluated" ? evaluationFacts.outcome : "failed",
+            promotionTag: attempt.candidate?.promotionTag ?? null, publicProgress: evaluationFacts.publicProgress,
+            hiddenProgress: evaluationFacts.hiddenProgress, aggregate: evaluationFacts.aggregate,
+            hiddenCandidateAggregate: evaluationFacts.hiddenCandidateAggregate, trustedPublicTraces: evaluationFacts.publicTraces,
+            hypothesis: provider?.hypothesis, gateDiagnostics: evaluationFacts.diagnostics,
             diffSummary: attempt.candidate
               ? options.lineage.diff(input.experimentId, input.role, championBefore, candidateCommit).slice(0, 4_000)
               : undefined,
@@ -204,12 +224,16 @@ export function createFrozenEvaluationCases(
 
 async function evaluateRole(
   role: "generator" | "solver",
+  attemptId: string,
+  generation: number,
   candidateRoot: string,
   championRoot: string,
   opponentRoot: string,
   cases: Array<{ id: string; seed: string; visibility: "public" | "hidden" }>,
   context: FrozenEvaluationContext,
-): Promise<{ outcome: "promoted" | "failed" | "tie"; publicRegressed: boolean; summary: string; aggregate: Record<string, number> }> {
+): Promise<{ outcome: "promoted" | "failed" | "tie"; publicRegressed: boolean; summary: string; aggregate: Record<string, number>;
+  hiddenCandidateAggregate: Record<string, number>;
+  publicTraces: NonNullable<GenerationRoleResult["trustedPublicTraces"]> }> {
   if (role === "generator") {
     const [candidate, champion, solver] = await Promise.all([
       generatorPlugin(candidateRoot, "candidate"), generatorPlugin(championRoot, "champion"), solverPlugin(opponentRoot, "opponent"),
@@ -225,6 +249,13 @@ async function evaluateRole(
       publicRegressed: evaluation.publicPrimaryRegressed,
       summary: JSON.stringify(evaluation.total),
       aggregate: { ...evaluation.total.candidate },
+      hiddenCandidateAggregate: { ...evaluation.hidden.candidate },
+      publicTraces: evaluation.publicCases.map(({ caseId, candidate }) => ({
+        attemptId, generation, traceId: caseId, outcome: candidate.failed ? "failure" : "success",
+        metrics: { failed: candidate.failed ? 1 : 0, extraActions: candidate.extraActions,
+          gateFailure: candidate.gateFailure === null ? 0 : 1 },
+        events: boundedTrace(sanitizeGeneratorTrace(candidate.trace)),
+      })),
     };
   }
   const [candidate, champion, generator] = await Promise.all([
@@ -241,6 +272,19 @@ async function evaluateRole(
     publicRegressed: evaluation.publicPrimaryRegressed,
     summary: JSON.stringify(evaluation.total),
     aggregate: { ...evaluation.total.candidate },
+    hiddenCandidateAggregate: { ...evaluation.hidden.candidate },
+    publicTraces: evaluation.publicCases.map(({ caseId, candidate }) => ({
+      attemptId, generation, traceId: caseId, outcome: candidate.solved ? "success" : "failure",
+      metrics: { solved: candidate.solved ? 1 : 0, extraActions: candidate.extraActions, illegalActions: candidate.illegalActions },
+      events: boundedTrace(candidate.trace.map(({ observation, action }) => ({
+        type: "solver.decision" as const,
+        position: { ...observation.position },
+        openDirections: [...observation.openDirections],
+        remainingSteps: observation.remainingSteps,
+        direction: action.direction,
+        kind: action.kind,
+      }))),
+    })),
   };
 }
 
@@ -250,8 +294,45 @@ async function generatorPlugin(root: string, version: string): Promise<Generator
   };
   return {
     version,
-    generate: async (seed) => ({ maze: await generateMaze(module.createGeneratorCapability(), seed), protocolValid: true, resourceCompliant: true, trace: [] }),
+    generate: async (seed) => {
+      const maze = await generateMaze(module.createGeneratorCapability(), seed);
+      return {
+        maze,
+        protocolValid: true,
+        resourceCompliant: true,
+        trace: [
+          ...maze.passages.map(({ from, to }) => ({ type: "maze.carved" as const, from: { ...from }, to: { ...to } })),
+          { type: "maze.completed" as const, passageCount: maze.passages.length },
+        ],
+      };
+    },
   };
+}
+
+function sanitizeGeneratorTrace(trace: readonly unknown[]): NonNullable<GenerationRoleResult["trustedPublicTraces"]>[number]["events"] {
+  return trace.map((event) => {
+    if (!event || typeof event !== "object" || Array.isArray(event)) throw new Error("Generator 公开轨迹事件非法");
+    const value = event as Record<string, unknown>;
+    if (value.type === "maze.carved" && coordinate(value.from) && coordinate(value.to)) {
+      return { type: "maze.carved" as const, from: { ...value.from }, to: { ...value.to } };
+    }
+    if (value.type === "maze.completed" && Number.isSafeInteger(value.passageCount) && Number(value.passageCount) >= 0) {
+      return { type: "maze.completed" as const, passageCount: Number(value.passageCount) };
+    }
+    throw new Error("Generator 公开轨迹包含非白名单事件");
+  });
+}
+
+function boundedTrace<T>(events: readonly T[]): T[] {
+  if (events.length <= MAX_PUBLIC_TRACE_EVENTS) return [...events];
+  const headCount = Math.floor(MAX_PUBLIC_TRACE_EVENTS / 2);
+  return [...events.slice(0, headCount), ...events.slice(-(MAX_PUBLIC_TRACE_EVENTS - headCount))];
+}
+
+function coordinate(value: unknown): value is { x: number; y: number } {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === 2
+    && Number.isSafeInteger((value as { x?: unknown }).x) && Number.isSafeInteger((value as { y?: unknown }).y);
 }
 
 async function generateMaze(capability: GeneratorCapability, seed: string): Promise<MazeSnapshot> {

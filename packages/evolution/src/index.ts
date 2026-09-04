@@ -2,26 +2,50 @@ import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, read
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CandidateCommit, PluginLineageRepository, PluginRole } from "@maze-arena/lineage";
 
+export type TypedPublicTraceEvent =
+  | { type: "maze.carved"; from: { x: number; y: number }; to: { x: number; y: number } }
+  | { type: "maze.completed"; passageCount: number }
+  | { type: "solver.decision"; position: { x: number; y: number }; openDirections: readonly ("north" | "east" | "south" | "west")[]; remainingSteps: number; direction: "north" | "east" | "south" | "west"; kind: "move" | "backtrack" };
+
 export interface TypedPublicTrace {
-  caseId: string;
-  outcome: "success" | "failure";
-  actions: number;
-  illegalActions: number;
-  observations?: Array<{
-    position: { x: number; y: number };
-    openDirections: string[];
-    remainingSteps: number;
-    moved: boolean | null;
-  }>;
+  attemptId: string;
+  generation: number;
+  traceId: string;
+  outcome: "success" | "failure" | "tie";
+  metrics: Readonly<Record<string, number>>;
+  events: readonly TypedPublicTraceEvent[];
+}
+
+export interface TrustedAttemptResult {
+  attemptId: string;
+  generation: number;
+  role: PluginRole;
+  outcome: "promoted" | "failed" | "tie";
+  publicCaseCount: number;
+  hiddenCaseCount: number;
+  totalCandidateAggregate: Readonly<Record<string, number>>;
+  /** 旧检查点缺少该字段；存在时仅包含去身份化的隐藏指标汇总。 */
+  hiddenCandidateAggregate?: Readonly<Record<string, number>>;
+}
+
+export interface DelayedHiddenAggregate {
+  completedAttemptCount: number;
+  metricAvailableAttemptCount: number;
+  metricUnavailableAttemptCount: number;
+  promotedAttemptCount: number;
+  failedAttemptCount: number;
+  tieAttemptCount: number;
+  evaluatedHiddenCaseCount: number;
+  metricTotals: Readonly<Record<string, number>>;
 }
 
 export interface TrustedEvolutionInput {
   role: PluginRole;
   championRoot: string;
-  lineagePlans: readonly { attemptId: string; hypothesis: string }[];
-  trustedResults: readonly { generation: number; promoted: boolean; primaryMetric: number }[];
+  lineagePlans: readonly { attemptId: string; strategyPlan: string }[];
+  trustedResults: readonly TrustedAttemptResult[];
   publicTraces: readonly TypedPublicTrace[];
-  hiddenAggregate: Readonly<Record<string, number>>;
+  hiddenAggregate: DelayedHiddenAggregate;
 }
 
 export interface EvolutionSessionRequest {
@@ -93,6 +117,7 @@ export async function runEvolutionAttempt(options: {
   isolatedRoot: string;
   input: Omit<TrustedEvolutionInput, "role" | "championRoot">;
   createSession(environment: { home: string; workspace: string }): EvolutionHarnessSession;
+  beginRepairAttempt?(repairAttempt: number): void;
   publicGate(workspace: string): PublicGateResult | Promise<PublicGateResult>;
   hiddenEvaluate(workspace: string): HiddenEvaluationResult | Promise<HiddenEvaluationResult>;
   lineage: PluginLineageRepository;
@@ -116,6 +141,7 @@ export async function runEvolutionAttempt(options: {
   let repairs = 0;
   try {
     for (let repairAttempt = 0; repairAttempt <= 3; repairAttempt += 1) {
+      options.beginRepairAttempt?.(repairAttempt);
       response = await session.run({
         role: options.role,
         home,
@@ -167,10 +193,20 @@ function writeStrategyPlan(workspace: string, attemptId: string, content: string
 }
 
 export function assertNoPrivateEvolutionData(value: unknown): void {
-  const serialized = JSON.stringify(value);
-  for (const forbidden of ["generationSeed", "mazeTopology", "shortestPath", "opponentSource", "opponentStderr", "prompt", "reasoning", "toolCalls"]) {
-    if (serialized.includes(`\"${forbidden}\"`)) throw new Error(`进化输入包含禁止字段：${forbidden}`);
-  }
+  const forbidden = new Set([
+    "seed", "generationSeed", "mazeTopology", "shortestPath", "opponent", "opponentVersion",
+    "opponentSource", "opponentComments", "opponentStderr", "stderr", "prompt", "reasoning",
+    "toolCalls", "toolActivity", "source", "comments",
+  ]);
+  const visit = (current: unknown): void => {
+    if (Array.isArray(current)) { current.forEach(visit); return; }
+    if (!current || typeof current !== "object") return;
+    for (const [key, nested] of Object.entries(current)) {
+      if (forbidden.has(key)) throw new Error(`进化输入包含禁止字段：${key}`);
+      visit(nested);
+    }
+  };
+  visit(value);
 }
 
 export function assertSolverCandidateScope(championRoot: string, candidateRoot: string): void {

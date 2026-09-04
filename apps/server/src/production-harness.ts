@@ -11,9 +11,19 @@ import {
   runIsolatedHarnessCommand,
   ExportedHarnessConfigAdapter,
   HARNESS_EVOLUTION_ALLOWED_TOOLS,
+  HARNESS_EVOLUTION_MAX_AGGREGATE_METRICS,
+  HARNESS_EVOLUTION_MAX_FEEDBACK_BYTES,
+  HARNESS_EVOLUTION_MAX_LINEAGE_PLANS,
+  HARNESS_EVOLUTION_MAX_PUBLIC_TRACES,
+  HARNESS_EVOLUTION_MAX_REQUEST_BYTES,
+  HARNESS_EVOLUTION_MAX_STRATEGY_PLAN_BYTES,
+  HARNESS_EVOLUTION_MAX_TRACE_EVENTS,
+  HARNESS_EVOLUTION_MAX_TRACE_METRICS,
+  HARNESS_EVOLUTION_MAX_TRUSTED_RESULTS,
   HARNESS_EVOLUTION_PROTOCOL_VERSION,
   HARNESS_EVOLUTION_REQUEST_TYPE,
   HARNESS_EVOLUTION_RESPONSE_TYPE,
+  harnessEvolutionTrustedInputBytes,
   HarnessConfigurationError,
   type HarnessAdapter,
   type HarnessEvolutionProtocolRequest,
@@ -27,9 +37,8 @@ import { HarnessInvocationError } from "./harness-invocation-error.js";
 
 const DEFAULT_EVOLUTION_TIMEOUT_MS = 120_000;
 const MAX_PROCESS_OUTPUT_BYTES = 1024 * 1024;
-const MAX_REQUEST_BYTES = 1024 * 1024;
 const MAX_HYPOTHESIS_BYTES = 16 * 1024;
-const MAX_STRATEGY_PLAN_BYTES = 64 * 1024;
+const MAX_RESPONSE_STRATEGY_PLAN_BYTES = 64 * 1024;
 const MAX_REASONING_BYTES = 128 * 1024;
 const MAX_TOOL_ACTIVITY_BYTES = 128 * 1024;
 const FORBIDDEN_INHERITED_DIRECTORIES = new Set([
@@ -167,7 +176,7 @@ async function runJsonCommand(
   } = { environment: process.env },
 ): Promise<unknown> {
   const serializedRequest = JSON.stringify(request);
-  if (Buffer.byteLength(serializedRequest, "utf8") > MAX_REQUEST_BYTES) {
+  if (Buffer.byteLength(serializedRequest, "utf8") >= HARNESS_EVOLUTION_MAX_REQUEST_BYTES) {
     throw new HarnessInvocationError(`DSH ${operation === "evolve" ? "自治" : "冒烟"}请求超过 1 MiB 限制`, "protocol");
   }
   const resolvedCommand = realpathSync(resolve(command));
@@ -263,11 +272,160 @@ function assertEvolutionSessionRequest(request: HarnessEvolutionRequest): void {
   if (request.input.role !== request.role || resolve(request.input.championRoot) !== workspace) {
     throw new Error("DSH 自治输入角色或冠军工作区与会话边界不一致");
   }
+  assertTrustedFeedback(request.input, request.generation, request.role);
   if (request.allowedTools.length !== HARNESS_EVOLUTION_ALLOWED_TOOLS.length
     || request.allowedTools.some((tool, index) => tool !== HARNESS_EVOLUTION_ALLOWED_TOOLS[index])) {
     throw new Error("DSH 自治会话工具白名单与冻结策略不一致");
   }
 }
+
+function assertTrustedFeedback(
+  input: HarnessEvolutionRequest["input"],
+  currentGeneration: number,
+  role: HarnessEvolutionRequest["role"],
+): void {
+  if (!exactFields(input as unknown as Record<string, unknown>, [
+    "role", "championRoot", "lineagePlans", "trustedResults", "publicTraces", "hiddenAggregate",
+  ]) || harnessEvolutionTrustedInputBytes(input) > HARNESS_EVOLUTION_MAX_FEEDBACK_BYTES
+    || !Array.isArray(input.lineagePlans) || input.lineagePlans.length > HARNESS_EVOLUTION_MAX_LINEAGE_PLANS
+    || !Array.isArray(input.trustedResults)
+    || input.trustedResults.length > HARNESS_EVOLUTION_MAX_TRUSTED_RESULTS
+    || !Array.isArray(input.publicTraces) || input.publicTraces.length > HARNESS_EVOLUTION_MAX_PUBLIC_TRACES
+    || !isPlainObject(input.hiddenAggregate)) feedbackError();
+  for (const plan of input.lineagePlans) {
+    if (!isPlainObject(plan) || !exactFields(plan, ["attemptId", "strategyPlan"])
+      || !feedbackId(plan.attemptId) || typeof plan.strategyPlan !== "string"
+      || !boundedString(plan.strategyPlan, HARNESS_EVOLUTION_MAX_STRATEGY_PLAN_BYTES)) feedbackError();
+  }
+  const resultsByAttempt = new Map<string, number>();
+  const completedResults: Array<Record<string, unknown>> = [];
+  let previousResultGeneration = 0;
+  for (const result of input.trustedResults) {
+    if (!isPlainObject(result) || !exactOptionalFields(result,
+      ["attemptId", "generation", "role", "outcome", "publicCaseCount", "hiddenCaseCount", "totalCandidateAggregate"],
+      ["hiddenCandidateAggregate"])
+      || !feedbackId(result.attemptId) || !positiveInteger(result.generation)
+      || Number(result.generation) >= currentGeneration
+      || result.role !== role
+      || result.attemptId !== feedbackAttemptId(Number(result.generation), role)
+      || !["promoted", "failed", "tie"].includes(String(result.outcome))
+      || !nonNegativeInteger(result.publicCaseCount) || !nonNegativeInteger(result.hiddenCaseCount)
+      || !numericRecord(result.totalCandidateAggregate, HARNESS_EVOLUTION_MAX_AGGREGATE_METRICS)
+      || Number(result.generation) <= previousResultGeneration
+      || (Object.hasOwn(result, "hiddenCandidateAggregate")
+        && (Number(result.hiddenCaseCount) === 0 || !hiddenMetricRecord(result.hiddenCandidateAggregate, role)))
+      || resultsByAttempt.has(String(result.attemptId))) feedbackError();
+    previousResultGeneration = Number(result.generation);
+    resultsByAttempt.set(String(result.attemptId), Number(result.generation));
+    if (Number(result.hiddenCaseCount) > 0) completedResults.push(result);
+  }
+  for (const plan of input.lineagePlans) if (!resultsByAttempt.has(plan.attemptId)) feedbackError();
+  const traceIdentities = new Set<string>();
+  for (const trace of input.publicTraces) {
+    const traceIdentity = isPlainObject(trace) ? `${String(trace.attemptId)}\0${String(trace.traceId)}` : "";
+    if (!isPlainObject(trace) || !exactFields(trace, ["attemptId", "generation", "traceId", "outcome", "metrics", "events"])
+      || !feedbackId(trace.attemptId) || !positiveInteger(trace.generation) || !feedbackId(trace.traceId)
+      || resultsByAttempt.get(String(trace.attemptId)) !== Number(trace.generation)
+      || !["success", "failure", "tie"].includes(String(trace.outcome))
+      || !numericRecord(trace.metrics, HARNESS_EVOLUTION_MAX_TRACE_METRICS)
+      || !Array.isArray(trace.events) || trace.events.length > HARNESS_EVOLUTION_MAX_TRACE_EVENTS
+      || traceIdentities.has(traceIdentity)) feedbackError();
+    traceIdentities.add(traceIdentity);
+    trace.events.forEach(assertPublicFeedbackEvent);
+  }
+  const hidden = input.hiddenAggregate as unknown as Record<string, unknown>;
+  const completedAttemptCount = Number(hidden.completedAttemptCount);
+  const metricAvailableAttemptCount = Number(hidden.metricAvailableAttemptCount);
+  const metricUnavailableAttemptCount = Number(hidden.metricUnavailableAttemptCount);
+  const promotedAttemptCount = Number(hidden.promotedAttemptCount);
+  const failedAttemptCount = Number(hidden.failedAttemptCount);
+  const tieAttemptCount = Number(hidden.tieAttemptCount);
+  const expectedMetricTotals: Record<string, number> = {};
+  let expectedHiddenCaseCount = 0;
+  let expectedMetricAvailableCount = 0;
+  for (const result of completedResults) {
+    expectedHiddenCaseCount = safeFeedbackCountSum(expectedHiddenCaseCount, Number(result.hiddenCaseCount));
+    if (!Object.hasOwn(result, "hiddenCandidateAggregate")) continue;
+    expectedMetricAvailableCount += 1;
+    for (const [metric, value] of Object.entries(result.hiddenCandidateAggregate as Record<string, number>)) {
+      expectedMetricTotals[metric] = finiteFeedbackMetricSum(expectedMetricTotals[metric] ?? 0, value);
+    }
+  }
+  const expectedPromotedCount = completedResults.filter(({ outcome }) => outcome === "promoted").length;
+  const expectedFailedCount = completedResults.filter(({ outcome }) => outcome === "failed").length;
+  const expectedTieCount = completedResults.filter(({ outcome }) => outcome === "tie").length;
+  if (!exactFields(hidden, ["completedAttemptCount", "metricAvailableAttemptCount", "metricUnavailableAttemptCount", "promotedAttemptCount", "failedAttemptCount", "tieAttemptCount", "evaluatedHiddenCaseCount", "metricTotals"])
+    || !nonNegativeInteger(hidden.completedAttemptCount) || !nonNegativeInteger(hidden.metricAvailableAttemptCount)
+    || !nonNegativeInteger(hidden.metricUnavailableAttemptCount)
+    || metricAvailableAttemptCount + metricUnavailableAttemptCount !== completedAttemptCount
+    || !nonNegativeInteger(hidden.promotedAttemptCount)
+    || !nonNegativeInteger(hidden.failedAttemptCount) || !nonNegativeInteger(hidden.tieAttemptCount)
+    || promotedAttemptCount + failedAttemptCount + tieAttemptCount !== completedAttemptCount
+    || !nonNegativeInteger(hidden.evaluatedHiddenCaseCount) || !hiddenMetricRecord(hidden.metricTotals, role)
+    || completedAttemptCount !== completedResults.length
+    || metricAvailableAttemptCount !== expectedMetricAvailableCount
+    || metricUnavailableAttemptCount !== completedResults.length - expectedMetricAvailableCount
+    || promotedAttemptCount !== expectedPromotedCount || failedAttemptCount !== expectedFailedCount
+    || tieAttemptCount !== expectedTieCount || Number(hidden.evaluatedHiddenCaseCount) !== expectedHiddenCaseCount
+    || !sameNumericRecord(hidden.metricTotals as Record<string, number>, expectedMetricTotals)) feedbackError();
+}
+
+function safeFeedbackCountSum(left: number, right: number): number {
+  const total = left + right;
+  if (!Number.isSafeInteger(total) || total < 0) feedbackError();
+  return total;
+}
+
+function finiteFeedbackMetricSum(left: number, right: number): number {
+  const total = left + right;
+  if (!Number.isSafeInteger(total) || total < 0) feedbackError();
+  return total;
+}
+
+function sameNumericRecord(left: Record<string, number>, right: Record<string, number>): boolean {
+  const leftKeys = Object.keys(left);
+  return leftKeys.length === Object.keys(right).length
+    && leftKeys.every((key) => Object.hasOwn(right, key) && left[key] === right[key]);
+}
+
+function assertPublicFeedbackEvent(value: unknown): void {
+  if (!isPlainObject(value)) feedbackError();
+  if (value.type === "maze.carved" && exactFields(value, ["type", "from", "to"])
+    && coordinate(value.from) && coordinate(value.to)) return;
+  if (value.type === "maze.completed" && exactFields(value, ["type", "passageCount"])
+    && nonNegativeInteger(value.passageCount)) return;
+  if (value.type === "solver.decision"
+    && exactFields(value, ["type", "position", "openDirections", "remainingSteps", "direction", "kind"])
+    && coordinate(value.position) && Array.isArray(value.openDirections)
+    && value.openDirections.every(direction) && nonNegativeInteger(value.remainingSteps)
+    && direction(value.direction) && ["move", "backtrack"].includes(String(value.kind))) return;
+  feedbackError();
+}
+
+function numericRecord(value: unknown, maximumEntries: number): boolean {
+  return isPlainObject(value) && Object.keys(value).length <= maximumEntries && Object.entries(value).every(([key, metric]) =>
+    /^[a-zA-Z][a-zA-Z0-9._-]{0,63}$/.test(key) && typeof metric === "number" && Number.isFinite(metric));
+}
+function hiddenMetricRecord(value: unknown, role: HarnessEvolutionRequest["role"]): boolean {
+  if (!isPlainObject(value)) return false;
+  const allowed = role === "generator"
+    ? new Set(["gateFailures", "failedCases", "extraActions", "structuralNovelty"])
+    : new Set(["solvedCases", "extraActions", "illegalActions"]);
+  return Object.entries(value).every(([key, metric]) =>
+    allowed.has(key) && Number.isSafeInteger(metric) && Number(metric) >= 0);
+}
+function coordinate(value: unknown): boolean {
+  return isPlainObject(value) && exactFields(value, ["x", "y"])
+    && Number.isSafeInteger(value.x) && Number.isSafeInteger(value.y);
+}
+function direction(value: unknown): boolean { return ["north", "east", "south", "west"].includes(String(value)); }
+function feedbackId(value: unknown): boolean { return typeof value === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(value); }
+function feedbackAttemptId(generation: number, role: HarnessEvolutionRequest["role"]): string {
+  return `g${String(generation).padStart(4, "0")}-${role}`;
+}
+function positiveInteger(value: unknown): boolean { return Number.isSafeInteger(value) && Number(value) > 0; }
+function nonNegativeInteger(value: unknown): boolean { return Number.isSafeInteger(value) && Number(value) >= 0; }
+function feedbackError(): never { throw new Error("DSH 自治反馈协议字段非法"); }
 
 function isNestedPath(parent: string, candidate: string): boolean {
   const local = relative(parent, candidate);
@@ -329,7 +487,7 @@ function parseEvolutionResponse(
     || typeof result.hypothesis !== "string" || typeof result.strategyPlan !== "string"
     || typeof result.submitted !== "boolean"
     || !boundedString(result.hypothesis, MAX_HYPOTHESIS_BYTES)
-    || !boundedString(result.strategyPlan, MAX_STRATEGY_PLAN_BYTES)
+    || !boundedString(result.strategyPlan, MAX_RESPONSE_STRATEGY_PLAN_BYTES)
     || (result.reasoning !== undefined && (typeof result.reasoning !== "string" || !boundedString(result.reasoning, MAX_REASONING_BYTES)))
     || (result.toolActivity !== undefined && (typeof result.toolActivity !== "string" || !boundedString(result.toolActivity, MAX_TOOL_ACTIVITY_BYTES)))) {
     throw protocolError(parsedUsage);

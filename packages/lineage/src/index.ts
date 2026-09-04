@@ -32,6 +32,11 @@ export interface LineageEntry {
   tags: string[];
 }
 
+export interface StrategyRecord {
+  attemptId: string;
+  strategyPlan: string;
+}
+
 interface PromotionRow {
   experiment_id: string;
   role: PluginRole;
@@ -212,6 +217,24 @@ export class PluginLineageRepository {
       const tags = [...decorations.matchAll(/tag: ([^,)]+)/g)].map((match) => match[1]!);
       return { commit, subject, tags };
     });
+  }
+
+  listStrategyRecords(experimentId: string, role: PluginRole): StrategyRecord[] {
+    this.verifyIntegrity(experimentId, role);
+    const repository = this.repositoryPath(experimentId, role);
+    const lines = git(repository, ["log", "--format=%H%x09%s", "--reverse"]).split("\n").filter(Boolean);
+    const records: StrategyRecord[] = [];
+    for (const line of lines) {
+      const [commit = "", subject = ""] = line.split("\t");
+      if (!subject.startsWith("candidate: ")) continue;
+      const attemptId = subject.slice("candidate: ".length);
+      if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(attemptId)) {
+        return this.tampered(experimentId, role, "候选提交包含非法尝试标识");
+      }
+      const strategyPlan = optionalGit(repository, ["show", `${commit}:lineage/${attemptId}.md`]);
+      if (strategyPlan !== undefined) records.push({ attemptId, strategyPlan });
+    }
+    return records;
   }
 
   diff(experimentId: string, role: PluginRole, from: string, to: string): string {
