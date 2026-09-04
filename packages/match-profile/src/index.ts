@@ -1,8 +1,9 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { request as httpRequest } from "node:http";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parse } from "@babel/parser";
 import packlist from "npm-packlist";
 import { parseDocument } from "yaml";
@@ -79,6 +80,58 @@ export interface MatchProfileCleanupCommand {
 
 export interface MatchProfileCommandFactory {
   create(role: MatchPluginRole): MatchProfileCommand;
+}
+
+export interface TrustedCandidateTestRunner {
+  run(input: { packageRoot: string; trustedToolRoot: string }): void | Promise<void>;
+}
+
+export class DockerTrustedCandidateTestRunner implements TrustedCandidateTestRunner {
+  constructor(
+    private readonly image: string,
+    private readonly executable = "docker",
+    private readonly environment: NodeJS.ProcessEnv = {},
+    private readonly runtimeExecutable = "node",
+  ) {
+    assertImmutableImageReference(image);
+  }
+
+  async run(input: { packageRoot: string; trustedToolRoot: string }): Promise<void> {
+    const packageRoot = resolve(input.packageRoot);
+    const trustedToolRoot = resolve(input.trustedToolRoot);
+    const repositoryRoot = resolve(trustedToolRoot, "../..");
+    const vitest = trustedVitestEntry(trustedToolRoot);
+    const mounts = trustedCandidateTestMounts(packageRoot, trustedToolRoot, repositoryRoot, this.runtimeExecutable);
+    if (mounts.some((path) => path.includes(",") || /[\r\n]/.test(path))) {
+      throw new Error("Docker 候选测试挂载路径包含不支持的字符");
+    }
+    const containerName = `maze-candidate-test-${randomBytes(12).toString("hex")}`;
+    const result = spawnSync(this.executable, [
+      "run", "--rm", "--name", containerName, "--network=none", "--read-only", `--user=${MATCH_PROFILE_POLICY.user}`,
+      "--memory=128m", "--memory-swap=128m", "--cpus=1", "--ulimit=cpu=2:2", "--pids-limit=64",
+      "--security-opt=no-new-privileges", "--cap-drop=ALL", "--tmpfs=/tmp:rw,noexec,nosuid,size=16m",
+      ...mounts.map((path) => `--mount=type=bind,src=${path},dst=${path},readonly`),
+      `--workdir=${packageRoot}`, `--entrypoint=${this.runtimeExecutable}`, this.image, vitest, "run", "--root", packageRoot,
+    ], { encoding: "utf8", timeout: 60_000, maxBuffer: 4 * 1024 * 1024, env: this.commandEnvironment() });
+    try {
+      await cleanupContainer({
+        identity: containerName,
+        remove: { executable: this.executable, args: ["rm", "-f", containerName], environment: this.commandEnvironment(), timeoutMs: 2_000 },
+        verifyAbsent: { executable: this.executable, args: ["inspect", containerName], environment: this.commandEnvironment(), timeoutMs: 2_000 },
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "未知清理错误";
+      throw new Error(`${result.error || result.status !== 0 ? "候选测试失败且" : "候选测试完成但"}隔离容器清理未确认：${reason}`);
+    }
+    if (result.error || result.status !== 0) {
+      const diagnostic = [result.error?.message, result.stderr, result.stdout].filter(Boolean).join("\n").trim().slice(0, 8_192);
+      throw new Error(`候选测试失败${diagnostic ? `：${diagnostic}` : ""}`);
+    }
+  }
+
+  private commandEnvironment(): NodeJS.ProcessEnv {
+    return { PATH: process.env.PATH, ...this.environment };
+  }
 }
 
 export interface HarnessProfileInstallOptions {
@@ -206,16 +259,7 @@ export class DockerMatchProfileCommandFactory implements MatchProfileCommandFact
     private readonly image: string,
     private readonly harnessHome: string,
   ) {
-    const directDigest = /^sha256:[0-9a-f]{64}$/;
-    const imageNameSegment = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/;
-    const registrySegment = /^[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?$/;
-    const named = image.match(/^(.+)@(sha256:[0-9a-f]{64})$/);
-    const namedSegments = named?.[1]!.split("/") ?? [];
-    const validNamedDigest = namedSegments.length > 0 && namedSegments.every((segment, index) =>
-      (index === 0 && namedSegments.length > 1 ? registrySegment : imageNameSegment).test(segment));
-    if (!directDigest.test(image) && !validNamedDigest) {
-      throw new Error("Match Profile 镜像必须使用完整 sha256 摘要精确锁定");
-    }
+    assertImmutableImageReference(image);
   }
 
   create(role: MatchPluginRole): MatchProfileCommand {
@@ -713,12 +757,15 @@ export interface PluginQuotaReport {
   auxiliary: { files: number; bytes: number };
   lineageEntries: Array<{ path: string; bytes: number }>;
   buildBytes: number;
+  runtimeSha256: string;
+  installPayloadSha256: string;
 }
 
 export type LineageBaseline = Record<string, string>;
 
 export async function validatePluginPackage(packageRoot: string, lineageBaseline: LineageBaseline = {}): Promise<PluginQuotaReport> {
   const root = resolve(packageRoot);
+  assertPackageTreePreflight(root);
   const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as Record<string, any>;
   const patch = manifest.dsh?.bundle?.patch;
   if (typeof patch !== "string" || !patch.startsWith("./")) throw new Error("插件必须声明相对 dsh.bundle.patch");
@@ -753,6 +800,8 @@ export async function validatePluginPackage(packageRoot: string, lineageBaseline
     source: measure(source), runtime: measure(runtime.map((path) => join(root, path))), auxiliary: measure(auxiliary),
     lineageEntries: lineage.map((path) => ({ path: relative(root, path), bytes: statSync(path).size })),
     buildBytes,
+    runtimeSha256: hashFiles(root, runtime),
+    installPayloadSha256: hashFiles(root, installPayload.map(({ path }) => path)),
   };
   if (result.runtime.files > 64 || result.runtime.bytes > 256 * 1024) throw new Error("可安装运行载荷超过冻结配额");
   if (result.source.files > 64 || result.source.bytes > 256 * 1024) throw new Error("候选源码超过冻结配额");
@@ -765,6 +814,312 @@ export async function validatePluginPackage(packageRoot: string, lineageBaseline
   const additions = Object.keys(currentLineage).filter((path) => !(path in lineageBaseline));
   if (additions.length > 1) throw new Error("每次候选尝试最多新增一份 lineage 策略计划");
   return result;
+}
+
+export interface TrustedCandidateBuildReport extends PluginQuotaReport {
+  changedSourcePaths: string[];
+  contentSha256: string;
+}
+
+const CANDIDATE_IGNORED_DIRECTORIES = new Set([
+  ".git", "node_modules", "dist",
+]);
+
+/** 从冻结源码和工具链重建候选，绝不采用模型写入的安装产物。 */
+export async function rebuildTrustedPluginCandidate(options: {
+  championRoot: string;
+  candidateRoot: string;
+  trustedToolRoot: string;
+  testRunner: TrustedCandidateTestRunner;
+  strategyRecord?: { attemptId: string; strategyPlan: string };
+}): Promise<TrustedCandidateBuildReport> {
+  const championRoot = resolve(options.championRoot);
+  const candidateRoot = resolve(options.candidateRoot);
+  const trustedToolRoot = resolve(options.trustedToolRoot);
+  assertPackageTreePreflight(championRoot);
+  assertPackageTreePreflight(candidateRoot);
+  assertPackageTreePreflight(trustedToolRoot);
+  const championManifest = readJsonObject(join(championRoot, "package.json"));
+  const candidateManifest = readJsonObject(join(candidateRoot, "package.json"));
+  const trustedManifest = readJsonObject(join(trustedToolRoot, "package.json"));
+  if (canonicalJson(candidateManifest) !== canonicalJson(championManifest)) throw new Error("候选不得修改冻结 package.json");
+  if (canonicalJson(packageDependencyContract(trustedManifest)) !== canonicalJson(packageDependencyContract(championManifest))) {
+    throw new Error("可信构建工具链的依赖契约与冠军不一致");
+  }
+
+  const before = sourceTreeIdentity(championRoot);
+  const after = sourceTreeIdentity(candidateRoot);
+  const changed = [...new Set([...Object.keys(before), ...Object.keys(after)])]
+    .filter((path) => before[path] !== after[path]).sort();
+  const forbidden = changed.find((path) => !path.startsWith("src/") && !path.startsWith("docs/") && !path.startsWith("lineage/"));
+  if (forbidden) throw new Error(`候选修改了冻结保护边界：${forbidden}`);
+  for (const [path, hash] of Object.entries(before).filter(([path]) => path.startsWith("lineage/"))) {
+    if (after[path] !== hash) throw new Error(`候选修改或删除了既有策略记录：${path}`);
+  }
+  const changedSourcePaths = changed.filter((path) => path.startsWith("src/") && !/\.test\.[cm]?[jt]sx?$/.test(path));
+  if (changedSourcePaths.length === 0) throw new Error("候选没有可安装运行源码变化");
+  const addedLineage = changed.filter((path) => path.startsWith("lineage/") && !(path in before));
+  if (addedLineage.length > 0) {
+    const expectedPath = options.strategyRecord && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(options.strategyRecord.attemptId)
+      ? `lineage/${options.strategyRecord.attemptId}.md` : undefined;
+    if (!expectedPath || addedLineage.length !== 1 || addedLineage[0] !== expectedPath) throw new Error("候选新增了非标准策略记录");
+    if (Buffer.byteLength(options.strategyRecord!.strategyPlan, "utf8") > 64 * 1024
+      || readFileSync(join(candidateRoot, expectedPath), "utf8") !== options.strategyRecord!.strategyPlan) {
+      throw new Error("候选策略记录与 Harness 响应不一致");
+    }
+  }
+  assertCandidatePrebuildQuota(candidateRoot);
+
+  const lineageBaseline = lineageIdentity(championRoot);
+  const championReport = await validatePluginPackage(championRoot, lineageBaseline);
+  const buildRoot = mkdtempSync(join(tmpdir(), "maze-candidate-build-"));
+  try {
+    copyCandidateSources(candidateRoot, buildRoot);
+    replaceCandidateTestsWithTrustedTests(buildRoot, trustedToolRoot);
+    const trustedNodeModules = realpathSync(join(trustedToolRoot, "node_modules"));
+    const trustedTsc = join(trustedNodeModules, ".bin/tsc");
+    const trustedVitest = join(trustedNodeModules, ".bin/vitest");
+    if (!existsSync(trustedTsc) || !existsSync(trustedVitest)) throw new Error("冻结候选构建工具链不完整");
+    assertTrustedToolVersion(trustedNodeModules, "typescript", trustedManifest);
+    assertTrustedToolVersion(trustedNodeModules, "vitest", trustedManifest);
+    symlinkSync(trustedNodeModules, join(buildRoot, "node_modules"), "dir");
+    // 临时副本中的原始相对 extends 已脱离仓库层级；以冻结配置的绝对路径替换它。
+    const configPath = join(buildRoot, "tsconfig.json");
+    writeFileSync(configPath, `${JSON.stringify({
+      compilerOptions: {
+        strict: true, target: "ES2022", module: "NodeNext", moduleResolution: "NodeNext",
+        esModuleInterop: true, forceConsistentCasingInFileNames: true, skipLibCheck: true,
+        noUncheckedIndexedAccess: true, declaration: true,
+        rootDir: join(buildRoot, "src"), outDir: join(buildRoot, "dist"),
+      },
+      include: [join(buildRoot, "src/**/*.ts")],
+      exclude: [join(buildRoot, "src/**/*.test.ts")],
+    })}\n`);
+    runTrustedCandidateCommand(trustedTsc, ["-p", configPath, "--noEmit"], buildRoot, "类型检查");
+    await withReadOnlyCandidateTestTree(buildRoot, () => options.testRunner.run({ packageRoot: buildRoot, trustedToolRoot }));
+    runTrustedCandidateCommand(trustedTsc, ["-p", configPath], buildRoot, "构建");
+    const buildReport = await validatePluginPackage(buildRoot, lineageBaseline);
+    if (buildReport.runtimeSha256 === championReport.runtimeSha256) throw new Error("候选可信重建后的可安装运行载荷没有变化");
+
+    const candidateDist = join(candidateRoot, "dist");
+    if (existsSync(candidateDist)) renameSync(candidateDist, join(buildRoot, "untrusted-dist"));
+    renameSync(join(buildRoot, "dist"), candidateDist);
+    const report = await validatePluginPackage(candidateRoot, lineageBaseline);
+    if (report.installPayloadSha256 !== buildReport.installPayloadSha256) throw new Error("候选安装载荷身份与可信构建结果不一致");
+    return { ...report, changedSourcePaths, contentSha256: candidateContentIdentity(candidateRoot, report.installPayloadSha256) };
+  } finally {
+    rmSync(buildRoot, { recursive: true, force: true });
+  }
+}
+
+export async function verifyTrustedPluginCandidate(root: string, expectedContentSha256: string): Promise<void> {
+  const resolved = resolve(root);
+  assertPackageTreePreflight(resolved);
+  const report = await validatePluginPackage(resolved, lineageIdentity(resolved));
+  if (candidateContentIdentity(resolved, report.installPayloadSha256) !== expectedContentSha256) {
+    throw new Error("候选工作区已偏离可信重建内容身份");
+  }
+}
+
+function runTrustedCandidateCommand(executable: string, args: string[], cwd: string, label: string): void {
+  const result = spawnSync(executable, args, {
+    cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+    env: { PATH: process.env.PATH, NO_COLOR: "1" },
+  });
+  if (result.error || result.status !== 0) {
+    const diagnostic = [result.stderr, result.stdout].filter(Boolean).join("\n").trim().slice(0, 8_192);
+    throw new Error(`候选${label}失败${diagnostic ? `：${diagnostic}` : ""}`);
+  }
+}
+
+function assertImmutableImageReference(image: string): void {
+  const directDigest = /^sha256:[0-9a-f]{64}$/;
+  const imageNameSegment = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/;
+  const registrySegment = /^[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?$/;
+  const named = image.match(/^(.+)@(sha256:[0-9a-f]{64})$/);
+  const namedSegments = named?.[1]!.split("/") ?? [];
+  const validNamedDigest = namedSegments.length > 0 && namedSegments.every((segment, index) =>
+    (index === 0 && namedSegments.length > 1 ? registrySegment : imageNameSegment).test(segment));
+  if (!directDigest.test(image) && !validNamedDigest) {
+    throw new Error("Match Profile 镜像必须使用完整 sha256 摘要精确锁定");
+  }
+}
+
+function copyCandidateSources(source: string, destination: string, root = source): void {
+  for (const entry of readdirSync(source)) {
+    if (source === root && CANDIDATE_IGNORED_DIRECTORIES.has(entry)) continue;
+    const from = join(source, entry);
+    const to = join(destination, entry);
+    const stat = lstatSync(from);
+    if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) throw new Error(`候选源树包含不安全文件：${relative(source, from)}`);
+    if (stat.isDirectory()) {
+      mkdirSync(to, { recursive: true });
+      copyCandidateSources(from, to, root);
+    } else cpSync(from, to);
+  }
+}
+
+function replaceCandidateTestsWithTrustedTests(buildRoot: string, trustedToolRoot: string): void {
+  for (const path of walk(join(buildRoot, "src"), true).filter((path) => /\.test\.[cm]?[jt]sx?$/.test(path))) unlinkSync(path);
+  for (const path of walk(join(trustedToolRoot, "src"), true).filter((path) => /\.test\.[cm]?[jt]sx?$/.test(path))) {
+    const target = join(buildRoot, "src", relative(join(trustedToolRoot, "src"), path));
+    mkdirSync(dirname(target), { recursive: true });
+    cpSync(path, target);
+  }
+}
+
+function assertTrustedToolVersion(nodeModules: string, name: "typescript" | "vitest", manifest: Record<string, unknown>): void {
+  const expected = record(manifest.devDependencies) ? manifest.devDependencies[name] : undefined;
+  const actual = readJsonObject(join(nodeModules, name, "package.json")).version;
+  if (typeof expected !== "string" || typeof actual !== "string" || expected !== actual) {
+    throw new Error(`冻结候选构建工具版本漂移：${name}`);
+  }
+}
+
+function trustedVitestEntry(trustedToolRoot: string): string {
+  const packageRoot = realpathSync(join(trustedToolRoot, "node_modules/vitest"));
+  const manifest = readJsonObject(join(packageRoot, "package.json"));
+  const binary = typeof manifest.bin === "string"
+    ? manifest.bin
+    : record(manifest.bin) && typeof manifest.bin.vitest === "string" ? manifest.bin.vitest : undefined;
+  if (!binary || isAbsolute(binary)) throw new Error("冻结 Vitest 包缺少相对 JavaScript 入口");
+  const entry = realpathSync(join(packageRoot, binary));
+  const relation = relative(packageRoot, entry);
+  if (relation === ".." || relation.startsWith(`..${sep}`) || isAbsolute(relation) || !/\.[cm]?js$/i.test(entry)) {
+    throw new Error("冻结 Vitest JavaScript 入口越出可信包");
+  }
+  return entry;
+}
+
+function trustedCandidateTestMounts(
+  packageRoot: string,
+  trustedToolRoot: string,
+  repositoryRoot: string,
+  runtimeExecutable: string,
+): string[] {
+  const repositoryNodeModules = realpathSync(join(repositoryRoot, "node_modules"));
+  const trustedNodeModules = realpathSync(join(trustedToolRoot, "node_modules"));
+  const manifest = readJsonObject(join(trustedToolRoot, "package.json"));
+  const dependencies = record(manifest.dependencies) ? Object.keys(manifest.dependencies) : [];
+  const workspaceDependencies = dependencies.flatMap((name) => {
+    const dependency = realpathSync(join(trustedNodeModules, ...name.split("/")));
+    const inNodeModules = relative(repositoryNodeModules, dependency);
+    if (inNodeModules !== ".." && !inNodeModules.startsWith(`..${sep}`) && !isAbsolute(inNodeModules)) return [];
+    const inRepository = relative(repositoryRoot, dependency);
+    if (inRepository === ".." || inRepository.startsWith(`..${sep}`) || isAbsolute(inRepository)) {
+      throw new Error(`冻结候选测试依赖越出仓库：${name}`);
+    }
+    return [dependency];
+  });
+  const runtimeMount = isAbsolute(runtimeExecutable) ? [realpathSync(runtimeExecutable)] : [];
+  return [...new Set([packageRoot, repositoryNodeModules, trustedNodeModules, ...workspaceDependencies, ...runtimeMount])];
+}
+
+async function withReadOnlyCandidateTestTree<T>(root: string, run: () => T | Promise<T>): Promise<T> {
+  const modes: Array<{ path: string; mode: number }> = [];
+  const visit = (path: string): void => {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) return;
+    if (!stat.isDirectory() && !stat.isFile()) throw new Error(`候选测试树包含不支持的文件类型：${relative(root, path)}`);
+    modes.push({ path, mode: stat.mode & 0o777 });
+    chmodSync(path, stat.isDirectory() ? 0o555 : 0o444);
+    if (stat.isDirectory()) for (const entry of readdirSync(path)) visit(join(path, entry));
+  };
+  try {
+    visit(root);
+    return await run();
+  } finally {
+    // 先恢复父目录的遍历权限，再恢复其子项，确保失败路径也可完整清理。
+    for (const item of modes) chmodSync(item.path, item.mode);
+  }
+}
+
+function sourceTreeIdentity(root: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory).sort()) {
+      if (directory === root && CANDIDATE_IGNORED_DIRECTORIES.has(entry)) continue;
+      const path = join(directory, entry);
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) throw new Error(`候选源树包含不安全文件：${relative(root, path)}`);
+      if (stat.isDirectory()) visit(path);
+      else result[normalizeLocal(relative(root, path))] = createHash("sha256").update(readFileSync(path)).digest("hex");
+    }
+  };
+  visit(root);
+  return result;
+}
+
+function assertPackageTreePreflight(root: string): void {
+  const limits = { files: 256, singleBytes: 2 * 1024 * 1024, totalBytes: 5 * 1024 * 1024 };
+  let files = 0;
+  let totalBytes = 0;
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory).sort()) {
+      if (directory === root && (entry === ".git" || entry === "node_modules")) continue;
+      const path = join(directory, entry);
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) {
+        throw new Error(`候选源树包含不安全文件：${relative(root, path)}`);
+      }
+      if (stat.isDirectory()) {
+        visit(path);
+        continue;
+      }
+      files += 1;
+      totalBytes += stat.size;
+      const local = normalizeLocal(relative(root, path));
+      if (local.startsWith("lineage/") && stat.size > 64 * 1024) throw new Error("lineage 条目超过冻结配额");
+      if (local.startsWith("src/") && /(?<!\.d)\.[cm]?[jt]sx?$/i.test(local) && stat.size > 256 * 1024) {
+        throw new Error("候选源码超过冻结配额");
+      }
+      if (local.startsWith("dist/") && stat.size > 2 * 1024 * 1024) throw new Error("构建产物超过冻结配额");
+      if (files > limits.files || stat.size > limits.singleBytes || totalBytes > limits.totalBytes) {
+        throw new Error("候选文件树超过冻结预检配额");
+      }
+    }
+  };
+  visit(root);
+}
+
+function lineageIdentity(root: string): LineageBaseline {
+  return Object.fromEntries(Object.entries(sourceTreeIdentity(root)).filter(([path]) => path.startsWith("lineage/")));
+}
+
+function assertCandidatePrebuildQuota(root: string): void {
+  const source = walk(join(root, "src"), true).filter((path) => /(?<!\.d)\.[cm]?[jt]sx?$/i.test(path));
+  const report = measure(source);
+  if (report.files > 64 || report.bytes > 256 * 1024) throw new Error("候选源码超过冻结配额");
+}
+
+function candidateContentIdentity(root: string, installPayloadSha256: string): string {
+  const source = Object.fromEntries(Object.entries(sourceTreeIdentity(root)).filter(([path]) => !path.startsWith("lineage/")));
+  return createHash("sha256").update(canonicalJson({ installPayloadSha256, source })).digest("hex");
+}
+
+function readJsonObject(path: string): Record<string, unknown> {
+  const value = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  if (!record(value)) throw new Error(`JSON 对象非法：${path}`);
+  return value;
+}
+
+function packageDependencyContract(manifest: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]
+    .map((key) => [key, manifest[key] ?? {}]));
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (record(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+
+function hashFiles(root: string, files: readonly string[]): string {
+  const hash = createHash("sha256");
+  for (const path of [...files].map(normalizeLocal).sort()) {
+    hash.update(path).update("\0").update(readFileSync(join(root, path))).update("\0");
+  }
+  return hash.digest("hex");
 }
 
 function collectRuntimeFiles(root: string, manifest: Record<string, any>, packed: string[]): string[] {
@@ -936,7 +1291,7 @@ function moduleSpecifiers(source: string): string[] {
       throw new Error("可执行文件不得使用 createRequire");
     } else if (type === "Identifier" && value.name === "Module" && !identifierIsMemberProperty(parent, key)) {
       throw new Error("可执行文件不得引用 Node Module 加载器");
-    } else if (type === "Identifier" && value.name === "module" && !identifierIsMemberProperty(parent, key)
+    } else if (type === "Identifier" && value.name === "module" && !identifierIsNonReferenceProperty(parent, key)
       && !isModuleExportsObject(parent, key)) {
       throw new Error("可执行文件不得引用 CommonJS module 加载器");
     } else if (type === "Identifier" && value.name === "process" && !identifierIsNonReferenceProperty(parent, key)

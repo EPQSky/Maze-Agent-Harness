@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -10,11 +10,15 @@ import type { MatchPluginRole, MatchProtocolRequest } from "@maze-arena/contract
 import { hashHarnessRuntimePayload } from "@maze-arena/dsh-integration";
 import {
   DockerMatchProfileCommandFactory,
+  DockerTrustedCandidateTestRunner,
   HarnessMatchProfileInstaller,
   MatchProfileError,
   MatchProfileProcess,
   NativePluginMatchRunner,
+  rebuildTrustedPluginCandidate,
   validatePluginPackage,
+  verifyTrustedPluginCandidate,
+  type TrustedCandidateTestRunner,
 } from "./index.js";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -26,6 +30,18 @@ const fakeHarnessRuntime = {
   runtimePayloadSha256: hashHarnessRuntimePayload(dirname(fakeDsh)),
 } as const;
 const cleanupFixture = join(packageRoot, "test/fixtures/container-cleanup.mjs");
+const fakeCandidateDocker = join(packageRoot, "test/fixtures/fake-candidate-docker.mjs");
+const realDockerTestImage = process.env.MAZE_TEST_DOCKER_IMAGE;
+const realDockerImageAvailable = Boolean(realDockerTestImage)
+  && spawnSync("docker", ["image", "inspect", realDockerTestImage!], { stdio: "ignore" }).status === 0;
+const stubCandidateTestRunner: TrustedCandidateTestRunner = {
+  run: ({ packageRoot: candidateRoot }) => {
+    // 单元测试只模拟权威测试结论，避免在 Vitest 宿主进程导入候选模块。
+    if (readFileSync(join(candidateRoot, "src/index.ts"), "utf8").includes("invalidCandidate")) {
+      throw new Error("候选测试失败：权威断言未通过");
+    }
+  },
+};
 
 function command(mode: string, role: MatchPluginRole = "solver") {
   return { executable: process.execPath, args: [peer, mode], environment: { PATH: process.env.PATH, MAZE_MATCH_ROLE: role } };
@@ -68,6 +84,15 @@ function pluginWithRuntimeSource(source: string): string {
   writeFileSync(join(root, "dist/index.js"), `${source}\n`);
   return root;
 }
+function candidateCopy(role: "generator" | "solver" = "generator"): { champion: string; candidate: string; trusted: string } {
+  const trusted = join(workspaceRoot, `packages/${role}-plugin`);
+  const root = mkdtempSync(join(tmpdir(), "maze-real-candidate-"));
+  const champion = join(root, "champion");
+  const candidate = join(root, "candidate");
+  cpSync(trusted, champion, { recursive: true, filter: (path) => !path.split("/").includes("node_modules") });
+  cpSync(trusted, candidate, { recursive: true, filter: (path) => !path.split("/").includes("node_modules") });
+  return { champion, candidate, trusted };
+}
 function dshCommand(home: string, role: MatchPluginRole, marker?: string) {
   return {
     executable: fakeDsh,
@@ -103,6 +128,209 @@ async function listenStatsServer(handler: (call: number, response: ServerRespons
 }
 
 describe("Match Profile 进程协议", () => {
+  it("权威候选测试通过摘要锁定的一次性 Docker 执行并确认清理", async () => {
+    chmodSync(fakeCandidateDocker, 0o700);
+    const marker = join(mkdtempSync(join(tmpdir(), "maze-candidate-docker-")), "calls.jsonl");
+    await new DockerTrustedCandidateTestRunner(`sha256:${"a".repeat(64)}`, fakeCandidateDocker, {
+      MAZE_FAKE_DOCKER_LOG: marker,
+    }).run({ packageRoot, trustedToolRoot: join(workspaceRoot, "packages/generator-plugin") });
+    const calls = readFileSync(marker, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
+    const args = calls[0]!;
+    expect(calls.map((call) => call[0])).toEqual(["run", "rm", "inspect", "inspect"]);
+    expect(args.slice(0, 5)).toEqual(["run", "--rm", "--name", expect.stringMatching(/^maze-candidate-test-[0-9a-f]{24}$/), "--network=none"]);
+    for (const expected of ["--network=none", "--read-only", "--user=65532:65532", "--cap-drop=ALL", "--pids-limit=64"]) {
+      expect(args).toContain(expected);
+    }
+    expect(args).toEqual(expect.arrayContaining([
+      "--memory=128m", "--memory-swap=128m", "--cpus=1", "--ulimit=cpu=2:2",
+      "--security-opt=no-new-privileges", "--tmpfs=/tmp:rw,noexec,nosuid,size=16m",
+    ]));
+    expect(args).toContain(`sha256:${"a".repeat(64)}`);
+    const mounts = args.filter((arg) => arg.startsWith("--mount=type=bind,"));
+    expect(mounts).toHaveLength(4);
+    expect(mounts.every((mount) => mount.endsWith(",readonly"))).toBe(true);
+    expect(mounts.some((mount) => mount.includes(`src=${workspaceRoot},`))).toBe(false);
+    expect(args).toContain("--entrypoint=node");
+    expect(args.at(-4)).toMatch(/node_modules\/vitest\/vitest\.mjs$/);
+    expect(args.slice(-3)).toEqual(["run", "--root", packageRoot]);
+  });
+
+  it("Docker 候选测试保留有界诊断，且清理不可确认时关闭失败", async () => {
+    chmodSync(fakeCandidateDocker, 0o700);
+    const root = mkdtempSync(join(tmpdir(), "maze-candidate-docker-failure-"));
+    const input = { packageRoot, trustedToolRoot: join(workspaceRoot, "packages/generator-plugin") };
+    await expect(new DockerTrustedCandidateTestRunner(`sha256:${"b".repeat(64)}`, fakeCandidateDocker, {
+      MAZE_FAKE_DOCKER_LOG: join(root, "test-failure.jsonl"), MAZE_FAKE_DOCKER_MODE: "test-failure",
+    }).run(input)).rejects.toThrow(/候选测试失败.*candidate test sentinel failure/s);
+    await expect(new DockerTrustedCandidateTestRunner(`sha256:${"c".repeat(64)}`, fakeCandidateDocker, {
+      MAZE_FAKE_DOCKER_LOG: join(root, "cleanup-failure.jsonl"), MAZE_FAKE_DOCKER_MODE: "cleanup-failure",
+    }).run(input)).rejects.toThrow(/隔离容器清理未确认/);
+  });
+
+  it.skipIf(!realDockerImageAvailable)("真实 Docker 以 UID 65532 读取只读构建根并执行 Vitest JavaScript 入口", async () => {
+    const isolatedRoot = mkdtempSync(join(tmpdir(), "maze-candidate-docker-uid-"));
+    mkdirSync(join(isolatedRoot, "src"));
+    symlinkSync(join(workspaceRoot, "packages/generator-plugin/node_modules"), join(isolatedRoot, "node_modules"), "dir");
+    writeFileSync(join(isolatedRoot, "src/uid.test.ts"), `
+      import { writeFileSync } from "node:fs";
+      import { expect, test } from "vitest";
+      test("容器身份和只读挂载", () => {
+        expect(process.getuid?.()).toBe(65532);
+        expect(() => writeFileSync(new URL("../forbidden", import.meta.url), "blocked")).toThrow();
+      });
+    `);
+    chmodSync(join(isolatedRoot, "src/uid.test.ts"), 0o444);
+    chmodSync(join(isolatedRoot, "src"), 0o555);
+    chmodSync(isolatedRoot, 0o555);
+    const realRunner = new DockerTrustedCandidateTestRunner(realDockerTestImage!, "docker", {}, process.execPath);
+    await expect(realRunner.run({
+      packageRoot: isolatedRoot,
+      trustedToolRoot: join(workspaceRoot, "packages/generator-plugin"),
+    })).resolves.toBeUndefined();
+
+    const fixture = candidateCopy();
+    const sourcePath = join(fixture.candidate, "src/index.ts");
+    writeFileSync(sourcePath, `${readFileSync(sourcePath, "utf8")}\nexport const dockerUidCandidate = true;\n`);
+    await expect(rebuildTrustedPluginCandidate({
+      championRoot: fixture.champion,
+      candidateRoot: fixture.candidate,
+      trustedToolRoot: fixture.trusted,
+      testRunner: realRunner,
+    })).resolves.toMatchObject({ changedSourcePaths: ["src/index.ts"] });
+  }, 30_000);
+  it.each(["generator", "solver"] as const)("%s 候选可信重建丢弃模型产物，并固定评测内容身份", async (role) => {
+    const fixture = candidateCopy(role);
+    const sourcePath = join(fixture.candidate, "src/index.ts");
+    const marker = `ticket07${role[0]!.toUpperCase()}${role.slice(1)}Candidate`;
+    writeFileSync(sourcePath, `${readFileSync(sourcePath, "utf8")}\nexport const ${marker} = true;\n`);
+    writeFileSync(join(fixture.candidate, "dist/index.js"), "throw new Error('untrusted');\n");
+    const report = await rebuildTrustedPluginCandidate({
+      championRoot: fixture.champion, candidateRoot: fixture.candidate, trustedToolRoot: fixture.trusted,
+      testRunner: stubCandidateTestRunner,
+    });
+    expect(report.changedSourcePaths).toEqual(["src/index.ts"]);
+    expect(report.runtime.files).toBeGreaterThan(0);
+    expect(readFileSync(join(fixture.candidate, "dist/index.js"), "utf8")).toContain(marker);
+    expect(readFileSync(join(fixture.candidate, "dist/index.js"), "utf8")).not.toContain("untrusted");
+    await expect(verifyTrustedPluginCandidate(fixture.candidate, report.contentSha256)).resolves.toBeUndefined();
+    writeFileSync(sourcePath, `${readFileSync(sourcePath, "utf8")}\nexport const lateMutation = true;\n`);
+    await expect(verifyTrustedPluginCandidate(fixture.candidate, report.contentSha256)).rejects.toThrow(/偏离可信重建内容身份/);
+  }, 30_000);
+
+  it.each([
+    ["完全无变化", (root: string) => root, /没有可安装运行源码变化/],
+    ["只改测试", (root: string) => writeFileSync(join(root, "src/index.test.ts"), `${readFileSync(join(root, "src/index.test.ts"), "utf8")}\n// test only\n`), /没有可安装运行源码变化/],
+    ["只追加策略", (root: string) => { mkdirSync(join(root, "lineage")); writeFileSync(join(root, "lineage/plan.md"), "plan\n"); }, /没有可安装运行源码变化/],
+    ["只改 dist", (root: string) => writeFileSync(join(root, "dist/index.js"), "export const fake = true;\n"), /没有可安装运行源码变化/],
+    ["只写缓存", (root: string) => { mkdirSync(join(root, ".cache")); writeFileSync(join(root, ".cache/result"), "cached\n"); }, /冻结保护边界/],
+    ["只写临时文件", (root: string) => writeFileSync(join(root, "candidate.tmp"), "temporary\n"), /冻结保护边界/],
+    ["依赖漂移", (root: string) => { const path = join(root, "package.json"); const value = JSON.parse(readFileSync(path, "utf8")); value.dependencies.evil = "1.0.0"; writeFileSync(path, JSON.stringify(value)); }, /package.json/],
+    ["保护文件变化", (root: string) => writeFileSync(join(root, "cordis.patch.yml"), "[]\n"), /保护边界/],
+  ])("拒绝无效候选：%s", async (_label, mutate, expected) => {
+    const fixture = candidateCopy();
+    mutate(fixture.candidate);
+    await expect(rebuildTrustedPluginCandidate({
+      championRoot: fixture.champion, candidateRoot: fixture.candidate, trustedToolRoot: fixture.trusted,
+      testRunner: stubCandidateTestRunner,
+    })).rejects.toThrow(expected);
+  });
+
+  it("拒绝构建失败和源码配额超限，且不采用旧 dist", async () => {
+    const broken = candidateCopy();
+    writeFileSync(join(broken.candidate, "src/index.ts"), "export const broken: = true;\n");
+    await expect(rebuildTrustedPluginCandidate({
+      championRoot: broken.champion, candidateRoot: broken.candidate, trustedToolRoot: broken.trusted,
+      testRunner: stubCandidateTestRunner,
+    })).rejects.toThrow(/类型检查失败/);
+
+    const oversized = candidateCopy();
+    writeFileSync(join(oversized.candidate, "src/oversized.ts"), `export const payload = "${"x".repeat(300 * 1024)}";\n`);
+    await expect(rebuildTrustedPluginCandidate({
+      championRoot: oversized.champion, candidateRoot: oversized.candidate, trustedToolRoot: oversized.trusted,
+      testRunner: stubCandidateTestRunner,
+    })).rejects.toThrow(/候选源码超过冻结配额/);
+  }, 30_000);
+
+  it("始终使用冻结工具根中的权威测试，拒绝冠军弱化测试后的候选", async () => {
+    const fixture = candidateCopy();
+    writeFileSync(join(fixture.champion, "src/index.test.ts"), "import { test } from 'vitest'; test('weak', () => {});\n");
+    writeFileSync(join(fixture.candidate, "src/index.test.ts"), "import { test } from 'vitest'; test('weak', () => {});\n");
+    writeFileSync(join(fixture.candidate, "src/index.ts"), "export const invalidCandidate = true;\n");
+    await expect(rebuildTrustedPluginCandidate({
+      championRoot: fixture.champion, candidateRoot: fixture.candidate, trustedToolRoot: fixture.trusted,
+      testRunner: stubCandidateTestRunner,
+    })).rejects.toThrow(/候选测试失败/);
+  }, 30_000);
+
+  it("运行源码变化可伴随一份新增策略记录及配额内文档和测试", async () => {
+    const fixture = candidateCopy();
+    const sourcePath = join(fixture.candidate, "src/index.ts");
+    writeFileSync(sourcePath, `${readFileSync(sourcePath, "utf8")}\nexport const accompaniedCandidate = true;\n`);
+    writeFileSync(join(fixture.candidate, "src/index.test.ts"), `${readFileSync(join(fixture.candidate, "src/index.test.ts"), "utf8")}\n// candidate test note\n`);
+    mkdirSync(join(fixture.candidate, "docs"));
+    writeFileSync(join(fixture.candidate, "docs/approach.md"), "候选设计说明\n");
+    mkdirSync(join(fixture.candidate, "lineage"));
+    writeFileSync(join(fixture.candidate, "lineage/attempt-1.md"), "候选策略");
+    await expect(rebuildTrustedPluginCandidate({
+      championRoot: fixture.champion, candidateRoot: fixture.candidate, trustedToolRoot: fixture.trusted,
+      testRunner: stubCandidateTestRunner, strategyRecord: { attemptId: "attempt-1", strategyPlan: "候选策略" },
+    })).resolves.toMatchObject({ changedSourcePaths: ["src/index.ts"] });
+  }, 30_000);
+
+  it.each([
+    ["非标准路径", (root: string) => writeFileSync(join(root, "lineage/other.md"), "候选策略")],
+    ["两份记录", (root: string) => {
+      writeFileSync(join(root, "lineage/attempt-1.md"), "候选策略");
+      writeFileSync(join(root, "lineage/other.md"), "候选策略");
+    }],
+    ["响应不一致", (root: string) => writeFileSync(join(root, "lineage/attempt-1.md"), "另一策略")],
+  ])("运行源码变化仍拒绝%s的新增 lineage", async (_label, writeLineage) => {
+    const fixture = candidateCopy();
+    writeFileSync(join(fixture.candidate, "src/index.ts"), `${readFileSync(join(fixture.candidate, "src/index.ts"), "utf8")}\nexport const invalidLineageCandidate = true;\n`);
+    mkdirSync(join(fixture.candidate, "lineage"));
+    writeLineage(fixture.candidate);
+    await expect(rebuildTrustedPluginCandidate({
+      championRoot: fixture.champion, candidateRoot: fixture.candidate, trustedToolRoot: fixture.trusted,
+      testRunner: stubCandidateTestRunner, strategyRecord: { attemptId: "attempt-1", strategyPlan: "候选策略" },
+    })).rejects.toThrow(/非标准策略记录|策略记录与 Harness 响应不一致/);
+  });
+
+  it("运行源码变化仍拒绝修改既有 lineage", async () => {
+    const fixture = candidateCopy();
+    for (const root of [fixture.champion, fixture.candidate]) {
+      mkdirSync(join(root, "lineage"));
+      writeFileSync(join(root, "lineage/existing.md"), "既有策略");
+    }
+    writeFileSync(join(fixture.candidate, "src/index.ts"), `${readFileSync(join(fixture.candidate, "src/index.ts"), "utf8")}\nexport const changedExistingLineage = true;\n`);
+    writeFileSync(join(fixture.candidate, "lineage/existing.md"), "篡改策略");
+    await expect(rebuildTrustedPluginCandidate({
+      championRoot: fixture.champion, candidateRoot: fixture.candidate, trustedToolRoot: fixture.trusted,
+      testRunner: stubCandidateTestRunner, strategyRecord: { attemptId: "attempt-1", strategyPlan: "候选策略" },
+    })).rejects.toThrow(/修改或删除了既有策略记录/);
+  });
+
+  it("完整安装载荷变化会使可信候选内容身份失效", async () => {
+    const fixture = candidateCopy();
+    const sourcePath = join(fixture.candidate, "src/index.ts");
+    writeFileSync(sourcePath, `${readFileSync(sourcePath, "utf8")}\nexport const installIdentityCandidate = true;\n`);
+    const report = await rebuildTrustedPluginCandidate({
+      championRoot: fixture.champion, candidateRoot: fixture.candidate, trustedToolRoot: fixture.trusted,
+      testRunner: stubCandidateTestRunner,
+    });
+    writeFileSync(join(fixture.candidate, "dist/unreferenced.js"), "export const hiddenMutation = true;\n");
+    await expect(verifyTrustedPluginCandidate(fixture.candidate, report.contentSha256)).rejects.toThrow(/偏离可信重建内容身份/);
+  }, 30_000);
+
+  it("整文件读取前通过 lstat 预检拒绝稀疏超大文件", async () => {
+    const fixture = candidateCopy();
+    const sourcePath = join(fixture.candidate, "src/index.ts");
+    truncateSync(sourcePath, 64 * 1024 * 1024);
+    await expect(rebuildTrustedPluginCandidate({
+      championRoot: fixture.champion, candidateRoot: fixture.candidate, trustedToolRoot: fixture.trusted,
+      testRunner: stubCandidateTestRunner,
+    })).rejects.toThrow(/配额/);
+  });
+
   it("启动 ready 握手独立于单次响应预算", async () => {
     const client = new MatchProfileProcess(command("slow-ready"), "solver", 100, 500);
     await expect(client.request(startRequest())).resolves.toMatchObject({ payload: { type: "solver.ready" } });
@@ -673,8 +901,8 @@ describe("原生插件与正式隔离策略", () => {
 
   it("AST 闭包分析不误封普通对象的同名成员", async () => {
     const root = pluginWithRuntimeSource(`
-      const loader = { createRequire: () => "business-value", require: () => "business-value" };
-      export default [loader.createRequire(), loader?.require()];
+      const loader = { createRequire: () => "business-value", require: () => "business-value", module: "NodeNext" };
+      export default [loader.createRequire(), loader?.require(), loader.module];
     `);
     await expect(validatePluginPackage(root)).resolves.toBeDefined();
   });

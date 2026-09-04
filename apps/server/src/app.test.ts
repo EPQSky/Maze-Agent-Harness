@@ -29,7 +29,7 @@ import {
 } from "@maze-arena/dsh-integration";
 import { ExperimentRuntimeRepository } from "@maze-arena/control-plane";
 import { afterEach, describe, expect, it } from "vitest";
-import { createArenaServer, installPersistentShutdownHandlers } from "./app.js";
+import { createArenaServer as createArenaServerImpl, installPersistentShutdownHandlers, type ArenaServerOptions } from "./app.js";
 import { createProductionHarnessAdapter } from "./production-harness.js";
 import { HarnessInvocationError } from "./harness-invocation-error.js";
 import { runBaselineMatch } from "@maze-arena/engine";
@@ -38,6 +38,13 @@ import { assembleTrustedEvolutionFeedback } from "./trusted-evolution-feedback.j
 
 const servers: ReturnType<typeof createArenaServer>[] = [];
 const deterministicMatchRunner = { run: async (seed: string) => runBaselineMatch(seed) };
+const trustedCandidateTestRunner = {
+  // 集成夹具模拟权威测试结论；生产接线必须使用 DockerTrustedCandidateTestRunner。
+  run: () => undefined,
+};
+function createArenaServer(options: ArenaServerOptions) {
+  return createArenaServerImpl({ candidateTestRunner: trustedCandidateTestRunner, ...options });
+}
 
 function findHostProcess(marker: string): number | undefined {
   for (const entry of readdirSync("/proc")) {
@@ -265,7 +272,6 @@ describe("实验工作台 API", () => {
     const directory = mkdtempSync(join(tmpdir(), "maze-local-evolution-"));
     const databasePath = join(directory, "arena.sqlite");
     const delegate = new DeterministicFakeHarnessAdapter();
-    const packagesRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../../packages");
     const providerCalls = { generator: 0, solver: 0 };
     const secondGenerationInput = new Map<EvolutionRole, HarnessEvolutionRequest["input"]>();
     const server = createArenaServer({
@@ -286,9 +292,6 @@ describe("实验工作台 API", () => {
             }
           }
           providerCalls[request.role] += 1;
-          if (providerCalls[request.role] > 1) {
-            cpSync(join(packagesRoot, `${request.role}-plugin/dist`), join(request.workspace, "dist"), { recursive: true });
-          }
           const response = await delegate.evolvePlugin(request);
           return { ...response, strategyPlan: `允许的己方策略-${request.role}`, reasoning: "forbidden-reasoning-secret",
             toolActivity: "forbidden-tool-activity-secret" };
@@ -313,8 +316,8 @@ describe("实验工作台 API", () => {
     expect(secondGenerationInput.size).toBe(2);
     await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/pause` });
     snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json();
-    expect(snapshot).toMatchObject({ state: "paused", generation: 1, usage: { tokens: 500, cost: 0 } });
-    expect(providerCalls).toEqual({ generator: 3, solver: 2 });
+    expect(snapshot).toMatchObject({ state: "paused", generation: 1, usage: { tokens: 300, cost: 0 } });
+    expect(providerCalls).toEqual({ generator: 2, solver: 1 });
     expect(snapshot.generations[0]).toMatchObject({
       generator: { outcome: "tie", publicProgress: 8, hiddenProgress: 24 },
       solver: { outcome: "tie", publicProgress: 8, hiddenProgress: 24 },
@@ -346,7 +349,7 @@ describe("实验工作台 API", () => {
       .json<import("@maze-arena/contracts").ExperimentAuditEventPage>();
     const allHarnessEvents = audit.events.filter(({ type }) => type === "harness.activity");
     const harnessEvents = allHarnessEvents.filter(({ details }) => details.outcome === "succeeded");
-    expect(harnessEvents).toHaveLength(5);
+    expect(harnessEvents).toHaveLength(3);
     expect(harnessEvents.every(({ details }) => details.executionKind === "fake" && details.protocolVersion === 1)).toBe(true);
     expect(new Set(harnessEvents.map(({ details }) => details.sessionId)).size).toBe(3);
     expect(new Set(harnessEvents.filter(({ details }) => details.role === "generator").map(({ details }) => details.sessionId)).size).toBe(2);
@@ -416,7 +419,7 @@ describe("实验工作台 API", () => {
 
   it.each([
     ["protocol", 2, 107, 0.27],
-    ["transient-provider", 6, 321, 0.81],
+    ["transient-provider", 4, 121, 0.81],
   ] as const)("本地适配器在前次成功、后续 %s 失败时合并可信用量且不双计", async (kind, expectedCalls, tokens, cost) => {
     const directory = mkdtempSync(join(tmpdir(), `maze-local-usage-${kind}-`));
     const databasePath = join(directory, "arena.sqlite");
@@ -431,7 +434,7 @@ describe("实验工作台 API", () => {
         smokeModel: (modelProfile) => delegate.smokeModel(modelProfile),
         evolvePlugin: async (request) => {
           providerCalls += 1;
-          if (providerCalls % 2 === 1) return delegate.evolvePlugin(request);
+          if (providerCalls === 1) return delegate.evolvePlugin(request);
           throw new HarnessInvocationError("受控失败", kind, { tokens: 7, cost: 0.27 }, {
             kind: "fake",
             protocolVersion: 1,

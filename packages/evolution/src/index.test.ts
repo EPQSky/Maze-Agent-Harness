@@ -1,14 +1,14 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { PluginLineageRepository } from "@maze-arena/lineage";
+import { PluginLineageRepository } from "@maze-arena/lineage";
 import { describe, expect, it, vi } from "vitest";
 import { assertNoPrivateEvolutionData, runEvolutionAttempt, type EvolutionHarnessSession } from "./index.js";
 
 const championRoot = resolve(import.meta.dirname, "../../generator-plugin");
 
 function fakeLineage() {
-  const commitCandidate = vi.fn(async (input: { outcome: string; generation?: number }) => ({
+  const commitCandidate = vi.fn(async (input: { outcome: string; generation?: number; sourceRoot?: string }) => ({
     commit: "a".repeat(40), role: "generator" as const, outcome: input.outcome as "failed",
     promotionTag: input.outcome === "promoted" ? `promotion/exp/generator/g${String(input.generation).padStart(4, "0")}` : undefined,
   }));
@@ -25,6 +25,8 @@ function baseOptions(session: EvolutionHarnessSession, lineage: PluginLineageRep
       evaluatedHiddenCaseCount: 0, metricTotals: {},
     } },
     createSession: () => session,
+    prepareCandidate: vi.fn(() => "trusted-candidate"),
+    verifyCandidate: vi.fn(),
   };
 }
 
@@ -92,6 +94,23 @@ describe("自主进化闭环", () => {
     })).resolves.toMatchObject({ status: "invalid-candidate" });
   });
 
+  it("Harness 写入稀疏超大 package.json 后在范围读取与可信重建前关闭失败", async () => {
+    const { lineage, commitCandidate } = fakeLineage();
+    const prepareCandidate = vi.fn();
+    const session: EvolutionHarnessSession = {
+      run: async (request) => {
+        truncateSync(join(request.workspace, "package.json"), 64 * 1024 * 1024);
+        return { hypothesis: "配额绕过", strategyPlan: "不应读取", submitted: true };
+      },
+      close: () => undefined,
+    };
+    await expect(runEvolutionAttempt({
+      ...baseOptions(session, lineage), prepareCandidate, publicGate: vi.fn(), hiddenEvaluate: vi.fn(),
+    })).rejects.toThrow(/预检配额/);
+    expect(prepareCandidate).not.toHaveBeenCalled();
+    expect(commitCandidate).not.toHaveBeenCalled();
+  });
+
   it("三次修复仍失败时保留失败候选且不运行隐藏评测", async () => {
     const session: EvolutionHarnessSession = {
       run: async () => ({ hypothesis: "无效尝试", strategyPlan: "记录失败", submitted: true }), close: () => undefined,
@@ -115,6 +134,129 @@ describe("自主进化闭环", () => {
       ...baseOptions(session, lineage), publicGate: vi.fn(), hiddenEvaluate: vi.fn(),
     });
     expect(result.status).toBe("invalid-candidate");
+    expect(commitCandidate).not.toHaveBeenCalled();
+  });
+
+  it("可信重建持续失败时不把未构建内容写入候选谱系", async () => {
+    const session: EvolutionHarnessSession = {
+      run: async () => ({ hypothesis: "构建失败", strategyPlan: "等待修复", submitted: true }), close: () => undefined,
+    };
+    const { lineage, commitCandidate } = fakeLineage();
+    const prepareCandidate = vi.fn((): string => { throw new Error("候选构建失败"); });
+    const publicGate = vi.fn();
+    const result = await runEvolutionAttempt({
+      ...baseOptions(session, lineage), prepareCandidate, publicGate, hiddenEvaluate: vi.fn(),
+    });
+    expect(result).toMatchObject({ status: "invalid-candidate", repairs: 3, hiddenEvaluationCount: 0 });
+    expect(result.diagnostics).toEqual(["候选构建失败"]);
+    expect(prepareCandidate).toHaveBeenCalledTimes(4);
+    expect(publicGate).not.toHaveBeenCalled();
+    expect(commitCandidate).not.toHaveBeenCalled();
+  });
+
+  it("公开评测后的工作区身份漂移进入修复，且不会提交不一致证据", async () => {
+    const session: EvolutionHarnessSession = {
+      run: async () => ({ hypothesis: "身份漂移", strategyPlan: "拒绝漂移", submitted: true }), close: () => undefined,
+    };
+    const { lineage, commitCandidate } = fakeLineage();
+    const publicGate = vi.fn(async () => ({ passed: true, diagnostics: [] }));
+    const verifyCandidate = vi.fn(() => { throw new Error("候选工作区已偏离可信重建内容身份"); });
+    const result = await runEvolutionAttempt({
+      ...baseOptions(session, lineage), publicGate, verifyCandidate, hiddenEvaluate: vi.fn(),
+    });
+    expect(result).toMatchObject({ status: "invalid-candidate", repairs: 3 });
+    expect(publicGate).toHaveBeenCalledTimes(4);
+    expect(commitCandidate).not.toHaveBeenCalled();
+  });
+
+  it("公开、隐藏评测和 Git 谱系提交复用同一个可信重建工作区", async () => {
+    const session: EvolutionHarnessSession = {
+      run: async (request) => {
+        writeFileSync(join(request.workspace, "src/candidate.ts"), "export const candidate = true;\n");
+        return { hypothesis: "内容身份", strategyPlan: "复用可信工作区", submitted: true };
+      }, close: () => undefined,
+    };
+    const { lineage, commitCandidate } = fakeLineage();
+    const result = await runEvolutionAttempt({
+      ...baseOptions(session, lineage),
+      prepareCandidate: (workspace) => {
+        mkdirSync(join(workspace, "dist"), { recursive: true });
+        writeFileSync(join(workspace, "dist/index.js"), "export const trustedBuild = true;\n");
+        return "identity-1";
+      },
+      verifyCandidate: (workspace, identity) => {
+        expect(identity).toBe("identity-1");
+        expect(readFileSync(join(workspace, "dist/index.js"), "utf8")).toContain("trustedBuild");
+      },
+      publicGate: async (workspace) => ({ passed: readFileSync(join(workspace, "dist/index.js"), "utf8").includes("trustedBuild"), diagnostics: [] }),
+      hiddenEvaluate: async (workspace) => ({
+        promote: false, outcome: "tie", resultSummary: readFileSync(join(workspace, "dist/index.js"), "utf8"),
+      }),
+    });
+    expect(result.status).toBe("evaluated");
+    const sourceRoot = commitCandidate.mock.calls[0]![0].sourceRoot!;
+    expect(readFileSync(join(sourceRoot, "dist/index.js"), "utf8")).toContain("trustedBuild");
+    expect(readFileSync(join(sourceRoot, "src/candidate.ts"), "utf8")).toContain("candidate");
+  });
+
+  it("候选已有标准策略记录时完整闭环复用该记录并提交单一 Git 谱系证据", async () => {
+    const root = mkdtempSync(join(tmpdir(), "maze-strategy-lineage-loop-"));
+    const lineage = new PluginLineageRepository(join(root, "lineages"), join(root, "arena.sqlite"));
+    try {
+      await lineage.initialize("exp", "generator", championRoot);
+      const strategyPlan = "候选自己写入的标准策略";
+      const session: EvolutionHarnessSession = {
+        run: async (request) => {
+          writeFileSync(join(request.workspace, "src/candidate.ts"), "export const candidate = true;\n");
+          mkdirSync(join(request.workspace, "lineage"), { recursive: true });
+          writeFileSync(join(request.workspace, "lineage/attempt-1.md"), strategyPlan);
+          return { hypothesis: "统一谱系", strategyPlan, submitted: true };
+        },
+        close: () => undefined,
+      };
+      const prepareCandidate = vi.fn((workspace: string, record: { attemptId: string; strategyPlan: string }) => {
+        expect(record).toEqual({ attemptId: "attempt-1", strategyPlan });
+        cpSync(join(championRoot, "dist"), join(workspace, "dist"), { recursive: true });
+        return "strategy-identity";
+      });
+      const result = await runEvolutionAttempt({
+        ...baseOptions(session, lineage), prepareCandidate,
+        publicGate: async () => ({ passed: true, diagnostics: [] }),
+        hiddenEvaluate: async () => ({ promote: false, outcome: "tie", resultSummary: "平局" }),
+      });
+      expect(result).toMatchObject({ status: "evaluated", promoted: false });
+      expect(prepareCandidate).toHaveBeenCalledTimes(1);
+      expect(lineage.listStrategyRecords("exp", "generator")).toEqual([{ attemptId: "attempt-1", strategyPlan }]);
+    } finally {
+      lineage.close();
+    }
+  });
+
+  it.each([
+    ["非标准记录", (workspace: string) => writeFileSync(join(workspace, "lineage/other.md"), "候选策略")],
+    ["两份记录", (workspace: string) => {
+      writeFileSync(join(workspace, "lineage/attempt-1.md"), "候选策略");
+      writeFileSync(join(workspace, "lineage/other.md"), "候选策略");
+    }],
+  ])("完整编排拒绝运行源码变化伴随%s", async (_label, writeLineage) => {
+    const { lineage, commitCandidate } = fakeLineage();
+    const prepareCandidate = vi.fn();
+    const session: EvolutionHarnessSession = {
+      run: async (request) => {
+        writeFileSync(join(request.workspace, "src/candidate.ts"), "export const candidate = true;\n");
+        mkdirSync(join(request.workspace, "lineage"), { recursive: true });
+        writeLineage(request.workspace);
+        return { hypothesis: "非法谱系", strategyPlan: "候选策略", submitted: true };
+      },
+      close: () => undefined,
+    };
+    const result = await runEvolutionAttempt({
+      ...baseOptions(session, lineage), prepareCandidate,
+      publicGate: vi.fn(), hiddenEvaluate: vi.fn(),
+    });
+    expect(result).toMatchObject({ status: "invalid-candidate", repairs: 3 });
+    expect(result.diagnostics.join("\n")).toMatch(/非标准策略记录/);
+    expect(prepareCandidate).not.toHaveBeenCalled();
     expect(commitCandidate).not.toHaveBeenCalled();
   });
 

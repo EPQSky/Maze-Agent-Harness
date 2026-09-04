@@ -2,7 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { createArenaServer } from "@maze-arena/server/app";
+import { createArenaServer as createArenaServerImpl, type ArenaServerOptions } from "@maze-arena/server/app";
 import { DeterministicFakeHarnessAdapter } from "@maze-arena/dsh-integration";
 import { runBaselineMatch } from "@maze-arena/engine";
 import { cleanup, render, screen, within } from "@testing-library/react";
@@ -11,6 +11,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 
 const servers: ReturnType<typeof createArenaServer>[] = [];
+const trustedCandidateTestRunner = {
+  // Web 集成只模拟权威测试结论，避免在宿主 Vitest 中执行候选模块。
+  run: () => undefined,
+};
+function createArenaServer(options: ArenaServerOptions) {
+  return createArenaServerImpl({ candidateTestRunner: trustedCandidateTestRunner, ...options });
+}
 
 afterEach(async () => {
   cleanup();

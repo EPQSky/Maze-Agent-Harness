@@ -17,7 +17,7 @@ import {
 } from "@maze-arena/evaluation";
 import { GOAL, START, runSolverOnMaze, type MazeSnapshot, type SolverPolicy } from "@maze-arena/engine";
 import type { PluginLineageRepository } from "@maze-arena/lineage";
-import { validatePluginPackage } from "@maze-arena/match-profile";
+import { rebuildTrustedPluginCandidate, verifyTrustedPluginCandidate, type TrustedCandidateTestRunner } from "@maze-arena/match-profile";
 import type { ExperimentRuntimeRepository } from "@maze-arena/control-plane";
 import type { AuditRepository } from "./audit-repository.js";
 import type { AutonomousEvolutionAdapter } from "./autonomous-runner.js";
@@ -34,6 +34,8 @@ export function createLocalEvolutionAdapter(options: {
   lineage: PluginLineageRepository;
   runtime: ExperimentRuntimeRepository;
   audits: AuditRepository;
+  pluginRoots: { generator: string; solver: string };
+  candidateTestRunner: TrustedCandidateTestRunner;
   startExhibition(input: {
     experimentId: string; seed: string; generatorCommit: string; solverCommit: string;
     generation?: number; exhibitionId?: string;
@@ -144,9 +146,19 @@ export function createLocalEvolutionAdapter(options: {
               close: () => undefined,
             };
           },
+          prepareCandidate: async (workspace, strategyRecord) => {
+            const report = await rebuildTrustedPluginCandidate({
+              championRoot,
+              candidateRoot: workspace,
+              trustedToolRoot: options.pluginRoots[input.role],
+              testRunner: options.candidateTestRunner,
+              strategyRecord,
+            });
+            return report.contentSha256;
+          },
+          verifyCandidate: verifyTrustedPluginCandidate,
           publicGate: async (workspace) => {
             try {
-              await validatePluginPackage(workspace);
               const evaluation = await evaluateRole(input.role, input.attemptId, input.generation, workspace, championRoot, opponentRoot, publicCases, context);
               const diagnostics = evaluationFacts.recordPublicSuccess({
                 caseCount: publicCases.length, aggregate: evaluation.aggregate,
@@ -182,7 +194,8 @@ export function createLocalEvolutionAdapter(options: {
             promotionTag: attempt.candidate?.promotionTag ?? null, publicProgress: evaluationFacts.publicProgress,
             hiddenProgress: evaluationFacts.hiddenProgress, aggregate: evaluationFacts.aggregate,
             hiddenCandidateAggregate: evaluationFacts.hiddenCandidateAggregate, trustedPublicTraces: evaluationFacts.publicTraces,
-            hypothesis: provider?.hypothesis, gateDiagnostics: evaluationFacts.diagnostics,
+            hypothesis: provider?.hypothesis,
+            gateDiagnostics: attempt.diagnostics.length > 0 ? [...attempt.diagnostics] : evaluationFacts.diagnostics,
             diffSummary: attempt.candidate
               ? options.lineage.diff(input.experimentId, input.role, championBefore, candidateCommit).slice(0, 4_000)
               : undefined,

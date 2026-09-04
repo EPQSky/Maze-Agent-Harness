@@ -2,7 +2,7 @@ import { resolve } from "node:path";
 import { Socket } from "node:net";
 import { createArenaServer, installPersistentShutdownHandlers } from "./app.js";
 import { createProductionHarnessAdapter } from "./production-harness.js";
-import { DockerMatchProfileCommandFactory, HarnessMatchProfileInstaller, NativePluginMatchRunner } from "@maze-arena/match-profile";
+import { DockerMatchProfileCommandFactory, DockerTrustedCandidateTestRunner, HarnessMatchProfileInstaller, NativePluginMatchRunner } from "@maze-arena/match-profile";
 import { isSensitiveProviderOptionName } from "@maze-arena/contracts";
 import type { FastifyRequest } from "fastify";
 
@@ -181,6 +181,7 @@ async function main(): Promise<void> {
     harnessRoot: trustedRoot,
     harnessAdapter,
     matchRunner,
+    candidateTestRunner: new DockerTrustedCandidateTestRunner(matchImage),
     webRoot,
     startupCommitted: () => startupCommitted,
     logger: {

@@ -39,7 +39,7 @@ import {
 } from "./experiment-repository.js";
 import { MatchDataCorruptError, MatchRepository } from "./match-repository.js";
 import { AuditRepository } from "./audit-repository.js";
-import type { ArenaMatchRunner } from "@maze-arena/match-profile";
+import type { ArenaMatchRunner, TrustedCandidateTestRunner } from "@maze-arena/match-profile";
 import { PluginLineageRepository } from "@maze-arena/lineage";
 import { registerControlRoutes } from "./control-routes.js";
 import { createRealBaselineValidationAdapter } from "./baseline-validation.js";
@@ -65,6 +65,7 @@ export interface ArenaServerOptions {
   baselineValidationAdapter?: (experiment: Experiment) => BaselineValidationAdapter;
   compatibilityFingerprint?: string;
   pluginRoots?: { generator: string; solver: string };
+  candidateTestRunner?: TrustedCandidateTestRunner;
   autonomousEvolutionAdapter?: AutonomousEvolutionAdapter;
 }
 
@@ -156,6 +157,10 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
     : resolve(dirname(options.databasePath), "lineages");
   const lineage = new PluginLineageRepository(lineageRoot, options.databasePath);
   const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+  const pluginRoots = options.pluginRoots ?? {
+    generator: resolve(workspaceRoot, "packages/generator-plugin"),
+    solver: resolve(workspaceRoot, "packages/solver-plugin"),
+  };
   const backgroundMatches = new Set<Promise<void>>();
   const matchBatchSize = options.matchBatchSize ?? 96;
   const matchBatchDelayMs = options.matchBatchDelayMs ?? 4;
@@ -330,6 +335,10 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
       lineage,
       runtime,
       audits,
+      pluginRoots,
+      candidateTestRunner: options.candidateTestRunner ?? {
+        run: () => { throw new Error("候选权威测试必须配置摘要锁定的 Docker 隔离执行器"); },
+      },
       startExhibition: startExhibitionMatch,
     }),
   );
@@ -351,10 +360,7 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
       matchRunner,
       matches,
       lineage,
-      pluginRoots: options.pluginRoots ?? {
-        generator: resolve(workspaceRoot, "packages/generator-plugin"),
-        solver: resolve(workspaceRoot, "packages/solver-plugin"),
-      },
+      pluginRoots,
     })),
     startExhibition: ({ experimentId, seed, exhibitionId, generatorCommit, solverCommit }) => startExhibitionMatch({
       experimentId, seed, exhibitionId, generatorCommit, solverCommit,

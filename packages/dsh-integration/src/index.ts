@@ -952,6 +952,12 @@ export class DeterministicFakeHarnessAdapter implements HarnessAdapter {
   }
 
   async evolvePlugin(request: HarnessEvolutionRequest): Promise<HarnessEvolutionResponse> {
+    const sourcePath = join(request.workspace, "src/index.ts");
+    const mutationName = `fakeEvolution${createHash("sha256").update(`${request.role}:${request.attemptId}`).digest("hex").slice(0, 12)}`;
+    const source = readFileSync(sourcePath, "utf8");
+    if (!source.includes(`export const ${mutationName} =`)) {
+      writeFileSync(sourcePath, `${source}\nexport const ${mutationName} = ${JSON.stringify(request.attemptId)};\n`);
+    }
     return {
       hypothesis: `${request.role} 第 ${request.generation} 代确定性候选`,
       strategyPlan: `尝试 ${request.attemptId}，保持协议与资源边界。`,
