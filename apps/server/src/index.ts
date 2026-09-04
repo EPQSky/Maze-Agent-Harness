@@ -2,7 +2,14 @@ import { resolve } from "node:path";
 import { Socket } from "node:net";
 import { createArenaServer, installPersistentShutdownHandlers } from "./app.js";
 import { createProductionHarnessAdapter } from "./production-harness.js";
-import { DockerMatchProfileCommandFactory, DockerTrustedCandidateTestRunner, HarnessMatchProfileInstaller, NativePluginMatchRunner } from "@maze-arena/match-profile";
+import {
+  DockerMatchProfileCommandFactory,
+  DockerPairedEvaluationRunner,
+  DockerTrustedCandidateTestRunner,
+  HarnessMatchProfileInstaller,
+  MATCH_PROFILE_POLICY_DIGEST,
+  NativePluginMatchRunner,
+} from "@maze-arena/match-profile";
 import { isSensitiveProviderOptionName } from "@maze-arena/contracts";
 import type { FastifyRequest } from "fastify";
 
@@ -175,6 +182,7 @@ async function main(): Promise<void> {
     roleBundles: { generator: generatorPlugin, solver: solverPlugin },
   }).prepare();
   const matchRunner = new NativePluginMatchRunner(new DockerMatchProfileCommandFactory(matchImage, trustedRoot));
+  const versionedMatchRunner = new DockerPairedEvaluationRunner(matchImage, trustedRoot);
   let startupCommitted = startupHandshakeFd === undefined;
   const server = createArenaServer({
     databasePath,
@@ -182,6 +190,10 @@ async function main(): Promise<void> {
     harnessAdapter,
     matchRunner,
     candidateTestRunner: new DockerTrustedCandidateTestRunner(matchImage),
+    pairedEvaluationRunner: versionedMatchRunner,
+    versionedMatchRunner,
+    matchImageDigest: matchImage,
+    resourcePolicyDigest: MATCH_PROFILE_POLICY_DIGEST,
     webRoot,
     startupCommitted: () => startupCommitted,
     logger: {

@@ -26,8 +26,19 @@ import {
   type MatchResult,
   type MatchScore,
   type MazeSnapshot,
+  type SolverAction,
+  type SolverObservation,
   validateMaze,
 } from "@maze-arena/engine";
+import {
+  evaluateAsyncSolverPair,
+  evaluateGeneratorPair,
+  shortestPathLength,
+  type EvaluationCase,
+  type FrozenEvaluationContext,
+  type GeneratorPairEvaluation,
+  type SolverPairEvaluation,
+} from "@maze-arena/evaluation";
 
 export const MATCH_PROFILE_POLICY = Object.freeze({
   memoryBytes: 128 * 1024 * 1024,
@@ -39,6 +50,9 @@ export const MATCH_PROFILE_POLICY = Object.freeze({
   outputBytes: MATCH_OUTPUT_LIMIT_BYTES,
   user: "65532:65532",
 });
+
+export const MATCH_PROFILE_POLICY_DIGEST = `sha256-${createHash("sha256")
+  .update(JSON.stringify(MATCH_PROFILE_POLICY)).digest("hex")}`;
 
 export type MatchProfileFailureCode =
   | "PLUGIN_LOAD_FAILED" | "CAPABILITY_INVALID" | "PROTOCOL_INVALID" | "OUTPUT_LIMIT"
@@ -258,6 +272,9 @@ export class DockerMatchProfileCommandFactory implements MatchProfileCommandFact
   constructor(
     private readonly image: string,
     private readonly harnessHome: string,
+    private readonly executable = "docker",
+    private readonly environment: NodeJS.ProcessEnv = {},
+    private readonly monitorCpu = true,
   ) {
     assertImmutableImageReference(image);
   }
@@ -267,8 +284,10 @@ export class DockerMatchProfileCommandFactory implements MatchProfileCommandFact
     const expectedDigest = readFileSync(`${trustedRoot}.sha256`, "utf8").trim();
     if (hashDirectory(trustedRoot) !== expectedDigest) throw new Error(`冻结 Match Profile 快照摘要不匹配：${role}`);
     const containerName = `maze-match-${role}-${randomBytes(12).toString("hex")}`;
+    const commandEnvironment = { PATH: process.env.PATH, ...this.environment };
     return {
-      executable: "docker",
+      executable: this.executable,
+      environment: commandEnvironment,
       args: [
         "run", "--rm", "--name", containerName, "--network=none", "--read-only", `--user=${MATCH_PROFILE_POLICY.user}`,
         "--memory=128m", "--memory-swap=128m", "--cpus=1", "--ulimit=cpu=2:2", "--pids-limit=64",
@@ -281,17 +300,480 @@ export class DockerMatchProfileCommandFactory implements MatchProfileCommandFact
       ],
       cleanup: {
         identity: containerName,
-        remove: { executable: "docker", args: ["rm", "-f", containerName], timeoutMs: 2_000 },
-        verifyAbsent: { executable: "docker", args: ["inspect", containerName], timeoutMs: 2_000 },
+        remove: { executable: this.executable, args: ["rm", "-f", containerName], environment: commandEnvironment, timeoutMs: 2_000 },
+        verifyAbsent: { executable: this.executable, args: ["inspect", containerName], environment: commandEnvironment, timeoutMs: 2_000 },
       },
-      cpuMonitor: {
+      cpuMonitor: this.monitorCpu ? {
         dockerSocketPath: process.env.DOCKER_HOST?.startsWith("unix://")
           ? process.env.DOCKER_HOST.slice("unix://".length) : "/var/run/docker.sock",
         containerIdentity: containerName,
         limitUsec: MATCH_PROFILE_POLICY.cpuSeconds * 1_000_000,
+      } : undefined,
+    };
+  }
+}
+
+export interface DockerPairedEvaluationInput {
+  role: MatchPluginRole;
+  protocolVersion: typeof MATCH_PROTOCOL_VERSION;
+  candidate: { commit: string; root: string };
+  champion: { commit: string; root: string };
+  opponent: { commit: string; root: string };
+  cases: readonly EvaluationCase[];
+  context: FrozenEvaluationContext;
+}
+
+export interface PairedEvaluationRunner {
+  evaluate(input: DockerPairedEvaluationInput): Promise<GeneratorPairEvaluation | SolverPairEvaluation>;
+}
+
+export interface VersionedMatchRunner {
+  runVersioned(input: {
+    seed: string;
+    generator: { commit: string; root: string };
+    solver: { commit: string; root: string };
+    onEvents?: (events: readonly MatchEvent[]) => Promise<void> | void;
+  }): Promise<MatchResult>;
+}
+
+interface PrivateVersionSnapshot {
+  commit: string;
+  root: string;
+  contentSha256: string;
+}
+
+interface GitTreeEntry {
+  mode: string;
+  object: string;
+  size: number;
+  path: string;
+}
+
+interface PrivateSnapshotOptions {
+  gitExecutable?: string;
+  remove?: (root: string) => void;
+}
+
+export async function withPrivateGitCommitSnapshot<T>(
+  version: { commit: string; root: string },
+  operation: (snapshot: PrivateVersionSnapshot) => Promise<T> | T,
+  options: PrivateSnapshotOptions = {},
+): Promise<T> {
+  if (!/^[0-9a-f]{40}$/i.test(version.commit)) throw new Error("版本化 Match Profile 必须使用不可变 Git 提交身份");
+  const gitExecutable = options.gitExecutable ?? "git";
+  const repository = realpathSync(resolve(version.root));
+  const topLevel = runGitBytes(gitExecutable, repository, ["rev-parse", "--show-toplevel"]).toString("utf8").trim();
+  if (realpathSync(topLevel) !== repository) throw new Error("版本化 Match Profile 根目录必须是独立 Git 工作树根");
+  const resolved = runGitBytes(gitExecutable, repository, ["rev-parse", `${version.commit}^{commit}`]).toString("utf8").trim();
+  if (resolved !== version.commit) throw new Error("版本化 Match Profile 提交不属于指定 Git 对象库");
+  const entries = parseGitTree(runGitBytes(gitExecutable, repository, ["ls-tree", "-rz", "--full-tree", "-l", version.commit]));
+  validateGitTree(entries);
+  const snapshotRoot = mkdtempSync(join(tmpdir(), "maze-version-snapshot-"));
+  let primaryError: Error | undefined;
+  try {
+    chmodSync(snapshotRoot, 0o700);
+    const archive = runGitBytes(gitExecutable, repository, ["archive", "--format=tar", version.commit], 8 * 1024 * 1024);
+    validateGitArchive(archive, entries);
+    const extraction = spawnSync("tar", ["--extract", "--directory", snapshotRoot, "--no-same-owner", "--no-same-permissions"], {
+      input: archive, encoding: null, maxBuffer: 8 * 1024 * 1024,
+    });
+    if (extraction.status !== 0) throw new Error("无法展开版本化 Match Profile 提交归档");
+    verifyExtractedGitTree(gitExecutable, repository, snapshotRoot, entries);
+    const snapshot = { commit: version.commit, root: snapshotRoot, contentSha256: hashDirectory(snapshotRoot) };
+    return await operation(snapshot);
+  } catch (error) {
+    primaryError = error as Error;
+    throw error;
+  } finally {
+    try {
+      (options.remove ?? ((root) => rmSync(root, { recursive: true, force: true })))(snapshotRoot);
+      if (existsSync(snapshotRoot)) throw new Error("版本化 Match Profile 私有快照清理后仍然存在");
+    } catch (cleanupError) {
+      throw primaryError
+        ? new AggregateError([primaryError, cleanupError as Error], `${primaryError.message}；且私有提交快照清理失败`)
+        : cleanupError;
+    }
+  }
+}
+
+function validateGitArchive(archive: Buffer, entries: readonly GitTreeEntry[]): void {
+  const listed = spawnSync("tar", ["--list", "--file=-"], { input: archive, encoding: "utf8", maxBuffer: 2 * 1024 * 1024 });
+  if (listed.status !== 0) throw new Error("版本化 Match Profile 提交归档无法读取");
+  const archiveFiles = listed.stdout.split("\n").filter((path) => path && !path.endsWith("/")).sort();
+  for (const path of archiveFiles) {
+    const segments = path.split("/");
+    if (path.startsWith("/") || segments.some((segment) => !segment || segment === "." || segment === "..")
+      || /[\0\r\n\t]/.test(path) || segments[0] === ".git") {
+      throw new Error("版本化 Match Profile 提交归档包含非法路径");
+    }
+  }
+  if (JSON.stringify(archiveFiles) !== JSON.stringify(entries.map(({ path }) => path).sort())) {
+    throw new Error("版本化 Match Profile 提交归档条目与 Git tree 不一致");
+  }
+}
+
+function runGitBytes(executable: string, repository: string, args: string[], maxBuffer = 2 * 1024 * 1024): Buffer {
+  const result = spawnSync(executable, ["-C", repository, ...args], {
+    encoding: null, maxBuffer, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" },
+  });
+  if (result.status !== 0 || !result.stdout) throw new Error(`无法读取版本化 Match Profile Git 对象：${args[0]}`);
+  return result.stdout;
+}
+
+function parseGitTree(output: Buffer): GitTreeEntry[] {
+  return output.toString("utf8").split("\0").filter(Boolean).map((record) => {
+    const match = /^(\d{6}) (\S+) ([0-9a-f]+)\s+(\d+|-)\t(.+)$/s.exec(record);
+    if (!match) throw new Error("版本化 Match Profile Git tree 输出非法");
+    return { mode: match[1]!, object: match[3]!, size: Number(match[4]), path: match[5]! };
+  });
+}
+
+function validateGitTree(entries: readonly GitTreeEntry[]): void {
+  let totalBytes = 0;
+  if (entries.length === 0 || entries.length > 256) throw new Error("版本化 Match Profile 提交文件数量超出冻结边界");
+  for (const entry of entries) {
+    const segments = entry.path.split("/");
+    if (entry.mode !== "100644" && entry.mode !== "100755") {
+      throw new Error("版本化 Match Profile 提交包含符号链接、子模块或特殊文件");
+    }
+    if (!Number.isSafeInteger(entry.size) || entry.size < 0 || entry.size > 2 * 1024 * 1024
+      || entry.path.startsWith("/") || segments.some((segment) => !segment || segment === "." || segment === "..")
+      || /[\0\r\n\t]/.test(entry.path) || segments[0] === ".git") {
+      throw new Error("版本化 Match Profile 提交包含非法路径或文件大小");
+    }
+    totalBytes += entry.size;
+  }
+  if (totalBytes > 5 * 1024 * 1024) throw new Error("版本化 Match Profile 提交总大小超出冻结边界");
+}
+
+function verifyExtractedGitTree(
+  gitExecutable: string, repository: string, snapshotRoot: string, entries: readonly GitTreeEntry[],
+): void {
+  const actual = versionedWorkingTreeFiles(snapshotRoot).sort();
+  const expected = entries.map(({ path }) => path).sort();
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error("版本化 Match Profile 归档条目与 Git tree 不一致");
+  for (const entry of entries) {
+    const path = join(snapshotRoot, ...entry.path.split("/"));
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== entry.size) {
+      throw new Error("版本化 Match Profile 归档包含非法条目类型或大小");
+    }
+    const blob = runGitBytes(gitExecutable, repository, ["cat-file", "blob", entry.object], entry.size + 1);
+    if (!blob.equals(readFileSync(path))) throw new Error("版本化 Match Profile 归档内容与 Git blob 不一致");
+  }
+}
+
+export class DockerPairedEvaluationRunner implements PairedEvaluationRunner, VersionedMatchRunner {
+  constructor(
+    private readonly image: string,
+    private readonly harnessHome: string,
+    private readonly executable = "docker",
+    private readonly environment: NodeJS.ProcessEnv = {},
+    private readonly monitorCpu = true,
+    private readonly privateSnapshotOptions: PrivateSnapshotOptions = {},
+  ) {
+    assertImmutableImageReference(image);
+  }
+
+  async evaluate(input: DockerPairedEvaluationInput): Promise<GeneratorPairEvaluation | SolverPairEvaluation> {
+    this.assertFrozenInput(input);
+    return withPrivateGitCommitSnapshot(input.candidate, (candidate) =>
+      withPrivateGitCommitSnapshot(input.champion, (champion) =>
+        withPrivateGitCommitSnapshot(input.opponent, async (opponent) => {
+          if (input.role === "generator") {
+            return evaluateGeneratorPair({
+              candidate: this.generator(candidate),
+              champion: this.generator(champion),
+              solver: {
+                version: opponent.commit,
+                solve: (maze) => this.solveDeterministically(opponent, "paired-generator", maze).then(({ rawScore }) => rawScore),
+              },
+              cases: input.cases,
+              context: input.context,
+            });
+          }
+          return evaluateAsyncSolverPair({
+            candidate: this.solver(candidate),
+            champion: this.solver(champion),
+            generator: {
+              version: opponent.commit,
+              generate: (seed) => this.generateDeterministically(opponent, seed).then(({ maze }) => maze),
+            },
+            cases: input.cases,
+            context: input.context,
+          });
+        }, this.privateSnapshotOptions), this.privateSnapshotOptions), this.privateSnapshotOptions);
+  }
+
+  async runVersioned(input: {
+    seed: string;
+    generator: { commit: string; root: string };
+    solver: { commit: string; root: string };
+    onEvents?: (events: readonly MatchEvent[]) => Promise<void> | void;
+  }): Promise<MatchResult> {
+    this.assertCommit(input.generator.commit);
+    this.assertCommit(input.solver.commit);
+    return withPrivateGitCommitSnapshot(input.generator, (generator) =>
+      withPrivateGitCommitSnapshot(input.solver, async (solver) => {
+        const generatorHome = await materializeVersionedProfile(this.harnessHome, "generator", generator.root);
+        let solverHome: string | undefined;
+        try {
+          solverHome = await materializeVersionedProfile(this.harnessHome, "solver", solver.root);
+          const runner = new NativePluginMatchRunner({
+            create: (role) => new DockerMatchProfileCommandFactory(
+              this.image,
+              role === "generator" ? generatorHome : solverHome!,
+              this.executable,
+              this.environment,
+              this.monitorCpu,
+            ).create(role),
+          });
+          return await runner.run(input.seed, input.onEvents);
+        } finally {
+          removeVersionedProfile(generatorHome, "generator");
+          if (solverHome) removeVersionedProfile(solverHome, "solver");
+        }
+      }, this.privateSnapshotOptions), this.privateSnapshotOptions);
+  }
+
+  private generator(version: PrivateVersionSnapshot) {
+    return {
+      version: version.commit,
+      generate: async (seed: string) => {
+        const generated = await this.generateDeterministically(version, seed);
+        return { maze: generated.maze, protocolValid: true, resourceCompliant: true, trace: generated.events };
       },
     };
   }
+
+  private solver(version: PrivateVersionSnapshot) {
+    return {
+      version: version.commit,
+      solve: async (seed: string, maze: MazeSnapshot) => this.solveDeterministically(version, seed, maze),
+    };
+  }
+
+  private async generateDeterministically(version: PrivateVersionSnapshot, seed: string): Promise<{ maze: MazeSnapshot; events: MatchEvent[] }> {
+    return this.repeatDeterministically(() => this.withVersionedProcess("generator", version, (profileProcess) => runGeneratorProfile(profileProcess, seed)));
+  }
+
+  private async solveDeterministically(version: PrivateVersionSnapshot, seed: string, maze: MazeSnapshot): Promise<{
+    score: { solved: boolean; extraActions: number; illegalActions: number };
+    rawScore: MatchScore;
+    trace: Array<{ observation: SolverObservation; action: SolverAction }>;
+  }> {
+    const result = await this.repeatDeterministically(() => this.withVersionedProcess("solver", version, (profileProcess) => runSolverProfile(profileProcess, seed, maze)));
+    return {
+      score: {
+        solved: result.score.solved,
+        extraActions: result.score.solved ? Math.max(0, result.score.actions - shortestPathLength(maze)) : 0,
+        illegalActions: result.score.illegalMoves,
+      },
+      rawScore: result.score,
+      trace: result.trace,
+    };
+  }
+
+  private async repeatDeterministically<T>(execute: () => Promise<T>): Promise<T> {
+    const first = await execute();
+    const second = await execute();
+    if (JSON.stringify(first) !== JSON.stringify(second)) {
+      throw new MatchProfileError("PROTOCOL_INVALID", "Match Profile 重复执行产生非确定性权威结果");
+    }
+    return first;
+  }
+
+  private async withVersionedProcess<T>(
+    role: MatchPluginRole,
+    version: PrivateVersionSnapshot,
+    operation: (profileProcess: MatchProfileProcess) => Promise<T>,
+  ): Promise<T> {
+    if (hashDirectory(version.root) !== version.contentSha256) throw new Error("版本化 Match Profile 私有快照在执行前发生漂移");
+    const home = await materializeVersionedProfile(this.harnessHome, role, version.root);
+    let profileProcess: MatchProfileProcess | undefined;
+    let primaryError: Error | undefined;
+    try {
+      profileProcess = new MatchProfileProcess(
+        new DockerMatchProfileCommandFactory(this.image, home, this.executable, this.environment, this.monitorCpu).create(role), role,
+      );
+      const result = await operation(profileProcess);
+      await profileProcess.finalize();
+      if (hashDirectory(version.root) !== version.contentSha256) throw new Error("版本化 Match Profile 私有快照在执行期间发生漂移");
+      return result;
+    } catch (error) {
+      primaryError = error as Error;
+      throw error;
+    } finally {
+      let cleanupError: unknown;
+      try { await profileProcess?.close(); }
+      catch (error) { cleanupError = error; }
+      removeVersionedProfile(home, role);
+      if (cleanupError) {
+        throw primaryError
+          ? new AggregateError([primaryError, cleanupError as Error], `${primaryError.message}；且 Match Profile 清理失败`)
+          : cleanupError;
+      }
+    }
+  }
+
+  private assertFrozenInput(input: DockerPairedEvaluationInput): void {
+    if (input.protocolVersion !== MATCH_PROTOCOL_VERSION) throw new Error("配对评测协议版本与冻结 Match Profile 不一致");
+    if (input.context.imageDigest !== this.image) throw new Error("配对评测镜像摘要与冻结上下文不一致");
+    if (input.context.resourcePolicyDigest !== MATCH_PROFILE_POLICY_DIGEST) throw new Error("配对评测资源策略与冻结上下文不一致");
+    if (input.context.opponentVersion !== input.opponent.commit) throw new Error("配对评测对手提交与冻结上下文不一致");
+    if (input.cases.length === 0) throw new Error("配对评测至少需要一个有序案例");
+    for (let index = 1; index < input.cases.length; index += 1) {
+      if (input.cases[index - 1]!.id.localeCompare(input.cases[index]!.id) >= 0) {
+        throw new Error("配对评测案例必须按唯一标识严格有序");
+      }
+    }
+    for (const version of [input.candidate, input.champion, input.opponent]) {
+      this.assertCommit(version.commit);
+    }
+  }
+
+  private assertCommit(commit: string): void {
+    if (!/^[0-9a-f]{40}$/i.test(commit)) throw new Error("版本化 Match Profile 必须使用不可变 Git 提交身份");
+  }
+
+}
+
+function versionedWorkingTreeFiles(root: string, current = root): string[] {
+  return readdirSync(current, { withFileTypes: true }).flatMap((entry) => {
+    if (current === root && entry.name === ".git") return [];
+    const path = join(current, entry.name);
+    return entry.isDirectory() ? versionedWorkingTreeFiles(root, path) : [relative(root, path).split(sep).join("/")];
+  });
+}
+
+function removeVersionedProfile(home: string, role: MatchPluginRole): void {
+  const snapshot = join(home, "snapshots", role);
+  if (existsSync(snapshot)) thawTree(snapshot);
+  const digest = `${snapshot}.sha256`;
+  if (existsSync(digest)) chmodSync(digest, 0o600);
+  rmSync(home, { recursive: true, force: true });
+}
+
+async function materializeVersionedProfile(harnessHome: string, role: MatchPluginRole, packageRoot: string): Promise<string> {
+  const trustedHome = resolve(harnessHome);
+  const sourceSnapshot = join(trustedHome, "snapshots", role);
+  const expected = readFileSync(`${sourceSnapshot}.sha256`, "utf8").trim();
+  if (hashDirectory(sourceSnapshot) !== expected) throw new Error(`冻结 Match Profile 快照摘要不匹配：${role}`);
+  await validatePluginPackage(packageRoot);
+  const home = mkdtempSync(join(tmpdir(), `maze-paired-${role}-`));
+  try {
+    chmodSync(home, 0o755);
+    const snapshot = join(home, "snapshots", role);
+    cpSync(sourceSnapshot, snapshot, { recursive: true });
+    thawTree(snapshot);
+    const artifactStaging = join(home, ".artifacts");
+    mkdirSync(artifactStaging, { recursive: true });
+    const artifact = await createInstallArtifact(packageRoot, artifactStaging);
+    await validateInstallArtifact(artifact);
+    const artifactTarget = join(snapshot, "artifacts", artifact.split(sep).at(-1)!);
+    cpSync(artifact, artifactTarget, { recursive: true });
+    const name = packageName(artifact);
+    const profile = profileName(role);
+    const profileRoot = join(snapshot, "profiles", profile);
+    const installed = join(profileRoot, "node_modules", ...name.split("/"));
+    if (!existsSync(installed)) throw new Error(`冻结 Profile 未安装预期角色包：${name}`);
+    rmSync(installed, { recursive: true, force: true });
+    cpSync(artifactTarget, installed, { recursive: true });
+    const manifestPath = join(profileRoot, "package.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, any>;
+    if (!record(manifest.dependencies) || !(name in manifest.dependencies)) throw new Error(`冻结 Profile 依赖缺少角色包：${name}`);
+    manifest.dependencies[name] = `file:/arena/artifacts/${artifact.split(sep).at(-1)!}`;
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    freezeTree(snapshot);
+    writeFileSync(`${snapshot}.sha256`, `${hashDirectory(snapshot)}\n`, { mode: 0o444 });
+    rmSync(artifactStaging, { recursive: true, force: true });
+    return home;
+  } catch (error) {
+    removeVersionedProfile(home, role);
+    throw error;
+  }
+}
+
+function thawTree(root: string): void {
+  for (const directory of [root, ...walkDirectories(root)].sort((left, right) => left.length - right.length)) chmodSync(directory, 0o755);
+  for (const path of walk(root)) chmodSync(path, 0o644);
+}
+
+function freezeTree(root: string): void {
+  for (const path of walk(root)) chmodSync(path, 0o444);
+  for (const directory of walkDirectories(root).sort((left, right) => right.length - left.length)) chmodSync(directory, 0o555);
+  chmodSync(root, 0o555);
+}
+
+async function runGeneratorProfile(profileProcess: MatchProfileProcess, seed: string): Promise<{ maze: MazeSnapshot; events: MatchEvent[] }> {
+  const passages: MazeSnapshot["passages"] = [];
+  const events: MatchEvent[] = [];
+  let sequence = 0;
+  let response = generatorPayload(await profileProcess.request(request("generator", ++sequence, {
+    type: "generator.start", seed, rules: { size: GRID_SIZE, start: { ...START }, goal: { ...GOAL } },
+  })));
+  while (response.type !== "generator.complete") {
+    const key = passageKey(response.from, response.to);
+    if (passages.some(({ from, to }) => passageKey(from, to) === key)) {
+      throw new MatchProfileError("PROTOCOL_INVALID", "生成器重复凿通边");
+    }
+    passages.push({ from: { ...response.from }, to: { ...response.to } });
+    events.push({ type: "maze.carved", protocolVersion: 1, sequence: events.length + 1,
+      from: { ...response.from }, to: { ...response.to } });
+    if (passages.length > GRID_SIZE * (GRID_SIZE - 1) * 2) {
+      throw new MatchProfileError("PROTOCOL_INVALID", "生成器凿通数量超出网格上限");
+    }
+    response = generatorPayload(await profileProcess.request(request("generator", ++sequence, { type: "generator.next" })));
+  }
+  const maze: MazeSnapshot = { size: GRID_SIZE, start: { ...START }, goal: { ...GOAL }, passages };
+  const validation = validateMaze(maze);
+  if (!validation.valid) throw new MatchProfileError("PROTOCOL_INVALID", validation.reason ?? "生成迷宫非法");
+  events.push({ type: "maze.completed", protocolVersion: 1, sequence: events.length + 1, passageCount: passages.length });
+  return { maze, events };
+}
+
+async function runSolverProfile(profileProcess: MatchProfileProcess, seed: string, maze: MazeSnapshot): Promise<{
+  score: MatchScore;
+  trace: Array<{ observation: SolverObservation; action: SolverAction }>;
+}> {
+  const validation = validateMaze(maze);
+  if (!validation.valid) throw new MatchProfileError("PROTOCOL_INVALID", validation.reason ?? "冻结迷宫非法");
+  let sequence = 0;
+  const ready = solverPayload(await profileProcess.request(request("solver", ++sequence, {
+    type: "solver.start", start: { ...START }, goal: { ...GOAL },
+  })));
+  if (ready.type !== "solver.ready") throw new MatchProfileError("PROTOCOL_INVALID", "求解器初始化响应非法");
+  let position: Coordinate = { ...START };
+  let previousAction: { direction: "north" | "east" | "south" | "west"; moved: boolean } | null = null;
+  let actions = 0;
+  let illegalMoves = 0;
+  let backtracks = 0;
+  const trace: Array<{ observation: SolverObservation; action: SolverAction }> = [];
+  while (!same(position, GOAL) && actions < MAX_SOLVER_STEPS) {
+    const open = openDirections(maze, position);
+    const observation: SolverObservation = {
+      position: { ...position }, start: { ...START }, goal: { ...GOAL }, openDirections: [...open],
+      remainingSteps: MAX_SOLVER_STEPS - actions, previousAction,
+    };
+    const next = solverPayload(await profileProcess.request(request("solver", ++sequence, {
+      type: "solver.next", position: observation.position, start: observation.start, goal: observation.goal,
+      openDirections: observation.openDirections, remainingSteps: observation.remainingSteps, previousAction: observation.previousAction,
+    })));
+    if (next.type !== "solver.move") throw new MatchProfileError("PROTOCOL_INVALID", "求解器动作响应非法");
+    const action: SolverAction = { direction: next.direction, kind: next.kind };
+    trace.push({ observation, action });
+    const candidate = moved(position, next.direction);
+    const didMove = open.includes(next.direction);
+    actions += 1;
+    if (didMove) position = candidate;
+    else illegalMoves += 1;
+    if (next.kind === "backtrack") backtracks += 1;
+    previousAction = { direction: next.direction, moved: didMove };
+  }
+  return {
+    score: { solved: same(position, GOAL), actions, illegalMoves, backtracks, remainingSteps: MAX_SOLVER_STEPS - actions },
+    trace,
+  };
 }
 
 function freezeProfileSnapshot(home: string, role: MatchPluginRole): void {
@@ -786,7 +1268,8 @@ export async function validatePluginPackage(packageRoot: string, lineageBaseline
     throw new Error("测试、文档与 lineage 不得进入 npm pack 构建产物");
   }
   const all = walk(root).filter((path) => !path.includes(`${sep}node_modules${sep}`));
-  const source = all.filter((path) => /(?<!\.d)\.[cm]?[jt]sx?$/i.test(path));
+  const source = all.filter((path) => !relative(root, path).startsWith(`dist${sep}`)
+    && /(?<!\.d)\.[cm]?[jt]sx?$/i.test(path));
   const sourceSet = new Set(source);
   const packedSet = new Set(packed.map(({ path }) => normalizeLocal(path)));
   const lineage = all.filter((path) => relative(root, path).startsWith(`lineage${sep}`));

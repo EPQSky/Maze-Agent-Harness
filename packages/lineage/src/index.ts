@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
@@ -26,6 +26,26 @@ export interface CandidateCommit {
   promotionTag?: string;
 }
 
+export interface PreparedCandidateCommitInput {
+  experimentId: string;
+  role: PluginRole;
+  sourceRoot: string;
+  attemptId: string;
+  hypothesis: string;
+  lineageBaseline?: LineageBaseline;
+}
+
+export interface CandidateResultInput {
+  experimentId: string;
+  role: PluginRole;
+  attemptId: string;
+  commit: string;
+  hypothesis: string;
+  resultSummary: string;
+  outcome: CandidateCommitInput["outcome"];
+  generation?: number;
+}
+
 export interface LineageEntry {
   commit: string;
   subject: string;
@@ -49,6 +69,18 @@ interface PromotionRow {
   state: "pending" | "complete";
 }
 
+interface CandidateResultRow {
+  experiment_id: string;
+  role: PluginRole;
+  attempt_id: string;
+  target_commit: string;
+  hypothesis: string;
+  result_summary: string;
+  outcome: CandidateCommitInput["outcome"];
+  generation: number | null;
+  metadata_digest: string;
+}
+
 export class LineageTamperError extends Error {
   constructor(message: string) { super(`插件谱系完整性失败：${message}`); this.name = "LineageTamperError"; }
 }
@@ -70,6 +102,12 @@ export class PluginLineageRepository {
       tag_name TEXT NOT NULL UNIQUE, target_commit TEXT NOT NULL, metadata_json TEXT NOT NULL,
       metadata_digest TEXT NOT NULL, tag_object TEXT, state TEXT NOT NULL,
       PRIMARY KEY (experiment_id, role, generation)
+    );
+    CREATE TABLE IF NOT EXISTS candidate_results (
+      experiment_id TEXT NOT NULL, role TEXT NOT NULL, attempt_id TEXT NOT NULL,
+      target_commit TEXT NOT NULL, hypothesis TEXT NOT NULL, result_summary TEXT NOT NULL,
+      outcome TEXT NOT NULL, generation INTEGER, metadata_digest TEXT NOT NULL,
+      PRIMARY KEY (experiment_id, role, attempt_id)
     );
     CREATE TABLE IF NOT EXISTS lineage_integrity_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT, experiment_id TEXT NOT NULL, role TEXT NOT NULL,
@@ -108,40 +146,69 @@ export class PluginLineageRepository {
   }
 
   async commitCandidate(input: CandidateCommitInput): Promise<CandidateCommit> {
+    const prepared = await this.createCandidate(input);
+    return this.recordCandidateResult({ ...input, commit: prepared.commit });
+  }
+
+  async createCandidate(input: PreparedCandidateCommitInput): Promise<Pick<CandidateCommit, "commit" | "role">> {
     validateIdentity(input.experimentId);
     this.ensureNotBlocked(input.experimentId);
     this.verifyIntegrity(input.experimentId, input.role);
     assertSafeSourceTree(input.sourceRoot);
     await validatePluginPackage(input.sourceRoot, input.lineageBaseline);
     const repository = this.repositoryPath(input.experimentId, input.role);
-    const metadata = canonicalJson({
-      attemptId: input.attemptId, hypothesis: input.hypothesis, resultSummary: input.resultSummary, outcome: input.outcome,
-    });
-    if (input.outcome === "promoted" && (!Number.isSafeInteger(input.generation) || (input.generation ?? 0) < 1)) {
-      throw new Error("晋级候选必须提供正整数代次");
-    }
-    const existing = findCandidateCommit(repository, input.attemptId);
+    const metadata = canonicalJson({ attemptId: input.attemptId, hypothesis: input.hypothesis });
+    const sourceTree = sourceTreeObject(input.sourceRoot);
+    const existing = findCandidateCommits(repository, input.attemptId).find((commit) =>
+      git(repository, ["rev-parse", `${commit}^{tree}`]) === sourceTree
+      && git(repository, ["show", "-s", "--format=%B", commit]).trim() === `candidate: ${input.attemptId}\n\n${metadata}`);
     if (existing) {
-      const message = git(repository, ["show", "-s", "--format=%B", existing]).trim();
-      if (message !== `candidate: ${input.attemptId}\n\n${metadata}`) throw new Error("候选尝试标识与既有 Git 证据冲突");
-      const promotionTag = input.outcome === "promoted"
-        ? this.ensurePromotion(input.experimentId, input.role, input.generation!, existing, {
-          attemptId: input.attemptId, hypothesis: input.hypothesis, resultSummary: input.resultSummary,
-        })
-        : undefined;
-      return { commit: existing, role: input.role, outcome: input.outcome, promotionTag };
+      return { commit: existing, role: input.role };
     }
     replaceWorktree(repository, input.sourceRoot);
     git(repository, ["add", "-A"]);
     git(repository, ["commit", "--allow-empty", "-m", `candidate: ${input.attemptId}`, "-m", metadata]);
     const commit = git(repository, ["rev-parse", "HEAD"]);
-    let promotionTag: string | undefined;
-    if (input.outcome === "promoted") {
-      promotionTag = this.ensurePromotion(input.experimentId, input.role, input.generation!, commit, {
-        attemptId: input.attemptId, hypothesis: input.hypothesis, resultSummary: input.resultSummary,
-      });
+    return { commit, role: input.role };
+  }
+
+  recordCandidateResult(input: CandidateResultInput): CandidateCommit {
+    validateIdentity(input.experimentId);
+    this.ensureNotBlocked(input.experimentId);
+    this.verifyIntegrity(input.experimentId, input.role);
+    if (input.outcome === "promoted" && (!Number.isSafeInteger(input.generation) || (input.generation ?? 0) < 1)) {
+      throw new Error("晋级候选必须提供正整数代次");
     }
-    return { commit, role: input.role, outcome: input.outcome, promotionTag };
+    const repository = this.repositoryPath(input.experimentId, input.role);
+    const resolved = optionalGit(repository, ["rev-parse", `${input.commit}^{commit}`]);
+    if (resolved !== input.commit || !findCandidateCommits(repository, input.attemptId).includes(input.commit)) {
+      throw new Error("候选结果目标与正式谱系提交不一致");
+    }
+    const metadata = canonicalJson({
+      attemptId: input.attemptId, commit: input.commit, hypothesis: input.hypothesis,
+      resultSummary: input.resultSummary, outcome: input.outcome,
+      generation: input.generation ?? null,
+    });
+    const digest = sha256(metadata);
+    const existing = this.database.prepare(`SELECT target_commit, metadata_digest FROM candidate_results
+      WHERE experiment_id = ? AND role = ? AND attempt_id = ?`).get(input.experimentId, input.role, input.attemptId) as
+      { target_commit: string; metadata_digest: string } | undefined;
+    if (existing && (existing.target_commit !== input.commit || existing.metadata_digest !== digest)) {
+      throw new Error("候选结果与既有可信记录冲突");
+    }
+    if (!existing) {
+      this.database.prepare(`INSERT INTO candidate_results
+        (experiment_id, role, attempt_id, target_commit, hypothesis, result_summary, outcome, generation, metadata_digest)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(input.experimentId, input.role, input.attemptId, input.commit, input.hypothesis,
+          input.resultSummary, input.outcome, input.generation ?? null, digest);
+    }
+    const promotionTag = input.outcome === "promoted"
+      ? this.ensurePromotion(input.experimentId, input.role, input.generation!, input.commit, {
+        attemptId: input.attemptId, hypothesis: input.hypothesis, resultSummary: input.resultSummary,
+      })
+      : undefined;
+    return { commit: input.commit, role: input.role, outcome: input.outcome, promotionTag };
   }
 
   ensurePromotion(
@@ -206,6 +273,19 @@ export class PluginLineageRepository {
         this.verifyTag(repository, row);
       }
     }
+    const results = this.database.prepare(`SELECT experiment_id, role, attempt_id, target_commit, hypothesis,
+      result_summary, outcome, generation, metadata_digest FROM candidate_results
+      WHERE experiment_id = ? AND role = ?`).all(experimentId, role) as unknown as CandidateResultRow[];
+    for (const result of results) {
+      const metadata = canonicalJson({
+        attemptId: result.attempt_id, commit: result.target_commit, hypothesis: result.hypothesis,
+        resultSummary: result.result_summary, outcome: result.outcome, generation: result.generation,
+      });
+      if (sha256(metadata) !== result.metadata_digest
+        || !findCandidateCommits(repository, result.attempt_id).includes(result.target_commit)) {
+        this.tampered(experimentId, role, "候选结果记录与 Git 提交身份不一致");
+      }
+    }
   }
 
   listHistory(experimentId: string, role: PluginRole): LineageEntry[] {
@@ -222,12 +302,11 @@ export class PluginLineageRepository {
   listStrategyRecords(experimentId: string, role: PluginRole): StrategyRecord[] {
     this.verifyIntegrity(experimentId, role);
     const repository = this.repositoryPath(experimentId, role);
-    const lines = git(repository, ["log", "--format=%H%x09%s", "--reverse"]).split("\n").filter(Boolean);
+    const completed = this.database.prepare(`SELECT attempt_id, target_commit FROM candidate_results
+      WHERE experiment_id = ? AND role = ? ORDER BY rowid`).all(experimentId, role) as
+      Array<{ attempt_id: string; target_commit: string }>;
     const records: StrategyRecord[] = [];
-    for (const line of lines) {
-      const [commit = "", subject = ""] = line.split("\t");
-      if (!subject.startsWith("candidate: ")) continue;
-      const attemptId = subject.slice("candidate: ".length);
+    for (const { attempt_id: attemptId, target_commit: commit } of completed) {
       if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(attemptId)) {
         return this.tampered(experimentId, role, "候选提交包含非法尝试标识");
       }
@@ -253,11 +332,14 @@ export class PluginLineageRepository {
     const resolved = optionalGit(repository, ["rev-parse", `${commit}^{commit}`]);
     if (!resolved) throw new Error(`插件提交不存在：${commit}`);
     rmSync(destination, { recursive: true, force: true });
-    mkdirSync(destination, { recursive: true });
-    const archive = spawnSync("git", ["-C", repository, "archive", resolved], { encoding: null, maxBuffer: 16 * 1024 * 1024 });
-    if (archive.status !== 0 || !archive.stdout) throw new Error(`无法导出插件提交 ${commit}`);
-    const extract = spawnSync("tar", ["-x", "-C", destination], { input: archive.stdout, encoding: null, maxBuffer: 16 * 1024 * 1024 });
-    if (extract.status !== 0) throw new Error(`无法展开插件提交 ${commit}`);
+    const clone = spawnSync("git", ["clone", "--no-hardlinks", "--no-checkout", repository, destination], {
+      encoding: "utf8", maxBuffer: 16 * 1024 * 1024, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" },
+    });
+    if (clone.status !== 0) throw new Error(`无法克隆插件谱系提交 ${commit}`);
+    git(destination, ["checkout", "--detach", resolved]);
+    if (git(destination, ["status", "--porcelain", "--untracked-files=all"]) !== "") {
+      throw new Error(`插件提交 ${commit} 物化后不是干净工作树`);
+    }
   }
 
   contains(experimentId: string, role: PluginRole, commit: string): boolean {
@@ -398,11 +480,22 @@ function optionalGit(repository: string, args: string[]): string | undefined {
   try { return git(repository, args); } catch { return undefined; }
 }
 
-function findCandidateCommit(repository: string, attemptId: string): string | undefined {
+function findCandidateCommits(repository: string, attemptId: string): string[] {
   const subject = `candidate: ${attemptId}`;
-  const line = git(repository, ["log", "--all", "--format=%H%x09%s"]).split("\n")
-    .find((entry) => entry.slice(41) === subject);
-  return line?.slice(0, 40);
+  return git(repository, ["log", "--all", "--format=%H%x09%s"]).split("\n")
+    .filter((entry) => entry.slice(41) === subject).map((entry) => entry.slice(0, 40));
+}
+
+function sourceTreeObject(sourceRoot: string): string {
+  const temporary = mkdtempSync(join(dirname(sourceRoot), ".maze-tree-"));
+  try {
+    git(temporary, ["init"]);
+    replaceWorktree(temporary, sourceRoot);
+    git(temporary, ["add", "-A"]);
+    return git(temporary, ["write-tree"]);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
 }
 
 function canonicalJson(value: Record<string, unknown>): string {

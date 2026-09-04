@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createServer, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -10,14 +10,17 @@ import type { MatchPluginRole, MatchProtocolRequest } from "@maze-arena/contract
 import { hashHarnessRuntimePayload } from "@maze-arena/dsh-integration";
 import {
   DockerMatchProfileCommandFactory,
+  DockerPairedEvaluationRunner,
   DockerTrustedCandidateTestRunner,
   HarnessMatchProfileInstaller,
+  MATCH_PROFILE_POLICY_DIGEST,
   MatchProfileError,
   MatchProfileProcess,
   NativePluginMatchRunner,
   rebuildTrustedPluginCandidate,
   validatePluginPackage,
   verifyTrustedPluginCandidate,
+  withPrivateGitCommitSnapshot,
   type TrustedCandidateTestRunner,
 } from "./index.js";
 
@@ -31,6 +34,7 @@ const fakeHarnessRuntime = {
 } as const;
 const cleanupFixture = join(packageRoot, "test/fixtures/container-cleanup.mjs");
 const fakeCandidateDocker = join(packageRoot, "test/fixtures/fake-candidate-docker.mjs");
+const fakePairedDocker = join(packageRoot, "test/fixtures/fake-paired-docker.mjs");
 const realDockerTestImage = process.env.MAZE_TEST_DOCKER_IMAGE;
 const realDockerImageAvailable = Boolean(realDockerTestImage)
   && spawnSync("docker", ["image", "inspect", realDockerTestImage!], { stdio: "ignore" }).status === 0;
@@ -92,6 +96,38 @@ function candidateCopy(role: "generator" | "solver" = "generator"): { champion: 
   cpSync(trusted, champion, { recursive: true, filter: (path) => !path.split("/").includes("node_modules") });
   cpSync(trusted, candidate, { recursive: true, filter: (path) => !path.split("/").includes("node_modules") });
   return { champion, candidate, trusted };
+}
+function versionedPluginCopy(role: "generator" | "solver", marker: string): { root: string; commit: string } {
+  const root = join(mkdtempSync(join(tmpdir(), `maze-versioned-${role}-`)), `${role}-plugin`);
+  cpSync(join(workspaceRoot, `packages/${role}-plugin`), root, {
+    recursive: true, filter: (path) => !path.split("/").includes("node_modules"),
+  });
+  writeFileSync(join(root, ".version-marker"), marker);
+  spawnSync("git", ["init", "--initial-branch=main"], { cwd: root });
+  spawnSync("git", ["config", "user.name", "Maze Test"], { cwd: root });
+  spawnSync("git", ["config", "user.email", "test@localhost"], { cwd: root });
+  spawnSync("git", ["add", "-A"], { cwd: root });
+  spawnSync("git", ["commit", "-m", `fixture: ${marker}`], { cwd: root });
+  return { root, commit: spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).stdout.trim() };
+}
+function fakeGit(mode: "archive-fail" | "malicious-tree"): string {
+  const root = mkdtempSync(join(tmpdir(), "maze-fake-git-"));
+  const executable = join(root, "git.mjs");
+  writeFileSync(executable, `#!/usr/bin/env node
+import { spawnSync } from "node:child_process";
+const args = process.argv.slice(2);
+const command = args[2];
+if (${JSON.stringify(mode)} === "archive-fail" && command === "archive") process.exit(23);
+if (${JSON.stringify(mode)} === "malicious-tree" && command === "ls-tree") {
+  process.stdout.write("100644 blob " + "a".repeat(40) + " 4\\t../escape\\0");
+  process.exit(0);
+}
+const result = spawnSync("git", args, { stdio: "inherit" });
+if (result.error) throw result.error;
+process.exit(result.status ?? 1);
+`);
+  chmodSync(executable, 0o755);
+  return executable;
 }
 function dshCommand(home: string, role: MatchPluginRole, marker?: string) {
   return {
@@ -821,6 +857,117 @@ describe("原生插件与正式隔离策略", () => {
   it("生产 Docker 命令允许 registry 端口和无 tag 名称的完整摘要", () => {
     const image = `localhost:5000/maze/match-profile@sha256:${"a".repeat(64)}`;
     expect(() => new DockerMatchProfileCommandFactory(image, "/tmp/match-profile")).not.toThrow();
+  });
+
+  it("候选与冠军从受验证版本树进入独立一次性容器并共享冻结输入身份", async () => {
+    const { home } = await installProfiles();
+    const log = join(mkdtempSync(join(tmpdir(), "maze-paired-docker-")), "calls.jsonl");
+    const image = `maze-match@sha256:${"a".repeat(64)}`;
+    const runner = new DockerPairedEvaluationRunner(image, home, fakePairedDocker, {
+      MAZE_FAKE_DOCKER_LOG: log,
+      MAZE_FAKE_DSH: fakeDsh,
+    }, false);
+    const candidate = versionedPluginCopy("generator", "candidate");
+    const champion = versionedPluginCopy("generator", "champion");
+    const opponent = versionedPluginCopy("solver", "opponent");
+    const evaluation = await runner.evaluate({
+      role: "generator",
+      protocolVersion: 1,
+      candidate,
+      champion,
+      opponent,
+      cases: [{ id: "public-01", seed: "same-seed", visibility: "public" }],
+      context: { opponentVersion: opponent.commit, imageDigest: image, resourcePolicyDigest: MATCH_PROFILE_POLICY_DIGEST },
+    });
+    expect(evaluation).toMatchObject({
+      candidateVersion: candidate.commit, championVersion: champion.commit,
+      context: { opponentVersion: opponent.commit, imageDigest: image, resourcePolicyDigest: MATCH_PROFILE_POLICY_DIGEST },
+      publicPrimaryRegressed: false, promote: false,
+    });
+    const calls = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
+    const runs = calls.filter(([command]) => command === "run");
+    expect(runs).toHaveLength(8);
+    const names = runs.map((args) => args[args.indexOf("--name") + 1]);
+    expect(new Set(names).size).toBe(runs.length);
+    for (const args of runs) {
+      expect(args).toEqual(expect.arrayContaining([
+        "--network=none", "--read-only", "--user=65532:65532", "--memory=128m", "--memory-swap=128m",
+        "--cpus=1", "--ulimit=cpu=2:2", "--pids-limit=64", "--security-opt=no-new-privileges", "--cap-drop=ALL", image,
+      ]));
+    }
+  }, 30_000);
+
+  it("配对评测只读取提交对象，拒绝目录与提交错配且忽略同尺寸同 mtime 工作树漂移", async () => {
+    const { home } = await installProfiles();
+    const image = `maze-match@sha256:${"a".repeat(64)}`;
+    const log = join(mkdtempSync(join(tmpdir(), "maze-binding-docker-")), "calls.jsonl");
+    const runner = new DockerPairedEvaluationRunner(image, home, fakePairedDocker, {
+      MAZE_FAKE_DSH: fakeDsh, MAZE_FAKE_DOCKER_LOG: log,
+    }, false);
+    const candidate = versionedPluginCopy("generator", "candidate-binding");
+    const champion = versionedPluginCopy("generator", "champion-binding");
+    const opponent = versionedPluginCopy("solver", "opponent-binding");
+    const base = {
+      role: "generator" as const, protocolVersion: 1 as const, candidate, champion, opponent,
+      cases: [{ id: "public-01", seed: "same-seed", visibility: "public" as const }],
+      context: { opponentVersion: opponent.commit, imageDigest: image, resourcePolicyDigest: MATCH_PROFILE_POLICY_DIGEST },
+    };
+    await expect(runner.evaluate({ ...base, candidate: { ...candidate, commit: champion.commit } }))
+      .rejects.toThrow(/Git 对象|指定 Git 对象库/);
+    await expect(runner.evaluate({ ...base, champion: { commit: champion.commit, root: candidate.root } }))
+      .rejects.toThrow(/Git 对象|指定 Git 对象库/);
+    const payload = join(candidate.root, "dist/index.js");
+    const original = readFileSync(payload);
+    const timestamps = statSync(payload);
+    spawnSync("git", ["config", "core.trustctime", "false"], { cwd: candidate.root });
+    writeFileSync(payload, Buffer.alloc(original.length, "E"));
+    utimesSync(payload, timestamps.atime, timestamps.mtime);
+    await expect(runner.evaluate(base)).resolves.toMatchObject({ candidateVersion: candidate.commit });
+    expect(readFileSync(payload).subarray(0, 4).toString()).toBe("EEEE");
+  }, 30_000);
+
+  it("私有提交快照拒绝归档失败、非法路径、符号链接与 submodule，并确认清理失败", async () => {
+    const valid = versionedPluginCopy("generator", "snapshot-boundary");
+    await expect(withPrivateGitCommitSnapshot(valid, async () => undefined, { gitExecutable: fakeGit("archive-fail") }))
+      .rejects.toThrow(/Git 对象：archive/);
+    await expect(withPrivateGitCommitSnapshot(valid, async () => undefined, { gitExecutable: fakeGit("malicious-tree") }))
+      .rejects.toThrow(/非法路径/);
+
+    const linked = versionedPluginCopy("generator", "snapshot-link");
+    symlinkSync("package.json", join(linked.root, "linked-package"));
+    spawnSync("git", ["add", "linked-package"], { cwd: linked.root });
+    spawnSync("git", ["commit", "-m", "fixture: symlink"], { cwd: linked.root });
+    linked.commit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: linked.root, encoding: "utf8" }).stdout.trim();
+    await expect(withPrivateGitCommitSnapshot(linked, async () => undefined)).rejects.toThrow(/符号链接/);
+
+    const submodule = versionedPluginCopy("generator", "snapshot-submodule");
+    spawnSync("git", ["update-index", "--add", "--cacheinfo", `160000,${submodule.commit},nested-module`], { cwd: submodule.root });
+    spawnSync("git", ["commit", "-m", "fixture: submodule"], { cwd: submodule.root });
+    submodule.commit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: submodule.root, encoding: "utf8" }).stdout.trim();
+    await expect(withPrivateGitCommitSnapshot(submodule, async () => undefined)).rejects.toThrow(/子模块/);
+
+    await expect(withPrivateGitCommitSnapshot(valid, async () => undefined, {
+      remove: (root) => { rmSync(root, { recursive: true, force: true }); throw new Error("受控清理失败"); },
+    })).rejects.toThrow(/受控清理失败/);
+  });
+
+  it("配对评测拒绝镜像、资源、对手或案例顺序身份漂移", async () => {
+    const runner = new DockerPairedEvaluationRunner(`maze-match@sha256:${"a".repeat(64)}`, "/tmp/unused");
+    const base = {
+      role: "solver" as const,
+      protocolVersion: 1 as const,
+      candidate: { commit: "1".repeat(40), root: "/tmp/candidate" },
+      champion: { commit: "2".repeat(40), root: "/tmp/champion" },
+      opponent: { commit: "3".repeat(40), root: "/tmp/opponent" },
+      cases: [{ id: "b", seed: "b", visibility: "public" as const }, { id: "a", seed: "a", visibility: "hidden" as const }],
+      context: { opponentVersion: "3".repeat(40), imageDigest: `maze-match@sha256:${"a".repeat(64)}`,
+        resourcePolicyDigest: MATCH_PROFILE_POLICY_DIGEST },
+    };
+    await expect(runner.evaluate(base)).rejects.toThrow(/严格有序/);
+    await expect(runner.evaluate({ ...base, cases: [...base.cases].reverse(),
+      context: { ...base.context, opponentVersion: "4".repeat(40) } })).rejects.toThrow(/对手提交/);
+    await expect(runner.evaluate({ ...base, cases: [...base.cases].reverse(),
+      context: { ...base.context, resourcePolicyDigest: "drift" } })).rejects.toThrow(/资源策略/);
   });
 
   it("真实子进程加载两个插件完成比赛，Solver 信封不含生成种子", async () => {

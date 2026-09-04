@@ -90,6 +90,33 @@ describe("插件 Git 谱系与晋级标签", () => {
     expect(repository.listHistory("exp-retry", "generator")).toHaveLength(2);
   });
 
+  it("公开评测前冻结正式候选提交，结果登记与物化不再创建第二个内容提交", async () => {
+    const { root, databasePath, repository } = setup();
+    await repository.initialize("exp-two-phase", "generator", fixture);
+    const first = await repository.createCandidate({
+      experimentId: "exp-two-phase", role: "generator", sourceRoot: candidate(root, "repair-0"),
+      attemptId: "g0001-generator", hypothesis: "先评测再记录",
+    });
+    const final = await repository.createCandidate({
+      experimentId: "exp-two-phase", role: "generator", sourceRoot: candidate(root, "repair-1"),
+      attemptId: "g0001-generator", hypothesis: "先评测再记录",
+    });
+    expect(final.commit).not.toBe(first.commit);
+    const result = repository.recordCandidateResult({
+      experimentId: "exp-two-phase", role: "generator", attemptId: "g0001-generator",
+      commit: final.commit, hypothesis: "先评测再记录", resultSummary: "平局", outcome: "tie",
+    });
+    const materialized = join(root, "materialized");
+    repository.materialize("exp-two-phase", "generator", result.commit, materialized);
+    expect(spawnSync("git", ["-C", materialized, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim()).toBe(result.commit);
+    expect(spawnSync("git", ["-C", materialized, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" }).stdout).toBe("");
+    expect(repository.listHistory("exp-two-phase", "generator")).toHaveLength(3);
+    const database = new DatabaseSync(databasePath);
+    expect(database.prepare("SELECT target_commit, outcome FROM candidate_results").get())
+      .toEqual({ target_commit: final.commit, outcome: "tie" });
+    database.close();
+  });
+
   it("只从己方候选提交读取按 attemptId 命名的策略记录", async () => {
     const { root, repository } = setup();
     await repository.initialize("exp-strategy", "generator", fixture);

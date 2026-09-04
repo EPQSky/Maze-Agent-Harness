@@ -2,6 +2,7 @@ import { createBaselineSolver, generateBaselineMaze, type MatchScore, type MazeS
 import { describe, expect, it } from "vitest";
 import {
   evaluateGeneratorPair,
+  evaluateAsyncSolverPair,
   evaluateSolverPair,
   shortestPathLength,
   topologyHash,
@@ -177,6 +178,28 @@ describe("生成器配对评测", () => {
 });
 
 describe("求解器配对评测", () => {
+  it("异步隔离 Solver 仍共享每案例唯一冻结迷宫并沿用平局不晋级", async () => {
+    const generated: string[] = [];
+    const solveInputs = { candidate: [] as string[], champion: [] as string[] };
+    const asyncSolver = (version: keyof typeof solveInputs) => ({
+      version,
+      async solve(seed: string, maze: MazeSnapshot) {
+        solveInputs[version].push(`${seed}:${topologyHash(maze)}`);
+        return { score: { solved: true, extraActions: 0, illegalActions: 0 }, trace: [] };
+      },
+    });
+    const result = await evaluateAsyncSolverPair({
+      candidate: asyncSolver("candidate"), champion: asyncSolver("champion"),
+      generator: { version: "generator-frozen-1", generate(seed) { generated.push(seed); return generateBaselineMaze(seed); } },
+      cases,
+      context,
+    });
+    expect(generated).toEqual(["h", "a", "b"]);
+    expect(solveInputs.candidate).toEqual(solveInputs.champion);
+    expect(result.publicCases.map(({ caseId }) => caseId)).toEqual(["public-a", "public-b"]);
+    expect(result.promote).toBe(false);
+  });
+
   function solverPlugin(version: string, createPolicy: () => SolverPolicy, cpuUsec = 1) {
     return { version, createPolicy, telemetry: { cpuUsec, wallClockMs: cpuUsec } };
   }

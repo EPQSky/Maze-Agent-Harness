@@ -21,6 +21,7 @@
     "@maze-arena/contracts": "workspace:*",
     "@maze-arena/dsh-integration": "workspace:*",
     "@maze-arena/engine": "workspace:*",
+    "@maze-arena/evaluation": "workspace:*",
     "npm-packlist": "10.0.4",
     "yaml": "2.9.0"
   },

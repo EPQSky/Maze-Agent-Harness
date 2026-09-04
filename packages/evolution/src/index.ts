@@ -130,6 +130,7 @@ export async function runEvolutionAttempt(options: {
   createSession(environment: { home: string; workspace: string }): EvolutionHarnessSession;
   beginRepairAttempt?(repairAttempt: number): void;
   prepareCandidate(workspace: string, strategyRecord: { attemptId: string; strategyPlan: string }): Promise<string> | string;
+  candidatePrepared?(candidate: Pick<CandidateCommit, "commit" | "role">): Promise<void> | void;
   verifyCandidate(workspace: string, expectedIdentity: string): Promise<void> | void;
   publicGate(workspace: string): PublicGateResult | Promise<PublicGateResult>;
   hiddenEvaluate(workspace: string): HiddenEvaluationResult | Promise<HiddenEvaluationResult>;
@@ -176,12 +177,18 @@ export async function runEvolutionAttempt(options: {
       let prepared = false;
       let preparedIdentity: string | undefined;
       try {
+        ensureStrategyPlan(workspace, options.attemptId, response.strategyPlan);
         assertCandidateStrategyRecord(workspace, lineageBaseline, options.attemptId, response.strategyPlan);
         preparedIdentity = await options.prepareCandidate(workspace, {
           attemptId: options.attemptId,
           strategyPlan: response.strategyPlan,
         });
         trustedCandidateIdentity = preparedIdentity;
+        const candidate = await options.lineage.createCandidate({
+          experimentId: options.experimentId, role: options.role, sourceRoot: workspace,
+          attemptId: options.attemptId, hypothesis: response.hypothesis, lineageBaseline,
+        });
+        await options.candidatePrepared?.(candidate);
         gate = await options.publicGate(workspace);
         await options.verifyCandidate(workspace, preparedIdentity);
         prepared = true;
@@ -192,10 +199,13 @@ export async function runEvolutionAttempt(options: {
       diagnostics = [...gate.diagnostics];
       if (repairAttempt === 3) {
         if (!prepared) return { status: "invalid-candidate", repairs, hiddenEvaluationCount: 0, promoted: false, diagnostics };
-        ensureStrategyPlan(workspace, options.attemptId, response.strategyPlan);
-        const candidate = await options.lineage.commitCandidate({
+        const preparedCandidate = await options.lineage.createCandidate({
           experimentId: options.experimentId, role: options.role, sourceRoot: workspace, attemptId: options.attemptId,
-          hypothesis: response.hypothesis, resultSummary: diagnostics.join("; "), outcome: "failed", lineageBaseline,
+          hypothesis: response.hypothesis, lineageBaseline,
+        });
+        const candidate = options.lineage.recordCandidateResult({
+          experimentId: options.experimentId, role: options.role, commit: preparedCandidate.commit, attemptId: options.attemptId,
+          hypothesis: response.hypothesis, resultSummary: diagnostics.join("; "), outcome: "failed",
         });
         return { status: "public-gate-failed", repairs, hiddenEvaluationCount: 0, promoted: false, diagnostics, candidate };
       }
@@ -206,12 +216,14 @@ export async function runEvolutionAttempt(options: {
     };
     const hidden = await options.hiddenEvaluate(workspace);
     await options.verifyCandidate(workspace, trustedCandidateIdentity);
-    ensureStrategyPlan(workspace, options.attemptId, response.strategyPlan);
-    const candidate = await options.lineage.commitCandidate({
+    const preparedCandidate = await options.lineage.createCandidate({
       experimentId: options.experimentId, role: options.role, sourceRoot: workspace, attemptId: options.attemptId,
+      hypothesis: response.hypothesis, lineageBaseline,
+    });
+    const candidate = options.lineage.recordCandidateResult({
+      experimentId: options.experimentId, role: options.role, commit: preparedCandidate.commit, attemptId: options.attemptId,
       hypothesis: response.hypothesis, resultSummary: hidden.resultSummary,
       outcome: hidden.outcome ?? (hidden.promote ? "promoted" : "failed"), generation: hidden.promote ? options.generation : undefined,
-      lineageBaseline,
     });
     return { status: "evaluated", repairs, hiddenEvaluationCount: 1, promoted: hidden.promote, diagnostics: [], candidate };
   } finally {

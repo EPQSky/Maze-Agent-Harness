@@ -53,6 +53,15 @@ export interface SolverEvaluationPlugin {
   telemetry?: EvaluationTelemetry;
 }
 
+export interface AsyncSolverEvaluationPlugin {
+  version: string;
+  solve(seed: string, maze: MazeSnapshot, context: FrozenEvaluationContext): Promise<{
+    score: SolverCaseScore;
+    trace: Array<{ observation: SolverObservation; action: SolverAction }>;
+    telemetry?: EvaluationTelemetry;
+  }>;
+}
+
 export interface SolverCaseScore {
   solved: boolean;
   extraActions: number;
@@ -213,6 +222,62 @@ export async function evaluateSolverPair(options: {
     const candidate = runSolverCase(options.candidate, evaluationCase.seed, maze, options.context);
     const champion = runSolverCase(options.champion, evaluationCase.seed, maze, options.context);
     results.push({ caseId: evaluationCase.id, seed: evaluationCase.seed, visibility: evaluationCase.visibility, candidate, champion });
+  }
+  const publicResults = results.filter(({ visibility }) => visibility === "public");
+  const hiddenResults = results.filter(({ visibility }) => visibility === "hidden");
+  const candidateTotal = aggregateSolver(results.map(({ candidate }) => candidate));
+  const championTotal = aggregateSolver(results.map(({ champion }) => champion));
+  const candidatePublic = aggregateSolver(publicResults.map(({ candidate }) => candidate));
+  const championPublic = aggregateSolver(publicResults.map(({ champion }) => champion));
+  const publicPrimaryRegressed = candidatePublic.solvedCases < championPublic.solvedCases;
+  return {
+    candidateVersion: options.candidate.version,
+    championVersion: options.champion.version,
+    generatorVersion: options.generator.version,
+    context: { ...options.context },
+    publicCases: publicResults.map(({ caseId, seed, candidate, champion }) => ({ caseId, seed, candidate, champion })),
+    hidden: {
+      caseCount: hiddenResults.length,
+      candidate: aggregateSolver(hiddenResults.map(({ candidate }) => candidate)),
+      champion: aggregateSolver(hiddenResults.map(({ champion }) => champion)),
+    },
+    total: { candidate: candidateTotal, champion: championTotal },
+    publicPrimaryRegressed,
+    promote: !publicPrimaryRegressed && compareSolverScores(candidateTotal, championTotal) > 0,
+  };
+}
+
+export async function evaluateAsyncSolverPair(options: {
+  candidate: AsyncSolverEvaluationPlugin;
+  champion: AsyncSolverEvaluationPlugin;
+  generator: FrozenGenerator;
+  cases: readonly EvaluationCase[];
+  context: FrozenEvaluationContext;
+}): Promise<SolverPairEvaluation> {
+  const cases = [...options.cases].sort((left, right) => left.id.localeCompare(right.id));
+  ensureUniqueCases(cases);
+  const results: Array<{
+    caseId: string;
+    seed: string;
+    visibility: EvaluationVisibility;
+    candidate: SolverCaseScore & { trace: Array<{ observation: SolverObservation; action: SolverAction }>; telemetry?: EvaluationTelemetry };
+    champion: SolverCaseScore & { trace: Array<{ observation: SolverObservation; action: SolverAction }>; telemetry?: EvaluationTelemetry };
+  }> = [];
+  for (const evaluationCase of cases) {
+    const maze = await options.generator.generate(evaluationCase.seed, options.context);
+    const validation = validateMaze(maze);
+    if (!validation.valid) throw new Error(`冻结生成器产生非法迷宫：${validation.reason}`);
+    const [candidateResult, championResult] = await Promise.all([
+      options.candidate.solve(evaluationCase.seed, maze, options.context),
+      options.champion.solve(evaluationCase.seed, maze, options.context),
+    ]);
+    results.push({
+      caseId: evaluationCase.id,
+      seed: evaluationCase.seed,
+      visibility: evaluationCase.visibility,
+      candidate: { ...candidateResult.score, trace: candidateResult.trace, telemetry: candidateResult.telemetry },
+      champion: { ...championResult.score, trace: championResult.trace, telemetry: championResult.telemetry },
+    });
   }
   const publicResults = results.filter(({ visibility }) => visibility === "public");
   const hiddenResults = results.filter(({ visibility }) => visibility === "hidden");

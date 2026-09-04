@@ -39,7 +39,7 @@ import {
 } from "./experiment-repository.js";
 import { MatchDataCorruptError, MatchRepository } from "./match-repository.js";
 import { AuditRepository } from "./audit-repository.js";
-import type { ArenaMatchRunner, TrustedCandidateTestRunner } from "@maze-arena/match-profile";
+import type { ArenaMatchRunner, PairedEvaluationRunner, TrustedCandidateTestRunner, VersionedMatchRunner } from "@maze-arena/match-profile";
 import { PluginLineageRepository } from "@maze-arena/lineage";
 import { registerControlRoutes } from "./control-routes.js";
 import { createRealBaselineValidationAdapter } from "./baseline-validation.js";
@@ -50,7 +50,6 @@ import { fileURLToPath } from "node:url";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { extname, join } from "node:path";
-import { runVersionedPluginMatch } from "./versioned-match-runner.js";
 
 export interface ArenaServerOptions {
   databasePath: string;
@@ -66,6 +65,10 @@ export interface ArenaServerOptions {
   compatibilityFingerprint?: string;
   pluginRoots?: { generator: string; solver: string };
   candidateTestRunner?: TrustedCandidateTestRunner;
+  pairedEvaluationRunner?: PairedEvaluationRunner;
+  matchImageDigest?: string;
+  resourcePolicyDigest?: string;
+  versionedMatchRunner?: VersionedMatchRunner;
   autonomousEvolutionAdapter?: AutonomousEvolutionAdapter;
 }
 
@@ -316,7 +319,15 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
         return match.id;
       }
       runMatchInBackground(match, {
-        run: (seed, onEvents) => runVersionedPluginMatch({ seed, generatorRoot, solverRoot, onEvents }),
+        run: (seed, onEvents) => {
+          if (!options.versionedMatchRunner) throw new Error("版本化展示局必须配置 Docker Match Profile 执行器");
+          return options.versionedMatchRunner.runVersioned({
+            seed,
+            generator: { commit: input.generatorCommit, root: generatorRoot },
+            solver: { commit: input.solverCommit, root: solverRoot },
+            onEvents,
+          });
+        },
       }, () => rmSync(scratch, { recursive: true, force: true }));
       return match.id;
     } catch (error) {
@@ -339,6 +350,11 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
       candidateTestRunner: options.candidateTestRunner ?? {
         run: () => { throw new Error("候选权威测试必须配置摘要锁定的 Docker 隔离执行器"); },
       },
+      pairedEvaluationRunner: options.pairedEvaluationRunner ?? {
+        evaluate: () => { throw new Error("自治配对评测必须配置摘要锁定的 Docker 隔离执行器"); },
+      },
+      matchImageDigest: options.matchImageDigest ?? "unconfigured-match-image",
+      resourcePolicyDigest: options.resourcePolicyDigest ?? "unconfigured-resource-policy",
       startExhibition: startExhibitionMatch,
     }),
   );
@@ -567,7 +583,9 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
           matchSubscribers.delete(subscriber);
           if (matchSubscribers.size === 0) subscribers.delete(matchId);
         });
-        try { publishCommittedEvents(matchId); } catch { socket.close(1011, "比赛事件读取失败"); }
+        setImmediate(() => {
+          try { publishCommittedEvents(matchId); } catch { socket.close(1011, "比赛事件读取失败"); }
+        });
       },
     );
   });

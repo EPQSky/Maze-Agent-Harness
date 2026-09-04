@@ -2,22 +2,22 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
-import type { Experiment, GenerationRoleResult, GeneratorCapability, MazeDirection, SolverCapability } from "@maze-arena/contracts";
+import { MATCH_PROTOCOL_VERSION, type Experiment, type GenerationRoleResult } from "@maze-arena/contracts";
 import { HARNESS_EVOLUTION_PROTOCOL_VERSION, type HarnessAdapter, type HarnessEvolutionResponse } from "@maze-arena/dsh-integration";
 import { runEvolutionAttempt } from "@maze-arena/evolution";
 import {
   compareGeneratorScores,
   compareSolverScores,
-  evaluateGeneratorPair,
-  evaluateSolverPair,
-  type FrozenEvaluationContext,
-  type GeneratorEvaluationPlugin,
-  type SolverEvaluationPlugin,
+  type GeneratorPairEvaluation,
+  type SolverPairEvaluation,
 } from "@maze-arena/evaluation";
-import { GOAL, START, runSolverOnMaze, type MazeSnapshot, type SolverPolicy } from "@maze-arena/engine";
 import type { PluginLineageRepository } from "@maze-arena/lineage";
-import { rebuildTrustedPluginCandidate, verifyTrustedPluginCandidate, type TrustedCandidateTestRunner } from "@maze-arena/match-profile";
+import {
+  rebuildTrustedPluginCandidate,
+  verifyTrustedPluginCandidate,
+  type PairedEvaluationRunner,
+  type TrustedCandidateTestRunner,
+} from "@maze-arena/match-profile";
 import type { ExperimentRuntimeRepository } from "@maze-arena/control-plane";
 import type { AuditRepository } from "./audit-repository.js";
 import type { AutonomousEvolutionAdapter } from "./autonomous-runner.js";
@@ -36,6 +36,9 @@ export function createLocalEvolutionAdapter(options: {
   audits: AuditRepository;
   pluginRoots: { generator: string; solver: string };
   candidateTestRunner: TrustedCandidateTestRunner;
+  pairedEvaluationRunner: PairedEvaluationRunner;
+  matchImageDigest: string;
+  resourcePolicyDigest: string;
   startExhibition(input: {
     experimentId: string; seed: string; generatorCommit: string; solverCommit: string;
     generation?: number; exhibitionId?: string;
@@ -54,12 +57,13 @@ export function createLocalEvolutionAdapter(options: {
       const opponentRole = input.role === "generator" ? "solver" : "generator";
       options.lineage.materialize(input.experimentId, opponentRole, input.frozenChampions[opponentRole], opponentRoot);
       let provider: HarnessEvolutionResponse | undefined;
+      let evaluationCandidate: { commit: string; root: string } | undefined;
       const trustedUsage = { tokens: 0, cost: 0 };
       const evaluationFacts = new CandidateEvaluationFacts();
-      const context: FrozenEvaluationContext = {
+      const context = {
         opponentVersion: input.frozenChampions[opponentRole],
-        imageDigest: "versioned-local-plugin-v1",
-        resourcePolicyDigest: "isolated-profile-v1",
+        imageDigest: options.matchImageDigest,
+        resourcePolicyDigest: options.resourcePolicyDigest,
       };
       const { publicCases, hiddenCases } = createFrozenEvaluationCases(
         options.runtime, input.experimentId, input.generation, input.role,
@@ -156,15 +160,29 @@ export function createLocalEvolutionAdapter(options: {
             });
             return report.contentSha256;
           },
+          candidatePrepared: (candidate) => {
+            const root = join(scratch, "evaluation-candidate");
+            options.lineage.materialize(input.experimentId, input.role, candidate.commit, root);
+            evaluationCandidate = { commit: candidate.commit, root };
+          },
           verifyCandidate: verifyTrustedPluginCandidate,
           publicGate: async (workspace) => {
             try {
-              const evaluation = await evaluateRole(input.role, input.attemptId, input.generation, workspace, championRoot, opponentRoot, publicCases, context);
-              const diagnostics = evaluationFacts.recordPublicSuccess({
-                caseCount: publicCases.length, aggregate: evaluation.aggregate,
-                traces: evaluation.publicTraces, regressed: evaluation.publicRegressed,
+              const evaluation = await options.pairedEvaluationRunner.evaluate({
+                role: input.role,
+                protocolVersion: MATCH_PROTOCOL_VERSION,
+                candidate: requireEvaluationCandidate(evaluationCandidate),
+                champion: { commit: input.frozenChampions[input.role], root: championRoot },
+                opponent: { commit: input.frozenChampions[opponentRole], root: opponentRoot },
+                cases: publicCases,
+                context,
               });
-              return { passed: !evaluation.publicRegressed, diagnostics };
+              const facts = evaluationFactsFor(input.role, input.attemptId, input.generation, evaluation);
+              const diagnostics = evaluationFacts.recordPublicSuccess({
+                caseCount: publicCases.length, aggregate: facts.aggregate,
+                traces: facts.publicTraces, regressed: evaluation.publicPrimaryRegressed,
+              });
+              return { passed: !evaluation.publicPrimaryRegressed, diagnostics };
             }
             catch {
               return { passed: false, diagnostics: evaluationFacts.recordPublicFailure() };
@@ -172,12 +190,21 @@ export function createLocalEvolutionAdapter(options: {
           },
           hiddenEvaluate: async (workspace) => {
             try {
-              const evaluation = await evaluateRole(input.role, input.attemptId, input.generation, workspace, championRoot, opponentRoot, allCases, context);
-              evaluationFacts.recordHiddenSuccess({
-                caseCount: hiddenCases.length, outcome: evaluation.outcome, aggregate: evaluation.aggregate,
-                hiddenCandidateAggregate: evaluation.hiddenCandidateAggregate,
+              const evaluation = await options.pairedEvaluationRunner.evaluate({
+                role: input.role,
+                protocolVersion: MATCH_PROTOCOL_VERSION,
+                candidate: requireEvaluationCandidate(evaluationCandidate),
+                champion: { commit: input.frozenChampions[input.role], root: championRoot },
+                opponent: { commit: input.frozenChampions[opponentRole], root: opponentRoot },
+                cases: allCases,
+                context,
               });
-              return { promote: evaluation.outcome === "promoted", outcome: evaluation.outcome, resultSummary: evaluation.summary };
+              const facts = evaluationFactsFor(input.role, input.attemptId, input.generation, evaluation);
+              evaluationFacts.recordHiddenSuccess({
+                caseCount: hiddenCases.length, outcome: facts.outcome, aggregate: facts.aggregate,
+                hiddenCandidateAggregate: facts.hiddenCandidateAggregate,
+              });
+              return { promote: facts.outcome === "promoted", outcome: facts.outcome, resultSummary: JSON.stringify(evaluation.total) };
             } catch (error) {
               evaluationFacts.recordHiddenFailure();
               return { promote: false, resultSummary: error instanceof Error ? error.message : "隐藏评测失败" };
@@ -235,35 +262,27 @@ export function createFrozenEvaluationCases(
   return { publicCases, hiddenCases };
 }
 
-async function evaluateRole(
+function requireEvaluationCandidate(candidate: { commit: string; root: string } | undefined) {
+  if (!candidate) throw new Error("候选尚未建立可信 Git 评测版本");
+  return candidate;
+}
+
+function evaluationFactsFor(
   role: "generator" | "solver",
   attemptId: string,
   generation: number,
-  candidateRoot: string,
-  championRoot: string,
-  opponentRoot: string,
-  cases: Array<{ id: string; seed: string; visibility: "public" | "hidden" }>,
-  context: FrozenEvaluationContext,
-): Promise<{ outcome: "promoted" | "failed" | "tie"; publicRegressed: boolean; summary: string; aggregate: Record<string, number>;
+  evaluation: GeneratorPairEvaluation | SolverPairEvaluation,
+): { outcome: "promoted" | "failed" | "tie"; aggregate: Record<string, number>;
   hiddenCandidateAggregate: Record<string, number>;
-  publicTraces: NonNullable<GenerationRoleResult["trustedPublicTraces"]> }> {
+  publicTraces: NonNullable<GenerationRoleResult["trustedPublicTraces"]> } {
   if (role === "generator") {
-    const [candidate, champion, solver] = await Promise.all([
-      generatorPlugin(candidateRoot, "candidate"), generatorPlugin(championRoot, "champion"), solverPlugin(opponentRoot, "opponent"),
-    ]);
-    const evaluation = await evaluateGeneratorPair({
-      candidate, champion,
-      solver: { version: solver.version, solve: (maze) => runSolverOnMaze({ seed: "paired-generator", maze, solver: solver.createPolicy(context) }).score },
-      cases, context,
-    });
-    const comparison = compareGeneratorScores(evaluation.total.candidate, evaluation.total.champion);
+    const generatorEvaluation = evaluation as GeneratorPairEvaluation;
+    const comparison = compareGeneratorScores(generatorEvaluation.total.candidate, generatorEvaluation.total.champion);
     return {
-      outcome: evaluation.promote ? "promoted" : comparison === 0 ? "tie" : "failed",
-      publicRegressed: evaluation.publicPrimaryRegressed,
-      summary: JSON.stringify(evaluation.total),
-      aggregate: { ...evaluation.total.candidate },
-      hiddenCandidateAggregate: { ...evaluation.hidden.candidate },
-      publicTraces: evaluation.publicCases.map(({ caseId, candidate }) => ({
+      outcome: generatorEvaluation.promote ? "promoted" : comparison === 0 ? "tie" : "failed",
+      aggregate: { ...generatorEvaluation.total.candidate },
+      hiddenCandidateAggregate: { ...generatorEvaluation.hidden.candidate },
+      publicTraces: generatorEvaluation.publicCases.map(({ caseId, candidate }) => ({
         attemptId, generation, traceId: caseId, outcome: candidate.failed ? "failure" : "success",
         metrics: { failed: candidate.failed ? 1 : 0, extraActions: candidate.extraActions,
           gateFailure: candidate.gateFailure === null ? 0 : 1 },
@@ -271,22 +290,13 @@ async function evaluateRole(
       })),
     };
   }
-  const [candidate, champion, generator] = await Promise.all([
-    solverPlugin(candidateRoot, "candidate"), solverPlugin(championRoot, "champion"), generatorPlugin(opponentRoot, "opponent"),
-  ]);
-  const evaluation = await evaluateSolverPair({
-    candidate, champion,
-    generator: { version: generator.version, generate: async (seed) => (await generator.generate(seed, context)).maze },
-    cases, context,
-  });
-  const comparison = compareSolverScores(evaluation.total.candidate, evaluation.total.champion);
+  const solverEvaluation = evaluation as SolverPairEvaluation;
+  const comparison = compareSolverScores(solverEvaluation.total.candidate, solverEvaluation.total.champion);
   return {
-    outcome: evaluation.promote ? "promoted" : comparison === 0 ? "tie" : "failed",
-    publicRegressed: evaluation.publicPrimaryRegressed,
-    summary: JSON.stringify(evaluation.total),
-    aggregate: { ...evaluation.total.candidate },
-    hiddenCandidateAggregate: { ...evaluation.hidden.candidate },
-    publicTraces: evaluation.publicCases.map(({ caseId, candidate }) => ({
+    outcome: solverEvaluation.promote ? "promoted" : comparison === 0 ? "tie" : "failed",
+    aggregate: { ...solverEvaluation.total.candidate },
+    hiddenCandidateAggregate: { ...solverEvaluation.hidden.candidate },
+    publicTraces: solverEvaluation.publicCases.map(({ caseId, candidate }) => ({
       attemptId, generation, traceId: caseId, outcome: candidate.solved ? "success" : "failure",
       metrics: { solved: candidate.solved ? 1 : 0, extraActions: candidate.extraActions, illegalActions: candidate.illegalActions },
       events: boundedTrace(candidate.trace.map(({ observation, action }) => ({
@@ -298,27 +308,6 @@ async function evaluateRole(
         kind: action.kind,
       }))),
     })),
-  };
-}
-
-async function generatorPlugin(root: string, version: string): Promise<GeneratorEvaluationPlugin> {
-  const module = await import(`${pathToFileURL(join(root, "dist/index.js")).href}?v=${Date.now()}-${Math.random()}`) as {
-    createGeneratorCapability(): GeneratorCapability;
-  };
-  return {
-    version,
-    generate: async (seed) => {
-      const maze = await generateMaze(module.createGeneratorCapability(), seed);
-      return {
-        maze,
-        protocolValid: true,
-        resourceCompliant: true,
-        trace: [
-          ...maze.passages.map(({ from, to }) => ({ type: "maze.carved" as const, from: { ...from }, to: { ...to } })),
-          { type: "maze.completed" as const, passageCount: maze.passages.length },
-        ],
-      };
-    },
   };
 }
 
@@ -346,43 +335,6 @@ function coordinate(value: unknown): value is { x: number; y: number } {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     && Object.keys(value).length === 2
     && Number.isSafeInteger((value as { x?: unknown }).x) && Number.isSafeInteger((value as { y?: unknown }).y);
-}
-
-async function generateMaze(capability: GeneratorCapability, seed: string): Promise<MazeSnapshot> {
-  const passages: MazeSnapshot["passages"] = [];
-  let response = await capability.handle({ type: "generator.start", seed, rules: { size: 31, start: START, goal: GOAL } });
-  while (response.type !== "generator.complete") {
-    passages.push({ from: { ...response.from }, to: { ...response.to } });
-    response = await capability.handle({ type: "generator.next" });
-  }
-  return { size: 31, start: { ...START }, goal: { ...GOAL }, passages };
-}
-
-async function solverPlugin(root: string, version: string): Promise<SolverEvaluationPlugin> {
-  const module = await import(`${pathToFileURL(join(root, "dist/index.js")).href}?v=${Date.now()}-${Math.random()}`) as {
-    createSolverCapability(): SolverCapability;
-  };
-  return { version, createPolicy: () => capabilityPolicy(module.createSolverCapability()) };
-}
-
-function capabilityPolicy(capability: SolverCapability): SolverPolicy {
-  let started = false;
-  return {
-    nextAction(observation) {
-      if (!started) {
-        const ready = capability.handle({ type: "solver.start", start: observation.start, goal: observation.goal });
-        if (ready instanceof Promise || ready.type !== "solver.ready") throw new Error("Solver 评测能力必须同步初始化");
-        started = true;
-      }
-      const response = capability.handle({
-        type: "solver.next", position: observation.position, start: observation.start, goal: observation.goal,
-        openDirections: observation.openDirections as MazeDirection[], remainingSteps: observation.remainingSteps,
-        previousAction: observation.previousAction,
-      });
-      if (response instanceof Promise || response.type !== "solver.move") throw new Error("Solver 评测能力必须同步返回动作");
-      return { direction: response.direction, kind: response.kind };
-    },
-  };
 }
 
 function requireExperiment(repository: ExperimentRepository, id: string): Experiment {

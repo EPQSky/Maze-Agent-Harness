@@ -8,11 +8,15 @@ import { assertNoPrivateEvolutionData, runEvolutionAttempt, type EvolutionHarnes
 const championRoot = resolve(import.meta.dirname, "../../generator-plugin");
 
 function fakeLineage() {
-  const commitCandidate = vi.fn(async (input: { outcome: string; generation?: number; sourceRoot?: string }) => ({
+  const createCandidate = vi.fn(async () => ({ commit: "a".repeat(40), role: "generator" as const }));
+  const commitCandidate = vi.fn((input: { outcome: string; generation?: number }) => ({
     commit: "a".repeat(40), role: "generator" as const, outcome: input.outcome as "failed",
     promotionTag: input.outcome === "promoted" ? `promotion/exp/generator/g${String(input.generation).padStart(4, "0")}` : undefined,
   }));
-  return { commitCandidate, lineage: { commitCandidate } as unknown as PluginLineageRepository };
+  return {
+    createCandidate, commitCandidate,
+    lineage: { createCandidate, recordCandidateResult: commitCandidate } as unknown as PluginLineageRepository,
+  };
 }
 
 function baseOptions(session: EvolutionHarnessSession, lineage: PluginLineageRepository) {
@@ -194,9 +198,7 @@ describe("自主进化闭环", () => {
       }),
     });
     expect(result.status).toBe("evaluated");
-    const sourceRoot = commitCandidate.mock.calls[0]![0].sourceRoot!;
-    expect(readFileSync(join(sourceRoot, "dist/index.js"), "utf8")).toContain("trustedBuild");
-    expect(readFileSync(join(sourceRoot, "src/candidate.ts"), "utf8")).toContain("candidate");
+    expect(commitCandidate).toHaveBeenCalledWith(expect.objectContaining({ commit: "a".repeat(40), outcome: "tie" }));
   });
 
   it("候选已有标准策略记录时完整闭环复用该记录并提交单一 Git 谱系证据", async () => {

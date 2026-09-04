@@ -13,6 +13,7 @@ import type {
   ExperimentListResponse,
   EvolutionRole,
   GenerationRoleResult,
+  MatchEvent,
 } from "@maze-arena/contracts";
 import {
   DeterministicFakeHarnessAdapter,
@@ -33,17 +34,73 @@ import { createArenaServer as createArenaServerImpl, installPersistentShutdownHa
 import { createProductionHarnessAdapter } from "./production-harness.js";
 import { HarnessInvocationError } from "./harness-invocation-error.js";
 import { runBaselineMatch } from "@maze-arena/engine";
+import type { PairedEvaluationRunner } from "@maze-arena/match-profile";
 import type { AutonomousEvolutionAdapter } from "./autonomous-runner.js";
 import { assembleTrustedEvolutionFeedback } from "./trusted-evolution-feedback.js";
 
 const servers: ReturnType<typeof createArenaServer>[] = [];
-const deterministicMatchRunner = { run: async (seed: string) => runBaselineMatch(seed) };
+const deterministicMatchRunner = {
+  run: async (seed: string, onEvents?: (events: readonly MatchEvent[]) => Promise<void> | void) => {
+    const result = runBaselineMatch(seed);
+    for (const event of result.events) await onEvents?.([event]);
+    return result;
+  },
+};
 const trustedCandidateTestRunner = {
   // 集成夹具模拟权威测试结论；生产接线必须使用 DockerTrustedCandidateTestRunner。
   run: () => undefined,
 };
+const deterministicPairedEvaluationRunner: PairedEvaluationRunner = {
+  async evaluate(input) {
+    if (input.role === "generator") {
+      const score = { gateFailures: 0, failedCases: 0, extraActions: 0, structuralNovelty: input.cases.length };
+      return {
+        candidateVersion: input.candidate.commit, championVersion: input.champion.commit,
+        solverVersion: input.opponent.commit, context: { ...input.context },
+        publicCases: input.cases.filter(({ visibility }) => visibility === "public").map(({ id, seed }) => ({
+          caseId: id, seed,
+          candidate: { failed: false, extraActions: 0, topologyHash: id, gateFailure: null,
+            trace: [{ type: "maze.carved", from: { x: 0, y: 0 }, to: { x: 1, y: 0 } }] },
+          champion: { failed: false, extraActions: 0, topologyHash: id, gateFailure: null, trace: [] },
+        })),
+        hidden: { caseCount: input.cases.filter(({ visibility }) => visibility === "hidden").length,
+          candidate: score, champion: score },
+        total: { candidate: score, champion: score }, publicPrimaryRegressed: false, promote: false,
+      };
+    }
+    const score = { solvedCases: input.cases.length, extraActions: 0, illegalActions: 0 };
+    return {
+      candidateVersion: input.candidate.commit, championVersion: input.champion.commit,
+      generatorVersion: input.opponent.commit, context: { ...input.context },
+      publicCases: input.cases.filter(({ visibility }) => visibility === "public").map(({ id, seed }) => ({
+        caseId: id, seed,
+        candidate: { solved: true, extraActions: 0, illegalActions: 0, trace: [{
+          observation: { position: { x: 0, y: 0 }, start: { x: 0, y: 0 }, goal: { x: 30, y: 30 },
+            openDirections: ["east" as const], remainingSteps: 4096, previousAction: null },
+          action: { direction: "east" as const, kind: "move" as const },
+        }] },
+        champion: { solved: true, extraActions: 0, illegalActions: 0, trace: [] },
+      })),
+      hidden: { caseCount: input.cases.filter(({ visibility }) => visibility === "hidden").length,
+        candidate: score, champion: score },
+      total: { candidate: score, champion: score }, publicPrimaryRegressed: false, promote: false,
+    };
+  },
+};
 function createArenaServer(options: ArenaServerOptions) {
-  return createArenaServerImpl({ candidateTestRunner: trustedCandidateTestRunner, ...options });
+  return createArenaServerImpl({
+    candidateTestRunner: trustedCandidateTestRunner,
+    pairedEvaluationRunner: deterministicPairedEvaluationRunner,
+    matchImageDigest: "test-match-image",
+    resourcePolicyDigest: "test-resource-policy",
+    versionedMatchRunner: {
+      runVersioned: async (input) => {
+        await new Promise((resolveStart) => setTimeout(resolveStart, 100));
+        return deterministicMatchRunner.run(input.seed, input.onEvents);
+      },
+    },
+    ...options,
+  });
 }
 
 function findHostProcess(marker: string): number | undefined {
@@ -273,6 +330,7 @@ describe("实验工作台 API", () => {
     const databasePath = join(directory, "arena.sqlite");
     const delegate = new DeterministicFakeHarnessAdapter();
     const providerCalls = { generator: 0, solver: 0 };
+    const pairCalls: Array<Parameters<PairedEvaluationRunner["evaluate"]>[0]> = [];
     const secondGenerationInput = new Map<EvolutionRole, HarnessEvolutionRequest["input"]>();
     const server = createArenaServer({
       databasePath,
@@ -297,6 +355,12 @@ describe("实验工作台 API", () => {
             toolActivity: "forbidden-tool-activity-secret" };
         },
       },
+      pairedEvaluationRunner: {
+        evaluate: async (input) => {
+          pairCalls.push(structuredClone(input));
+          return deterministicPairedEvaluationRunner.evaluate(input);
+        },
+      },
     });
     servers.push(server);
     const experiment = await createExperiment(server, "真实本地适配器实验");
@@ -318,6 +382,23 @@ describe("实验工作台 API", () => {
     snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json();
     expect(snapshot).toMatchObject({ state: "paused", generation: 1, usage: { tokens: 300, cost: 0 } });
     expect(providerCalls).toEqual({ generator: 2, solver: 1 });
+    expect(pairCalls.length).toBeGreaterThanOrEqual(4);
+    for (const role of ["generator", "solver"] as const) {
+      const roleCalls = pairCalls.filter((call) => call.role === role);
+      expect(roleCalls.length).toBeGreaterThanOrEqual(2);
+      expect(roleCalls[0]?.cases.map(({ id }) => id)).toEqual(Array.from({ length: 8 }, (_, index) => `public-${String(index + 1).padStart(2, "0")}`));
+      expect(roleCalls[1]?.cases.slice(0, 8)).toEqual(roleCalls[0]?.cases);
+      expect(roleCalls[1]?.cases).toHaveLength(32);
+      expect(roleCalls[0]).toMatchObject({
+        candidate: { commit: expect.stringMatching(/^[0-9a-f]{40}$/), root: expect.stringContaining("/evaluation-candidate") },
+        champion: { commit: expect.stringMatching(/^[0-9a-f]{40}$/), root: expect.stringContaining("/champion") },
+        opponent: { commit: expect.stringMatching(/^[0-9a-f]{40}$/), root: expect.stringContaining("/opponent") },
+        context: { opponentVersion: roleCalls[0]!.opponent.commit, imageDigest: "test-match-image", resourcePolicyDigest: "test-resource-policy" },
+      });
+      expect(roleCalls.slice(0, 2).every(({ candidate }) => candidate.commit === roleCalls[0]!.candidate.commit)).toBe(true);
+      expect(roleCalls[0]!.candidate.commit).toBe(snapshot.generations[0]![role]!.candidateCommit);
+      expect(roleCalls[0]!.candidate.root).not.toBe(roleCalls[0]!.champion.root);
+    }
     expect(snapshot.generations[0]).toMatchObject({
       generator: { outcome: "tie", publicProgress: 8, hiddenProgress: 24 },
       solver: { outcome: "tie", publicProgress: 8, hiddenProgress: 24 },
