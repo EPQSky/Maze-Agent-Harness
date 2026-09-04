@@ -185,6 +185,14 @@ describe("同步进化运行控制", () => {
     expect(wait).toHaveBeenCalledTimes(2);
   });
 
+  it("取消类错误可关闭重试并立即抛出", async () => {
+    const operation = vi.fn(async () => { throw new Error("已取消"); });
+    const wait = vi.fn(async () => undefined);
+    await expect(withProviderRetry(operation, wait, () => false)).rejects.toThrow("已取消");
+    expect(operation).toHaveBeenCalledTimes(1);
+    expect(wait).not.toHaveBeenCalled();
+  });
+
   it("双方共享上一代冻结快照，调用顺序不改变独立晋级结果", async () => {
     async function execute(order: readonly ("generator" | "solver")[]) {
       const repository = new ExperimentRuntimeRepository(":memory:");

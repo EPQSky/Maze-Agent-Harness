@@ -1,5 +1,5 @@
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CandidateCommit, PluginLineageRepository, PluginRole } from "@maze-arena/lineage";
 
 export interface TypedPublicTrace {
@@ -60,6 +60,30 @@ export interface EvolutionAttemptResult {
   candidate?: CandidateCommit;
 }
 
+const EXCLUDED_SESSION_DIRECTORIES = new Set([
+  ".git", "node_modules", "dist", "cache", ".cache", ".next", ".turbo", ".vite", "coverage", ".pnpm-store",
+]);
+
+function assertSafeWorkspaceTree(root: string, ignoredDirectories: ReadonlySet<string> = new Set()): void {
+  const absoluteRoot = resolve(root);
+  const canonicalRoot = realpathSync(absoluteRoot);
+  const visit = (current: string): void => {
+    for (const name of readdirSync(current)) {
+      if (ignoredDirectories.has(name)) continue;
+      const path = join(current, name);
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink()) throw new Error(`候选工作区不得包含符号链接：${relative(absoluteRoot, path)}`);
+      const relation = relative(canonicalRoot, realpathSync(path));
+      if (relation === ".." || relation.startsWith(`..${sep}`) || isAbsolute(relation)) throw new Error("候选工作区路径越界");
+      if (stat.isDirectory()) visit(path);
+      else if (!stat.isFile()) throw new Error(`候选工作区包含不支持的文件类型：${relative(absoluteRoot, path)}`);
+    }
+  };
+  const rootStat = lstatSync(absoluteRoot);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("候选工作区必须为真实目录");
+  visit(absoluteRoot);
+}
+
 export async function runEvolutionAttempt(options: {
   experimentId: string;
   generation: number;
@@ -77,11 +101,15 @@ export async function runEvolutionAttempt(options: {
   const home = join(options.isolatedRoot, options.attemptId, "harness-home");
   const workspace = join(options.isolatedRoot, options.attemptId, "workspace");
   rmSync(join(options.isolatedRoot, options.attemptId), { recursive: true, force: true });
-  mkdirSync(home, { recursive: true });
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  assertSafeWorkspaceTree(options.championRoot, EXCLUDED_SESSION_DIRECTORIES);
   cpSync(options.championRoot, workspace, {
     recursive: true,
-    filter: (source) => !source.includes("node_modules") && !source.includes("/.git") && !source.endsWith("/dist"),
+    dereference: false,
+    filter: (source) => relative(options.championRoot, source).split(sep)
+      .filter(Boolean).every((segment) => !EXCLUDED_SESSION_DIRECTORIES.has(segment)),
   });
+  chmodSync(workspace, 0o700);
   const session = options.createSession({ home, workspace });
   let response: EvolutionSessionResponse | undefined;
   let diagnostics: string[] = [];
@@ -97,6 +125,8 @@ export async function runEvolutionAttempt(options: {
         repairAttempt,
         diagnostics,
       });
+      // 模型命令返回后重新检查实际文件类型，禁止利用链接或特殊文件绕过公开门禁。
+      assertSafeWorkspaceTree(workspace);
       if (!response.submitted) return { status: "invalid-candidate", repairs, hiddenEvaluationCount: 0, promoted: false };
       if (options.role === "solver") assertSolverCandidateScope(options.championRoot, workspace);
       const gate = await options.publicGate(workspace);

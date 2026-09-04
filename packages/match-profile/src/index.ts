@@ -1,4 +1,4 @@
-import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
@@ -15,6 +15,7 @@ import type {
   SolverResponse,
 } from "@maze-arena/contracts";
 import { MATCH_OUTPUT_LIMIT_BYTES, MATCH_PROTOCOL_VERSION } from "@maze-arena/contracts";
+import { runIsolatedHarnessCommand } from "@maze-arena/dsh-integration";
 import {
   GOAL,
   GRID_SIZE,
@@ -82,6 +83,8 @@ export interface MatchProfileCommandFactory {
 
 export interface HarnessProfileInstallOptions {
   executable: string;
+  runtimeRoot: string;
+  runtimePayloadSha256: string;
   expectedVersion: string;
   home: string;
   protocolBundle: string;
@@ -94,18 +97,17 @@ export class HarnessMatchProfileInstaller {
   constructor(private readonly options: HarnessProfileInstallOptions) {}
 
   async prepare(): Promise<void> {
-    const version = spawnSync(this.options.executable, ["--version"], { encoding: "utf8" });
-    if (version.status !== 0 || version.stdout.trim() !== this.options.expectedVersion) {
+    const version = await this.run(["--version"], [], false);
+    if (version.trim() !== this.options.expectedVersion) {
       throw new Error(`DeepSeek Harness 版本不匹配：期望 ${this.options.expectedVersion}`);
     }
     for (const role of ["generator", "solver"] as const) await this.installRole(role);
   }
 
-  uninstall(): void {
+  async uninstall(): Promise<void> {
     for (const role of ["generator", "solver"] as const) {
       const profile = profileName(role);
-      const result = this.run(["plugin", "--profile", profile, "remove", packageName(this.options.roleBundles[role]), packageName(this.options.protocolBundle)]);
-      if (result.status !== 0) throw new Error(`无法卸载 ${profile}（dsh 退出码 ${result.status ?? "未知"}）`);
+      await this.run(["plugin", "--profile", profile, "remove", packageName(this.options.roleBundles[role]), packageName(this.options.protocolBundle)]);
       const manifest = readProfile(this.options.home, profile);
       if (Object.keys(manifest.dependencies ?? {}).length !== 0 || (manifest.dsh?.profile?.bundles ?? []).length !== 0) {
         throw new Error(`${profile} 卸载后仍残留能力 bundle`);
@@ -128,11 +130,10 @@ export class HarnessMatchProfileInstaller {
     const roleArtifact = await createInstallArtifact(this.options.roleBundles[role], artifactRoot);
     await validateInstallArtifact(protocolArtifact);
     await validateInstallArtifact(roleArtifact);
-    const result = this.run([
+    await this.run([
       "plugin", "--profile", profile, "add", "--offline", "--save-exact",
       `file:${protocolArtifact}`, `file:${roleArtifact}`,
-    ]);
-    if (result.status !== 0) throw new Error(`无法安装 ${profile}（dsh 退出码 ${result.status ?? "未知"}）`);
+    ], [protocolArtifact, roleArtifact]);
     const manifest = readProfile(this.options.home, profile);
     const protocolName = packageName(protocolArtifact);
     const roleName = packageName(roleArtifact);
@@ -150,11 +151,53 @@ export class HarnessMatchProfileInstaller {
     freezeProfileSnapshot(this.options.home, role);
   }
 
-  private run(args: string[]) {
-    return spawnSync(this.options.executable, args, {
-      encoding: "utf8",
-      env: { ...process.env, ...this.options.environment, DSH_HOME: resolve(this.options.home) },
+  private async run(args: string[], readOnlyArtifacts: readonly string[] = [], useProfileHome = true): Promise<string> {
+    const home = resolve(this.options.home);
+    const sessionRoot = useProfileHome ? undefined : join(home, `.version-session-${process.pid}-${randomBytes(6).toString("hex")}`);
+    const commandHome = sessionRoot ?? home;
+    const workspace = sessionRoot ? join(sessionRoot, "workspace") : home;
+    if (sessionRoot) mkdirSync(workspace, { recursive: true, mode: 0o700 });
+    const environment: NodeJS.ProcessEnv = {};
+    const source = { ...process.env, ...this.options.environment };
+    for (const key of ["PATH", "LANG", "LC_ALL", "TZ", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR"]) {
+      if (source[key] !== undefined) environment[key] = source[key];
+    }
+    for (const [key, value] of Object.entries(this.options.environment ?? {})) {
+      if (key.startsWith("DSH_") && value !== undefined) environment[key] = value;
+    }
+    Object.assign(environment, {
+      HOME: commandHome,
+      DSH_HOME: commandHome,
+      TMPDIR: commandHome,
+      XDG_CONFIG_HOME: join(commandHome, ".config"),
+      XDG_DATA_HOME: join(commandHome, ".local/share"),
+      XDG_STATE_HOME: join(commandHome, ".local/state"),
+      npm_config_cache: join(commandHome, ".npm-cache"),
     });
+    try {
+      const artifactRoot = join(home, "artifacts");
+      const result = await runIsolatedHarnessCommand({
+        command: this.options.executable,
+        args,
+        runtimeRoot: this.options.runtimeRoot,
+        expectedRuntimePayloadSha256: this.options.runtimePayloadSha256,
+        environment,
+        timeoutMs: 30_000,
+        outputLimitBytes: 1024 * 1024,
+        cwd: workspace,
+        writablePaths: [commandHome],
+        readOnlyPaths: useProfileHome && existsSync(artifactRoot)
+          ? [artifactRoot, ...readOnlyArtifacts]
+          : readOnlyArtifacts,
+      });
+      return result.stdout;
+    } catch (error) {
+      const exitCode = error && typeof error === "object" && "exitCode" in error ? (error as { exitCode?: unknown }).exitCode : undefined;
+      if (typeof exitCode === "number") throw new Error(`dsh 命令失败（退出码 ${exitCode}）`);
+      throw error;
+    } finally {
+      if (sessionRoot) rmSync(sessionRoot, { recursive: true, force: true });
+    }
   }
 }
 

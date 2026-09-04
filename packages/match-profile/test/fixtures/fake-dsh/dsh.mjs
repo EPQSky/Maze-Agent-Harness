@@ -1,11 +1,38 @@
 #!/usr/bin/env node
-import { readFileSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const args = process.argv.slice(2);
 const home = resolve(process.env.DSH_HOME ?? ".");
+
+async function exerciseIsolationAttacks() {
+  for (const variable of ["DSH_ATTACK_EXTERNAL_PATH", "DSH_ATTACK_RUNTIME_PATH"]) {
+    const path = process.env[variable];
+    if (!path) continue;
+    try { writeFileSync(path, variable); } catch { /* 受控执行必须拒绝越界或只读写入。 */ }
+  }
+  if (process.env.DSH_ATTACK_DAEMON_MARKER) {
+    spawn(process.execPath, ["-e", `setTimeout(() => { try { require("node:fs").writeFileSync(process.argv[1], "escaped"); } catch {} }, 400); setInterval(() => {}, 1_000);`, process.env.DSH_ATTACK_DAEMON_MARKER, process.env.DSH_ATTACK_DAEMON_IDENTITY ?? ""], {
+      detached: true,
+      stdio: "ignore",
+    }).unref();
+  }
+  if (process.env.DSH_ATTACK_SOCKET_PATH) {
+    await new Promise((resolveAttempt) => {
+      const socket = createConnection(process.env.DSH_ATTACK_SOCKET_PATH);
+      const finish = () => { socket.destroy(); resolveAttempt(); };
+      socket.once("connect", finish);
+      socket.once("error", finish);
+      socket.setTimeout(200, finish);
+    });
+  }
+}
+
+await exerciseIsolationAttacks();
+
 if (args[0] === "--version") {
   process.stdout.write("2026.09-preview.1\n");
 } else if (args[0] === "plugin") {
@@ -19,33 +46,25 @@ if (args[0] === "--version") {
   manifest.dependencies ??= {};
   manifest.dsh.profile.bundles ??= [];
   if (action === "add") {
-    const npmCli = resolve(dirname(process.execPath), "../lib/node_modules/npm/bin/npm-cli.js");
-    const install = spawnSync(process.execPath, [npmCli, "install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", "--save-exact", ...values], {
-      cwd: join(home, "profiles", profile), encoding: "utf8", timeout: 15_000,
-      env: { PATH: process.env.PATH, HOME: home, npm_config_cache: join(home, ".npm-cache") },
-    });
-    if (install.status !== 0) throw new Error(`npm 离线安装失败：${install.stderr}`);
-    const installed = JSON.parse(readFileSync(path, "utf8"));
     for (const spec of values) {
       const root = spec.startsWith("file:") ? spec.slice(5) : spec;
       const packageManifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
       if (!packageManifest.dsh?.bundle?.patch) throw new Error(`${packageManifest.name} 不是 dsh.bundle`);
-      manifest.dependencies[packageManifest.name] = installed.dependencies[packageManifest.name];
+      const installedRoot = join(home, "profiles", profile, "node_modules", ...packageManifest.name.split("/"));
+      mkdirSync(resolve(installedRoot, ".."), { recursive: true });
+      rmSync(installedRoot, { recursive: true, force: true });
+      symlinkSync(root, installedRoot, "dir");
+      manifest.dependencies[packageManifest.name] = `file:${root}`;
       if (!manifest.dsh.profile.bundles.includes(packageManifest.name)) manifest.dsh.profile.bundles.push(packageManifest.name);
     }
     if (process.env.DSH_TAMPER_INSTALLED_PATCH) {
-      const name = Object.keys(installed.dependencies).at(-1);
+      const name = Object.keys(manifest.dependencies).at(-1);
       const installedRoot = join(home, "profiles", profile, "node_modules", ...name.split("/"));
       writeFileSync(join(installedRoot, "cordis.patch.yml"), "- insert: [{ id: extra, name: dangerous }]\n");
     }
   } else {
-    const npmCli = resolve(dirname(process.execPath), "../lib/node_modules/npm/bin/npm-cli.js");
-    const uninstall = spawnSync(process.execPath, [npmCli, "uninstall", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", ...values], {
-      cwd: join(home, "profiles", profile), encoding: "utf8", timeout: 15_000,
-      env: { PATH: process.env.PATH, HOME: home, npm_config_cache: join(home, ".npm-cache") },
-    });
-    if (uninstall.status !== 0) throw new Error(`npm 离线卸载失败：${uninstall.stderr}`);
     for (const name of values) {
+      rmSync(join(home, "profiles", profile, "node_modules", ...name.split("/")), { recursive: true, force: true });
       delete manifest.dependencies[name];
       manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.filter((value) => value !== name);
     }

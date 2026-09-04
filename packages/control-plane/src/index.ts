@@ -305,6 +305,16 @@ export class ExperimentRuntimeRepository {
     return this.get(experimentId)!;
   }
 
+  completeRequestedPause(experimentId: string): ExperimentRuntimeSnapshot {
+    const current = this.require(experimentId);
+    if (current.state !== "running" || !current.pauseRequested) {
+      throw new RuntimeStateError("实验没有待完成的安全暂停请求");
+    }
+    this.database.prepare("UPDATE experiment_runtime SET state = 'paused', phase = 'paused', pause_requested = 0 WHERE experiment_id = ?")
+      .run(experimentId);
+    return this.get(experimentId)!;
+  }
+
   cancel(experimentId: string): ExperimentRuntimeSnapshot {
     const current = this.require(experimentId);
     if (["completed", "cancelled"].includes(current.state)) throw new RuntimeStateError("终态实验不能再次终止");
@@ -564,11 +574,19 @@ export class ExperimentRuntimeRepository {
   }
 }
 
-export async function withProviderRetry<T>(operation: () => Promise<T>, wait: (attempt: number) => Promise<void> = async () => undefined): Promise<T> {
+export async function withProviderRetry<T>(
+  operation: () => Promise<T>,
+  wait: (attempt: number) => Promise<void> = async () => undefined,
+  shouldRetry: (error: unknown) => boolean = () => true,
+): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try { return await operation(); }
-    catch (error) { lastError = error; if (attempt < 3) await wait(attempt); }
+    catch (error) {
+      lastError = error;
+      if (!shouldRetry(error) || attempt === 3) break;
+      await wait(attempt);
+    }
   }
   throw lastError;
 }

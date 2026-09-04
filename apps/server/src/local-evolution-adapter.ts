@@ -1,9 +1,10 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Experiment, GeneratorCapability, MazeDirection, SolverCapability } from "@maze-arena/contracts";
-import type { HarnessAdapter, HarnessEvolutionResponse } from "@maze-arena/dsh-integration";
+import { HARNESS_EVOLUTION_PROTOCOL_VERSION, type HarnessAdapter, type HarnessEvolutionResponse } from "@maze-arena/dsh-integration";
 import { runEvolutionAttempt } from "@maze-arena/evolution";
 import {
   compareGeneratorScores,
@@ -21,6 +22,7 @@ import type { ExperimentRuntimeRepository } from "@maze-arena/control-plane";
 import type { AuditRepository } from "./audit-repository.js";
 import type { AutonomousEvolutionAdapter } from "./autonomous-runner.js";
 import type { ExperimentRepository } from "./experiment-repository.js";
+import { HarnessInvocationError } from "./harness-invocation-error.js";
 
 export function createLocalEvolutionAdapter(options: {
   harness: HarnessAdapter;
@@ -67,25 +69,68 @@ export function createLocalEvolutionAdapter(options: {
           championRoot,
           isolatedRoot: join(scratch, "attempts"),
           input: { lineagePlans: [], trustedResults: [], publicTraces: [], hiddenAggregate: {} },
-          createSession: ({ workspace }) => ({
-            run: async ({ repairAttempt, diagnostics }) => {
-              if (input.signal.aborted) throw new Error("自治任务已取消");
-              provider = await options.harness.evolvePlugin!({
-                experimentId: input.experimentId, generation: input.generation, role: input.role,
-                attemptId: input.attemptId, modelProfile: experiment.modelProfile!, workspace, repairAttempt, diagnostics,
-                signal: input.signal,
-              });
-              trustedUsage.tokens += provider.usage.tokens;
-              trustedUsage.cost += provider.usage.cost;
-              options.audits.append(input.experimentId, "harness.activity", {
-                role: input.role, attemptId: input.attemptId,
-                reasoning: provider.reasoning?.slice(0, 2_000) ?? null,
-                toolActivity: provider.toolActivity?.slice(0, 2_000) ?? null,
-              });
-              return provider;
-            },
-            close: () => undefined,
-          }),
+          createSession: () => {
+            const sessionId = randomUUID();
+            return {
+              run: async (sessionRequest) => {
+                if (input.signal.aborted) throw new Error("自治任务已取消");
+                try {
+                  provider = await options.harness.evolvePlugin!({
+                    sessionId,
+                    experimentId: input.experimentId, generation: input.generation, role: input.role,
+                    attemptId: input.attemptId, modelProfile: experiment.modelProfile!,
+                    home: sessionRequest.home, workspace: sessionRequest.workspace,
+                    input: sessionRequest.input, allowedTools: sessionRequest.allowedTools,
+                    repairAttempt: sessionRequest.repairAttempt, diagnostics: sessionRequest.diagnostics,
+                    signal: input.signal,
+                  });
+                } catch (error) {
+                  const currentInvocation = error instanceof HarnessInvocationError ? error : undefined;
+                  const execution = currentInvocation?.execution ?? provider?.execution;
+                  options.audits.append(input.experimentId, "harness.activity", {
+                    role: input.role,
+                    attemptId: input.attemptId,
+                    executionKind: execution?.kind ?? "unknown",
+                    protocolVersion: execution?.protocolVersion ?? HARNESS_EVOLUTION_PROTOCOL_VERSION,
+                    sessionId: execution?.sessionId ?? sessionId,
+                    harnessVersion: execution?.harnessVersion ?? "unknown",
+                    providerId: execution?.providerId ?? experiment.modelProfile!.providerId,
+                    modelId: execution?.modelId ?? experiment.modelProfile!.modelId,
+                    outcome: "failed",
+                    failureKind: currentInvocation?.kind ?? "unknown",
+                    usageTokens: currentInvocation?.usage?.tokens ?? null,
+                    usageCost: currentInvocation?.usage?.cost ?? null,
+                  });
+                  const hasTrustedUsage = trustedUsage.tokens > 0 || trustedUsage.cost > 0 || currentInvocation?.usage !== undefined;
+                  throw new HarnessInvocationError(
+                    currentInvocation?.message ?? "Harness 自治调用失败",
+                    currentInvocation?.kind ?? "process",
+                    hasTrustedUsage ? {
+                      tokens: trustedUsage.tokens + (currentInvocation?.usage?.tokens ?? 0),
+                      cost: trustedUsage.cost + (currentInvocation?.usage?.cost ?? 0),
+                    } : undefined,
+                    execution,
+                  );
+                }
+                trustedUsage.tokens += provider.usage.tokens;
+                trustedUsage.cost += provider.usage.cost;
+                options.audits.append(input.experimentId, "harness.activity", {
+                  role: input.role, attemptId: input.attemptId,
+                  executionKind: provider.execution.kind,
+                  protocolVersion: provider.execution.protocolVersion,
+                  sessionId: provider.execution.sessionId,
+                  harnessVersion: provider.execution.harnessVersion,
+                  providerId: provider.execution.providerId,
+                  modelId: provider.execution.modelId,
+                  outcome: "succeeded",
+                  usageTokens: provider.usage.tokens,
+                  usageCost: provider.usage.cost,
+                });
+                return provider;
+              },
+              close: () => undefined,
+            };
+          },
           publicGate: async (workspace) => {
             try {
               await validatePluginPackage(workspace);

@@ -155,15 +155,20 @@ async function main(): Promise<void> {
   const solverPlugin = process.env.ARENA_SOLVER_PLUGIN_PACKAGE;
   const webRoot = process.env.ARENA_WEB_ROOT;
   const dshExecutable = process.env.DSH_EXECUTABLE ?? "dsh";
+  const harnessRuntimeRoot = process.env.DSH_HARNESS_RUNTIME_ROOT;
+  const harnessRuntimePayloadSha256 = process.env.DSH_HARNESS_RUNTIME_SHA256;
   const harnessVersion = process.env.DSH_HARNESS_VERSION;
   if (!Number.isSafeInteger(port) || (port !== 0 && (port < 1_024 || port > 65_535))) throw new Error("生产监听端口无效");
   if (startupHandshakeFd !== undefined && startupHandshakeFd !== 3) throw new Error("生产启动握手描述符无效");
   if (port === 0 && startupHandshakeFd === undefined) throw new Error("自动监听端口需要生产启动握手描述符");
-  if (!matchImage || !trustedRoot || !protocolBundle || !generatorPlugin || !solverPlugin || !harnessVersion || !webRoot) {
+  if (!matchImage || !trustedRoot || !protocolBundle || !generatorPlugin || !solverPlugin || !harnessVersion || !webRoot
+    || !harnessRuntimeRoot || !harnessRuntimePayloadSha256) {
     throw new Error("生产启动必须配置摘要锁定的 Match Profile 镜像、隔离 Harness home、三个 bundle 包路径与 Web 构建目录");
   }
   await new HarnessMatchProfileInstaller({
     executable: dshExecutable,
+    runtimeRoot: harnessRuntimeRoot,
+    runtimePayloadSha256: harnessRuntimePayloadSha256,
     expectedVersion: harnessVersion,
     home: trustedRoot,
     protocolBundle,

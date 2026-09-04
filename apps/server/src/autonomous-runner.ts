@@ -1,5 +1,6 @@
 import type { EvolutionRole, ExperimentRuntimeSnapshot, GenerationRoleResult } from "@maze-arena/contracts";
 import { ExperimentRuntimeRepository, withProviderRetry } from "@maze-arena/control-plane";
+import { HarnessInvocationError } from "./harness-invocation-error.js";
 import type { AuditRepository } from "./audit-repository.js";
 import type { ExperimentRepository } from "./experiment-repository.js";
 
@@ -48,7 +49,24 @@ export class AutonomousExperimentRunner {
     this.tasks.set(experimentId, { controller, task });
   }
 
-  cancel(experimentId: string): void { this.tasks.get(experimentId)?.controller.abort(); }
+  async cancel(experimentId: string): Promise<void> {
+    const active = this.tasks.get(experimentId);
+    active?.controller.abort();
+    if (active) await active.task;
+  }
+
+  async pause(experimentId: string): Promise<ExperimentRuntimeSnapshot> {
+    const active = this.tasks.get(experimentId);
+    active?.controller.abort();
+    if (active) await active.task;
+    const current = this.runtime.get(experimentId);
+    const paused = current?.state === "running" && current.pauseRequested
+      ? this.runtime.completeRequestedPause(experimentId)
+      : current;
+    if (!paused) throw new Error("实验运行时不存在");
+    this.experiments.setStatus(experimentId, experimentStatus(paused));
+    return paused;
+  }
 
   async close(): Promise<void> {
     for (const { controller } of this.tasks.values()) controller.abort();
@@ -62,23 +80,43 @@ export class AutonomousExperimentRunner {
       const generation = before.generation + 1;
       const champions = Object.freeze({ ...before.champions });
       const results = {} as Record<EvolutionRole, GenerationRoleResult>;
+      const uncheckpointedUsage = { tokens: 0, cost: 0 };
       try {
         for (const role of ["generator", "solver"] as const) {
           const checkpoint = this.runtime.getRoleCheckpoint(experimentId, generation, role);
           if (checkpoint) { results[role] = checkpoint.result; continue; }
           const attemptId = `g${String(generation).padStart(4, "0")}-${role}`;
-          const execution = await withProviderRetry(() => this.adapter.runRole({
-            experimentId, generation, role, attemptId, frozenChampions: champions,
-            compatibilityFingerprint: before.compatibilityFingerprint, signal,
-          }), async (attempt) => new Promise((resolve) => setTimeout(resolve, attempt * 10)));
-          if (signal.aborted) return;
+          const execution = await withProviderRetry(() => {
+            if (signal.aborted) return Promise.reject(new Error("自治任务已取消"));
+            return this.adapter.runRole({
+              experimentId, generation, role, attemptId, frozenChampions: champions,
+              compatibilityFingerprint: before.compatibilityFingerprint, signal,
+            });
+          }, async (attempt) => new Promise((resolve) => setTimeout(resolve, attempt * 10)), (error) => {
+            if (error instanceof HarnessInvocationError && error.usage) {
+              uncheckpointedUsage.tokens += error.usage.tokens;
+              uncheckpointedUsage.cost += error.usage.cost;
+            }
+            return !signal.aborted && error instanceof HarnessInvocationError && error.kind === "transient-provider";
+          });
+          execution.usage.tokens += uncheckpointedUsage.tokens;
+          execution.usage.cost += uncheckpointedUsage.cost;
           validateRoleResult(role, champions[role], execution);
           this.runtime.saveRoleCheckpoint({ experimentId, generation, role, attemptId, ...execution.usage, result: execution.result });
+          uncheckpointedUsage.tokens = 0;
+          uncheckpointedUsage.cost = 0;
           results[role] = execution.result;
+          // 已完成的角色副作用必须先落检查点，暂停或取消才能从下一原子步骤恢复。
+          if (signal.aborted) return;
         }
       } catch (error) {
+        if (uncheckpointedUsage.tokens > 0 || uncheckpointedUsage.cost > 0) {
+          this.runtime.recordUsage(experimentId, uncheckpointedUsage.tokens, uncheckpointedUsage.cost);
+        }
         if (signal.aborted) return;
-        const paused = this.runtime.recordInfrastructureFailure(experimentId, error instanceof Error ? error.message : "未知提供方故障");
+        // Provider 与模型控制的异常文本不得进入运行时状态或公开审计，只持久化稳定分类。
+        const failureCategory = error instanceof HarnessInvocationError ? `harness-${error.kind}` : "unknown-provider-failure";
+        const paused = this.runtime.recordInfrastructureFailure(experimentId, failureCategory);
         this.experiments.setStatus(experimentId, experimentStatus(paused));
         this.audits.append(experimentId, "runtime.paused", { reason: paused.phase });
         return;

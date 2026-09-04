@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type ServerResponse } from "node:http";
@@ -7,6 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import type { MatchPluginRole, MatchProtocolRequest } from "@maze-arena/contracts";
+import { hashHarnessRuntimePayload } from "@maze-arena/dsh-integration";
 import {
   DockerMatchProfileCommandFactory,
   HarnessMatchProfileInstaller,
@@ -20,6 +21,10 @@ const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workspaceRoot = resolve(packageRoot, "../..");
 const peer = join(packageRoot, "test/fixtures/protocol-peer.mjs");
 const fakeDsh = join(packageRoot, "test/fixtures/fake-dsh/dsh.mjs");
+const fakeHarnessRuntime = {
+  runtimeRoot: dirname(fakeDsh),
+  runtimePayloadSha256: hashHarnessRuntimePayload(dirname(fakeDsh)),
+} as const;
 const cleanupFixture = join(packageRoot, "test/fixtures/container-cleanup.mjs");
 
 function command(mode: string, role: MatchPluginRole = "solver") {
@@ -50,7 +55,8 @@ async function installProfiles(roleBundles = {
 }) {
   const home = mkdtempSync(join(tmpdir(), "maze-dsh-home-"));
   const installer = new HarnessMatchProfileInstaller({
-    executable: fakeDsh, expectedVersion: "2026.09-preview.1", home,
+    executable: fakeDsh, ...fakeHarnessRuntime,
+    expectedVersion: "2026.09-preview.1", home,
     protocolBundle: packageRoot, roleBundles,
   });
   await installer.prepare();
@@ -72,6 +78,18 @@ function dshCommand(home: string, role: MatchPluginRole, marker?: string) {
 function statsResponse(response: ServerResponse, usageUsec: number): void {
   response.writeHead(200, { "content-type": "application/json" });
   response.end(JSON.stringify({ cpu_stats: { cpu_usage: { total_usage: usageUsec * 1_000 } } }));
+}
+function wait(milliseconds: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+function findHostProcess(marker: string): number | undefined {
+  for (const entry of readdirSync("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      if (readFileSync(`/proc/${entry}/cmdline`).toString("utf8").includes(marker)) return Number(entry);
+    } catch { /* 进程可能在枚举期间退出。 */ }
+  }
+  return undefined;
 }
 async function listenStatsServer(handler: (call: number, response: ServerResponse) => void) {
   const socket = join(mkdtempSync(join(tmpdir(), "maze-docker-stats-")), "docker.sock");
@@ -393,7 +411,7 @@ describe("原生插件与正式隔离策略", () => {
     await expect(client.request(startRequest())).resolves.toMatchObject({ payload: { type: "solver.ready" } });
     await client.finalize();
     expect(JSON.parse(readFileSync(marker, "utf8"))).toEqual(["provide"]);
-    installer.uninstall();
+    await installer.uninstall();
     for (const role of ["generator", "solver"] as const) {
       const manifest = JSON.parse(readFileSync(join(home, "profiles", `maze-match-${role}`, "package.json"), "utf8"));
       expect(manifest.dsh.profile.bundles).toEqual([]);
@@ -408,6 +426,88 @@ describe("原生插件与正式隔离策略", () => {
     expect(readFileSync(join(home, "snapshots/solver.sha256"), "utf8")).toBe(before);
     expect(statSync(join(home, "snapshots/solver")).mode & 0o222).toBe(0);
   });
+
+  it("Profile 安装与清理只写 profile home，阻断外部写、Unix socket 和后台进程", async () => {
+    const home = mkdtempSync(join(tmpdir(), "maze-profile-isolation-home-"));
+    const externalMarker = join(mkdtempSync(join(tmpdir(), "maze-profile-external-")), "escaped");
+    const daemonMarker = join(mkdtempSync(join(tmpdir(), "maze-profile-daemon-")), "escaped");
+    const socketRoot = mkdtempSync(join(tmpdir(), "maze-profile-socket-"));
+    const socketPath = join(socketRoot, "host.sock");
+    const socketMarker = join(socketRoot, "connected");
+    const daemonIdentity = `maze-profile-daemon-${home}`;
+    const runtimeMarker = join(fakeHarnessRuntime.runtimeRoot, "runtime-write-must-fail");
+    const listener = spawn(process.execPath, ["-e", `
+      const fs = require("node:fs");
+      const net = require("node:net");
+      const server = net.createServer(() => fs.writeFileSync(${JSON.stringify(socketMarker)}, "connected"));
+      server.listen(${JSON.stringify(socketPath)});
+      setInterval(() => {}, 1_000);
+    `], { stdio: "ignore" });
+    try {
+      for (let attempt = 0; attempt < 100 && !existsSync(socketPath); attempt += 1) wait(10);
+      expect(existsSync(socketPath)).toBe(true);
+      const installer = new HarnessMatchProfileInstaller({
+        executable: fakeDsh,
+        ...fakeHarnessRuntime,
+        expectedVersion: "2026.09-preview.1",
+        home,
+        protocolBundle: packageRoot,
+        roleBundles: {
+          generator: join(workspaceRoot, "packages/generator-plugin"),
+          solver: join(workspaceRoot, "packages/solver-plugin"),
+        },
+        environment: {
+          DSH_ATTACK_EXTERNAL_PATH: externalMarker,
+          DSH_ATTACK_RUNTIME_PATH: runtimeMarker,
+          DSH_ATTACK_SOCKET_PATH: socketPath,
+          DSH_ATTACK_DAEMON_MARKER: daemonMarker,
+          DSH_ATTACK_DAEMON_IDENTITY: daemonIdentity,
+        },
+      });
+
+      await expect(installer.prepare()).resolves.toBeUndefined();
+      await expect(installer.uninstall()).resolves.toBeUndefined();
+      wait(700);
+      expect(existsSync(externalMarker)).toBe(false);
+      expect(existsSync(runtimeMarker)).toBe(false);
+      expect(existsSync(socketMarker)).toBe(false);
+      expect(existsSync(daemonMarker)).toBe(false);
+      expect(findHostProcess(daemonIdentity)).toBeUndefined();
+    } finally {
+      if (listener.exitCode === null && listener.signalCode === null) {
+        const closed = new Promise<void>((resolveClosed) => listener.once("close", () => resolveClosed()));
+        listener.kill("SIGKILL");
+        await closed;
+      }
+    }
+  }, 30_000);
+
+  it("Profile 每次调用前重新验证冻结 runtime 载荷", async () => {
+    const root = mkdtempSync(join(tmpdir(), "maze-profile-runtime-drift-"));
+    const runtimeRoot = join(root, "runtime");
+    cpSync(fakeHarnessRuntime.runtimeRoot, runtimeRoot, { recursive: true });
+    const dependency = join(runtimeRoot, "runtime-dependency.txt");
+    writeFileSync(dependency, "A\n");
+    const installer = new HarnessMatchProfileInstaller({
+      executable: join(runtimeRoot, "dsh.mjs"),
+      runtimeRoot,
+      runtimePayloadSha256: hashHarnessRuntimePayload(runtimeRoot),
+      expectedVersion: "2026.09-preview.1",
+      home: join(root, "home"),
+      protocolBundle: packageRoot,
+      roleBundles: {
+        generator: join(workspaceRoot, "packages/generator-plugin"),
+        solver: join(workspaceRoot, "packages/solver-plugin"),
+      },
+    });
+    mkdirSync(join(root, "home"));
+    await installer.prepare();
+    writeFileSync(dependency, "B\n");
+
+    await expect(installer.uninstall()).rejects.toThrow(/冻结载荷身份已漂移/);
+    const manifest = JSON.parse(readFileSync(join(root, "home/profiles/maze-match-generator/package.json"), "utf8"));
+    expect(Object.keys(manifest.dependencies)).toHaveLength(2);
+  }, 30_000);
 
   it("结构化 pack 清单不执行生命周期并对可信 lineage 基线关闭失败", async () => {
     const root = join(mkdtempSync(join(tmpdir(), "maze-quota-")), "solver-plugin");
@@ -687,7 +787,7 @@ describe("原生插件与正式隔离策略", () => {
     const home = mkdtempSync(join(tmpdir(), "maze-dsh-home-patch-"));
     writeFileSync(join(home, "cordis.patch.yml"), "- insert: [{ id: extra, name: dangerous }]\n");
     const installer = new HarnessMatchProfileInstaller({
-      executable: fakeDsh, expectedVersion: "2026.09-preview.1", home, protocolBundle: packageRoot,
+      executable: fakeDsh, ...fakeHarnessRuntime, expectedVersion: "2026.09-preview.1", home, protocolBundle: packageRoot,
       roleBundles: { generator: join(workspaceRoot, "packages/generator-plugin"), solver: join(workspaceRoot, "packages/solver-plugin") },
     });
     await expect(installer.prepare()).rejects.toThrow(/不得叠加额外贡献项/);
@@ -700,7 +800,7 @@ describe("原生插件与正式隔离策略", () => {
     const home = mkdtempSync(join(tmpdir(), "maze-preinstall-home-"));
     const marker = join(home, "dsh-invoked");
     const installer = new HarnessMatchProfileInstaller({
-      executable: fakeDsh, expectedVersion: "2026.09-preview.1", home, protocolBundle: packageRoot,
+      executable: fakeDsh, ...fakeHarnessRuntime, expectedVersion: "2026.09-preview.1", home, protocolBundle: packageRoot,
       roleBundles: { generator: invalid, solver: join(workspaceRoot, "packages/solver-plugin") },
       environment: { DSH_INVOCATION_MARKER: marker },
     });
@@ -715,7 +815,7 @@ describe("原生插件与正式隔离策略", () => {
     const home = mkdtempSync(join(tmpdir(), "maze-outside-home-"));
     const marker = join(home, "dsh-invoked");
     const installer = new HarnessMatchProfileInstaller({
-      executable: fakeDsh, expectedVersion: "2026.09-preview.1", home, protocolBundle: packageRoot,
+      executable: fakeDsh, ...fakeHarnessRuntime, expectedVersion: "2026.09-preview.1", home, protocolBundle: packageRoot,
       roleBundles: { generator: invalid, solver: join(workspaceRoot, "packages/solver-plugin") },
       environment: { DSH_INVOCATION_MARKER: marker },
     });
@@ -723,13 +823,13 @@ describe("原生插件与正式隔离策略", () => {
     expect(existsSync(marker)).toBe(false);
   });
 
-  it("dsh 安装后篡改真实 node_modules 会被再次拒绝", async () => {
+  it("dsh 无法篡改只读的内容寻址安装产物", async () => {
     const home = mkdtempSync(join(tmpdir(), "maze-postinstall-home-"));
     const installer = new HarnessMatchProfileInstaller({
-      executable: fakeDsh, expectedVersion: "2026.09-preview.1", home, protocolBundle: packageRoot,
+      executable: fakeDsh, ...fakeHarnessRuntime, expectedVersion: "2026.09-preview.1", home, protocolBundle: packageRoot,
       roleBundles: { generator: join(workspaceRoot, "packages/generator-plugin"), solver: join(workspaceRoot, "packages/solver-plugin") },
       environment: { DSH_TAMPER_INSTALLED_PATCH: "1" },
     });
-    await expect(installer.prepare()).rejects.toThrow(/贡献项|内容哈希/);
+    await expect(installer.prepare()).rejects.toThrow(/dsh 命令失败/);
   });
 });

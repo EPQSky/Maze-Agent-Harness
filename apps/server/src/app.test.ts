@@ -1,9 +1,11 @@
-import { chmodSync, cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
+import { createServer as createNetServer } from "node:net";
 import type {
   CreateExperimentRequest,
   DomainErrorResponse,
@@ -12,11 +14,15 @@ import type {
 } from "@maze-arena/contracts";
 import {
   DeterministicFakeHarnessAdapter,
+  HARNESS_EVOLUTION_ALLOWED_TOOLS,
+  hashHarnessRuntimePayload,
   ModelProfileValidationError,
+  type HarnessEvolutionRequest,
 } from "@maze-arena/dsh-integration";
 import { afterEach, describe, expect, it } from "vitest";
 import { createArenaServer, installPersistentShutdownHandlers } from "./app.js";
 import { createProductionHarnessAdapter } from "./production-harness.js";
+import { HarnessInvocationError } from "./harness-invocation-error.js";
 import { runBaselineMatch } from "@maze-arena/engine";
 import type { AutonomousEvolutionAdapter } from "./autonomous-runner.js";
 
@@ -44,6 +50,26 @@ function createTestServer(databasePath: string, autonomousEvolutionAdapter?: Aut
   });
   servers.push(server);
   return server;
+}
+
+function productionEvolutionRequest(
+  request: Omit<HarnessEvolutionRequest, "sessionId" | "home" | "input" | "allowedTools">,
+): HarnessEvolutionRequest {
+  const home = mkdtempSync(join(tmpdir(), "maze-harness-session-"));
+  return {
+    ...request,
+    sessionId: randomUUID(),
+    home,
+    input: {
+      role: request.role,
+      championRoot: request.workspace,
+      lineagePlans: [],
+      trustedResults: [],
+      publicTraces: [],
+      hiddenAggregate: {},
+    },
+    allowedTools: HARNESS_EVOLUTION_ALLOWED_TOOLS,
+  };
 }
 
 async function createExperiment(server: ReturnType<typeof createArenaServer>, name: string, costLimit?: number) {
@@ -198,17 +224,12 @@ describe("实验工作台 API", () => {
       .toMatchObject({ status: "ready", frozenConfiguration: { compatibilityFingerprint: "maze-arena-v1" } });
   });
 
-  it("运行 API 在安全边界暂停并拒绝第二个并发实验", async () => {
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
+  it("运行 API 通过取消信号立即暂停活动会话并释放单实验锁", async () => {
     const adapter: AutonomousEvolutionAdapter = {
-      runRole: async ({ role, frozenChampions }) => {
-        await gate;
-        return { result: {
-          candidateCommit: `${role}-candidate`, championBefore: frozenChampions[role], championAfter: frozenChampions[role],
-          outcome: "tie", promotionTag: null, publicProgress: 1, hiddenProgress: 1, aggregate: { primary: 1 },
-        }, usage: { tokens: 10, cost: 0 } };
-      },
+      runRole: ({ signal }) => new Promise((_resolve, reject) => {
+        if (signal.aborted) { reject(new Error("自治会话已取消")); return; }
+        signal.addEventListener("abort", () => reject(new Error("自治会话已取消")), { once: true });
+      }),
     };
     const server = createTestServer(":memory:", adapter);
     const first = await createExperiment(server, "运行实验一");
@@ -221,14 +242,9 @@ describe("实验工作台 API", () => {
     const conflict = await server.inject({ method: "POST", url: `/api/experiments/${second.id}/runtime/start` });
     expect(conflict.statusCode).toBe(409);
     expect(conflict.json<DomainErrorResponse>().error.message).toMatch(/已有运行中的实验/);
-    await server.inject({ method: "POST", url: `/api/experiments/${first.id}/runtime/pause` });
-    release();
-    let committed = (await server.inject({ method: "GET", url: `/api/experiments/${first.id}/runtime` })).json();
-    for (let attempt = 0; attempt < 100 && committed.generation === 0; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      committed = (await server.inject({ method: "GET", url: `/api/experiments/${first.id}/runtime` })).json();
-    }
-    expect(committed).toMatchObject({ state: "paused", generation: 1, stagnationCount: 1, usage: { tokens: 20, cost: 0 } });
+    const paused = await server.inject({ method: "POST", url: `/api/experiments/${first.id}/runtime/pause` });
+    expect(paused.json()).toMatchObject({ state: "paused", generation: 0, usage: { tokens: 0, cost: 0 } });
+    expect((await server.inject({ method: "POST", url: `/api/experiments/${second.id}/runtime/start` })).statusCode).toBe(200);
   });
 
   it("可编程假 Harness 穿过真实本地适配器完成一代 8/24 配对评测", async () => {
@@ -245,6 +261,12 @@ describe("实验工作台 API", () => {
         validateModelProfile: (input) => delegate.validateModelProfile(input),
         smokeModel: (profile) => delegate.smokeModel(profile),
         evolvePlugin: async (request) => {
+          if (request.generation > 1) {
+            await new Promise((_resolve, reject) => {
+              if (request.signal?.aborted) { reject(new Error("自治任务已取消")); return; }
+              request.signal?.addEventListener("abort", () => reject(new Error("自治任务已取消")), { once: true });
+            });
+          }
           providerCalls[request.role] += 1;
           if (providerCalls[request.role] > 1) {
             cpSync(join(packagesRoot, `${request.role}-plugin/dist`), join(request.workspace, "dist"), { recursive: true });
@@ -257,7 +279,6 @@ describe("实验工作台 API", () => {
     const experiment = await createExperiment(server, "真实本地适配器实验");
     await validateAndConfirm(server, experiment.id);
     expect((await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/start` })).statusCode).toBe(200);
-    await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/pause` });
 
     let snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` }))
       .json<import("@maze-arena/contracts").ExperimentRuntimeSnapshot>();
@@ -265,13 +286,125 @@ describe("实验工作台 API", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
       snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json();
     }
+    await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/pause` });
+    snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json();
     expect(snapshot).toMatchObject({ state: "paused", generation: 1, usage: { tokens: 400, cost: 0 } });
     expect(providerCalls).toEqual({ generator: 2, solver: 2 });
     expect(snapshot.generations[0]).toMatchObject({
       generator: { outcome: "tie", publicProgress: 8, hiddenProgress: 24 },
       solver: { outcome: "tie", publicProgress: 8, hiddenProgress: 24 },
     });
+    const audit = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/audit-events` }))
+      .json<import("@maze-arena/contracts").ExperimentAuditEventPage>();
+    const allHarnessEvents = audit.events.filter(({ type }) => type === "harness.activity");
+    const harnessEvents = allHarnessEvents.filter(({ details }) => details.outcome === "succeeded");
+    expect(harnessEvents).toHaveLength(4);
+    expect(harnessEvents.every(({ details }) => details.executionKind === "fake" && details.protocolVersion === 1)).toBe(true);
+    expect(new Set(harnessEvents.map(({ details }) => details.sessionId)).size).toBe(2);
+    for (const role of ["generator", "solver"] as const) {
+      expect(new Set(harnessEvents.filter(({ details }) => details.role === role).map(({ details }) => details.sessionId)).size).toBe(1);
+    }
+    expect(allHarnessEvents.some(({ details }) => details.outcome === "failed" && details.failureKind === "unknown")).toBe(true);
   }, 20_000);
+
+  it.each([
+    ["protocol", 2, 107, 0.27],
+    ["transient-provider", 6, 321, 0.81],
+  ] as const)("本地适配器在前次成功、后续 %s 失败时合并可信用量且不双计", async (kind, expectedCalls, tokens, cost) => {
+    const directory = mkdtempSync(join(tmpdir(), `maze-local-usage-${kind}-`));
+    const databasePath = join(directory, "arena.sqlite");
+    const delegate = new DeterministicFakeHarnessAdapter();
+    let providerCalls = 0;
+    const server = createArenaServer({
+      databasePath,
+      matchRunner: deterministicMatchRunner,
+      harnessAdapter: {
+        listModels: () => delegate.listModels(),
+        validateModelProfile: (input) => delegate.validateModelProfile(input),
+        smokeModel: (modelProfile) => delegate.smokeModel(modelProfile),
+        evolvePlugin: async (request) => {
+          providerCalls += 1;
+          if (providerCalls % 2 === 1) return delegate.evolvePlugin(request);
+          throw new HarnessInvocationError("受控失败", kind, { tokens: 7, cost: 0.27 }, {
+            kind: "fake",
+            protocolVersion: 1,
+            sessionId: request.sessionId,
+            harnessVersion: "fake",
+            providerId: request.modelProfile.providerId,
+            modelId: request.modelProfile.modelId,
+          });
+        },
+      },
+    });
+    servers.push(server);
+    const experiment = await createExperiment(server, `${kind} 用量合并`);
+    await validateAndConfirm(server, experiment.id);
+    await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/start` });
+    let snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` }))
+      .json<import("@maze-arena/contracts").ExperimentRuntimeSnapshot>();
+    for (let attempt = 0; attempt < 500 && snapshot.state !== "paused"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json();
+    }
+
+    expect(providerCalls).toBe(expectedCalls);
+    expect(snapshot).toMatchObject({ state: "paused", generation: 0, usage: { tokens, cost } });
+  }, 20_000);
+
+  it.each([
+    ["deterministic-fixture", "2026.09.fixture"],
+    ["real-provider", "2026.09.real"],
+  ] as const)("失败审计保留 %s 的结构化执行身份且不记录模型自由文本", async (kind, harnessVersion) => {
+    const delegate = new DeterministicFakeHarnessAdapter();
+    const server = createArenaServer({
+      databasePath: ":memory:",
+      matchRunner: deterministicMatchRunner,
+      harnessAdapter: {
+        listModels: () => delegate.listModels(),
+        validateModelProfile: (input) => delegate.validateModelProfile(input),
+        smokeModel: (modelProfile) => delegate.smokeModel(modelProfile),
+        evolvePlugin: async (request) => {
+          throw new HarnessInvocationError("sk-secret-value-must-not-persist", "protocol", { tokens: 37, cost: 0.25 }, {
+            kind,
+            protocolVersion: 1,
+            sessionId: request.sessionId,
+            harnessVersion,
+            providerId: request.modelProfile.providerId,
+            modelId: request.modelProfile.modelId,
+          });
+        },
+      },
+    });
+    servers.push(server);
+    const experiment = await createExperiment(server, `${kind} 失败审计`);
+    await validateAndConfirm(server, experiment.id);
+    await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/start` });
+    let snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` }))
+      .json<import("@maze-arena/contracts").ExperimentRuntimeSnapshot>();
+    for (let attempt = 0; attempt < 300 && snapshot.state !== "paused"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json();
+    }
+
+    expect(snapshot).toMatchObject({ state: "paused", usage: { tokens: 37, cost: 0.25 } });
+    const audit = await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/audit-events` });
+    const activity = audit.json<import("@maze-arena/contracts").ExperimentAuditEventPage>().events
+      .find(({ type }) => type === "harness.activity");
+    expect(activity?.details).toMatchObject({
+      executionKind: kind,
+      protocolVersion: 1,
+      harnessVersion,
+      providerId: "fake-basic",
+      modelId: "compact-v1",
+      outcome: "failed",
+      failureKind: "protocol",
+      usageTokens: 37,
+      usageCost: 0.25,
+    });
+    expect(audit.body).not.toContain("sk-secret-value-must-not-persist");
+    expect(audit.body).not.toContain("reasoning");
+    expect(audit.body).not.toContain("toolActivity");
+  });
 
   it("比较克隆继承密封套件且展示局不改变代次、冠军或用量", async () => {
     const server = createTestServer(":memory:");
@@ -705,7 +838,7 @@ describe("实验工作台 API", () => {
 
     expect(response.statusCode).toBe(200);
     const detail = await server.inject({ method: "GET", url: `/api/experiments/${created.id}` });
-    expect(detail.json<Experiment>()).toMatchObject({ status: "running", modelProfile: created.modelProfile });
+    expect(detail.json<Experiment>()).toMatchObject({ status: "paused", modelProfile: created.modelProfile });
   });
 
   it("基线冻结后目录变化不改变实验模型配置且不阻止启动", async () => {
@@ -911,7 +1044,7 @@ describe("实验工作台 API", () => {
         reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
       } }] }],
     }));
-    writeFileSync(commandPath, `#!/usr/bin/env node\nlet input="";for await(const chunk of process.stdin)input+=chunk;const request=JSON.parse(input);process.stdout.write(JSON.stringify({hypothesis:request.attemptId,strategyPlan:"plan",submitted:true,usage:{tokens:321,cost:0.12},reasoning:"provider reasoning",toolActivity:"read,test"}));\n`);
+    writeFileSync(commandPath, `#!/usr/bin/env node\nlet input="";for await(const chunk of process.stdin)input+=chunk;const request=JSON.parse(input);process.stdout.write(JSON.stringify({type:"maze-arena.harness-evolution.response",protocolVersion:1,sessionId:request.session.id,result:{hypothesis:request.attempt.attemptId,strategyPlan:"plan",submitted:true,reasoning:"provider reasoning",toolActivity:"read,test"},usage:{tokens:321,cost:0.12}}));\n`);
     writeFileSync(smokePath, `#!/usr/bin/env node\nlet input="";for await(const chunk of process.stdin)input+=chunk;const request=JSON.parse(input);process.stdout.write(JSON.stringify({providerText:request.modelProfile.modelId+":"+process.env.DSH_HARNESS_OPERATION}));\n`);
     chmodSync(commandPath, 0o755);
     chmodSync(smokePath, 0o755);
@@ -921,11 +1054,173 @@ describe("实验工作台 API", () => {
     });
     const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model", credentialRef: "dsh-credential://production",
       contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
-    await expect(adapter.evolvePlugin!({ experimentId: "exp", generation: 1, role: "generator", attemptId: "attempt-1",
-      modelProfile, workspace: directory, repairAttempt: 0, diagnostics: [] })).resolves.toMatchObject({
+    await expect(adapter.evolvePlugin!(productionEvolutionRequest({ experimentId: "exp", generation: 1, role: "generator", attemptId: "attempt-1",
+      modelProfile, workspace: directory, repairAttempt: 0, diagnostics: [] }))).resolves.toMatchObject({
       hypothesis: "attempt-1", usage: { tokens: 321, cost: 0.12 }, reasoning: "provider reasoning",
+      execution: { kind: "real-provider", protocolVersion: 1, providerId: "provider", modelId: "model" },
     });
     await expect(adapter.smokeModel!(modelProfile)).resolves.toMatchObject({ providerText: "model:smoke" });
+  });
+
+  it("生产 Harness 每次调用前复核实例快照，依赖载荷漂移后关闭失败", async () => {
+    const runtimeRoot = mkdtempSync(join(tmpdir(), "maze-frozen-harness-"));
+    const exportPath = join(runtimeRoot, "models.json");
+    const commandPath = join(runtimeRoot, "harness.mjs");
+    const dependencyPath = join(runtimeRoot, "runtime-dependency.txt");
+    writeFileSync(exportPath, JSON.stringify({
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
+        reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
+      } }] }],
+    }));
+    writeFileSync(dependencyPath, "A\n");
+    writeFileSync(commandPath, `#!/usr/bin/env node
+import { readFileSync } from "node:fs";
+process.stdin.resume();
+process.stdin.on("end", () => process.stdout.write(JSON.stringify({ providerText: readFileSync(${JSON.stringify(dependencyPath)}, "utf8").trim() })));
+`);
+    chmodSync(commandPath, 0o755);
+    const payloadSha256 = hashHarnessRuntimePayload(runtimeRoot);
+    const adapter = createProductionHarnessAdapter({
+      ARENA_MODEL_CATALOG_PATH: exportPath,
+      DSH_HARNESS_VERSION: "2026.09.2",
+      DSH_EVOLUTION_COMMAND: commandPath,
+      DSH_SMOKE_COMMAND: commandPath,
+      DSH_HARNESS_RUNTIME_ROOT: runtimeRoot,
+      DSH_HARNESS_RUNTIME_SHA256: payloadSha256,
+    });
+    const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model",
+      credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+
+    await expect(adapter.smokeModel!(modelProfile)).resolves.toEqual({ providerText: "A" });
+    writeFileSync(dependencyPath, "B\n");
+    await expect(adapter.smokeModel!(modelProfile)).rejects.toThrow(/Harness runtime 冻结载荷身份已漂移/);
+  });
+
+  it("确定性 Harness 夹具通过生产会话协议在空 home 和净化工作区中实际编辑源码", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-deterministic-protocol-"));
+    const exportPath = join(directory, "models.json");
+    const workspace = join(directory, "workspace");
+    const globalHome = join(directory, "global-home");
+    mkdirSync(join(workspace, "src"), { recursive: true });
+    mkdirSync(globalHome);
+    writeFileSync(join(globalHome, "readonly.txt"), "locked");
+    writeFileSync(join(workspace, "package.json"), JSON.stringify({ name: "fixture-plugin", version: "1.0.0" }));
+    writeFileSync(join(workspace, "src/index.ts"), "export const baseline = true;\n");
+    writeFileSync(exportPath, JSON.stringify({
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
+        reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
+      } }] }],
+    }));
+    const commandPath = resolve(dirname(fileURLToPath(import.meta.url)), "../test/fixtures/deterministic-evolution-harness.mjs");
+    const adapter = createProductionHarnessAdapter({
+      ARENA_MODEL_CATALOG_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
+      DSH_EVOLUTION_COMMAND: commandPath, DSH_SMOKE_COMMAND: "/bin/false",
+      DSH_EVOLUTION_EXECUTION_KIND: "deterministic-fixture",
+      DSH_HOME: globalHome,
+    });
+    const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model",
+      credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+
+    const request = productionEvolutionRequest({
+      experimentId: "exp", generation: 1, role: "generator", attemptId: "deterministic-1",
+      modelProfile, workspace, repairAttempt: 0, diagnostics: [],
+    });
+    const response = await adapter.evolvePlugin!(request);
+
+    expect(readFileSync(join(workspace, "src/index.ts"), "utf8")).toContain("deterministicEvolutionAttempt");
+    expect(existsSync(join(workspace, "dist"))).toBe(false);
+    expect(readFileSync(join(globalHome, "readonly.txt"), "utf8")).toBe("locked");
+    expect(readFileSync(join(request.home, "session-write.txt"), "utf8")).toBe("allowed");
+    expect(response).toMatchObject({
+      submitted: true,
+      usage: { tokens: 64, cost: 0 },
+      execution: { kind: "deterministic-fixture", protocolVersion: 1, harnessVersion: "2026.09.2" },
+    });
+    expect(response.execution.sessionId).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it("生产 Harness 隐藏宿主运行时 socket 且仍允许 Session 目录读写", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-production-ipc-"));
+    const exportPath = join(directory, "models.json");
+    const commandPath = join(directory, "ipc-check.mjs");
+    const hostSocket = resolve(dirname(fileURLToPath(import.meta.url)), `../../../.maze-host-${randomUUID()}.sock`);
+    const abstractSocket = `\0maze-ticket05-${randomUUID()}`;
+    const mountedSocket = "/mnt/wslg/runtime-dir/wayland-0";
+    const workspace = join(directory, "workspace");
+    const globalHome = join(directory, "global-home");
+    mkdirSync(workspace);
+    mkdirSync(globalHome);
+    writeFileSync(join(workspace, "package.json"), JSON.stringify({ name: "ipc-fixture", version: "1.0.0" }));
+    writeFileSync(exportPath, JSON.stringify({
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
+        reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
+      } }] }],
+    }));
+    writeFileSync(commandPath, `#!/usr/bin/env node
+import { existsSync, writeFileSync } from "node:fs";
+import { createConnection, createServer } from "node:net";
+let input="";for await(const chunk of process.stdin)input+=chunk;const request=JSON.parse(input);
+const connectable=(path)=>new Promise((resolve)=>{const socket=createConnection(path);const finish=(value)=>{socket.destroy();resolve(value)};socket.once("connect",()=>finish({connected:true}));socket.once("error",(error)=>finish({connected:false,code:error.code}));socket.setTimeout(200,()=>finish({connected:false,code:"TIMEOUT"}));});
+const tcpLoopback=()=>new Promise((resolve)=>{const server=createServer((socket)=>socket.end());server.once("error",()=>resolve(false));server.listen(0,"127.0.0.1",()=>{const address=server.address();if(!address||typeof address==="string"){server.close();return resolve(false)}const client=createConnection({host:"127.0.0.1",port:address.port});client.once("connect",()=>{client.end();server.close(()=>resolve(true))});client.once("error",()=>{server.close();resolve(false)})})});
+const dockerPaths=["/run/docker.sock","/var/run/docker.sock"];
+const writable=(path)=>{try{writeFileSync(path,"forbidden");return true}catch{return false}};
+const mountedSocket=${JSON.stringify(mountedSocket)};
+const dockerConnections=await Promise.all(dockerPaths.map(connectable));
+const result={dockerVisible:dockerPaths.some(existsSync),dockerConnect:dockerConnections.some((value)=>value.connected),homeVisible:existsSync(${JSON.stringify(hostSocket)}),homeConnect:(await connectable(${JSON.stringify(hostSocket)})).connected,mountVisible:existsSync(mountedSocket),mountConnect:(await connectable(mountedSocket)).connected,abstractConnect:await connectable(${JSON.stringify(abstractSocket)}),tcpLoopback:await tcpLoopback(),tmpWritable:writable("/tmp/unscoped-write"),runWritable:writable("/run/unscoped-write")};
+writeFileSync(request.session.home+"/ipc-session-write.txt","allowed");
+writeFileSync(request.session.workspace+"/ipc-workspace-write.txt","allowed");
+process.stdout.write(JSON.stringify({type:"maze-arena.harness-evolution.response",protocolVersion:1,sessionId:request.session.id,result:{hypothesis:JSON.stringify(result),strategyPlan:"ipc boundary",submitted:false},usage:{tokens:1,cost:0}}));
+`);
+    chmodSync(commandPath, 0o755);
+    const listener = createNetServer();
+    const abstractListener = createNetServer();
+    await new Promise<void>((resolveListen, rejectListen) => {
+      listener.once("error", rejectListen);
+      listener.listen(hostSocket, () => resolveListen());
+    });
+    await new Promise<void>((resolveListen, rejectListen) => {
+      abstractListener.once("error", rejectListen);
+      abstractListener.listen(abstractSocket, () => resolveListen());
+    });
+    try {
+      const adapter = createProductionHarnessAdapter({
+        ARENA_MODEL_CATALOG_PATH: exportPath,
+        DSH_HARNESS_VERSION: "2026.09.2",
+        DSH_EVOLUTION_COMMAND: commandPath,
+        DSH_SMOKE_COMMAND: "/bin/false",
+        DSH_HOME: globalHome,
+      });
+      const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model",
+        credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+      const request = productionEvolutionRequest({
+        experimentId: "exp", generation: 1, role: "generator", attemptId: "ipc-check",
+        modelProfile, workspace, repairAttempt: 0, diagnostics: [],
+      });
+
+      const response = await adapter.evolvePlugin!(request);
+
+      expect(JSON.parse(response.hypothesis)).toEqual({
+        dockerVisible: false,
+        dockerConnect: false,
+        homeVisible: false,
+        homeConnect: false,
+        mountVisible: false,
+        mountConnect: false,
+        abstractConnect: { connected: false, code: "EAFNOSUPPORT" },
+        tcpLoopback: true,
+        tmpWritable: false,
+        runWritable: false,
+      });
+      expect(readFileSync(join(request.home, "ipc-session-write.txt"), "utf8")).toBe("allowed");
+      expect(readFileSync(join(workspace, "ipc-workspace-write.txt"), "utf8")).toBe("allowed");
+    } finally {
+      await new Promise<void>((resolveClose, rejectClose) => listener.close((error) => error ? rejectClose(error) : resolveClose()));
+      await new Promise<void>((resolveClose, rejectClose) => abstractListener.close((error) => error ? rejectClose(error) : resolveClose()));
+      rmSync(hostSocket, { force: true });
+    }
   });
 
   it("生产 Harness 模型调用失败不回显第三方 stderr", async () => {
@@ -948,8 +1243,8 @@ describe("实验工作台 API", () => {
       credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
     let message = "";
     try {
-      await adapter.evolvePlugin!({ experimentId: "exp", generation: 1, role: "generator", attemptId: "attempt",
-        modelProfile, workspace: directory, repairAttempt: 0, diagnostics: [] });
+      await adapter.evolvePlugin!(productionEvolutionRequest({ experimentId: "exp", generation: 1, role: "generator", attemptId: "attempt",
+        modelProfile, workspace: directory, repairAttempt: 0, diagnostics: [] }));
     } catch (error) {
       message = (error as Error).message;
     }
@@ -991,7 +1286,27 @@ describe("实验工作台 API", () => {
         reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
       } }] }],
     }));
-    writeFileSync(commandPath, `#!/usr/bin/env node\nlet input="";for await(const chunk of process.stdin)input+=chunk;const request=JSON.parse(input);if(request.attemptId==="block"){setInterval(()=>{},1000);await new Promise(()=>{});}process.stdout.write(JSON.stringify({hypothesis:"h",strategyPlan:"p",submitted:true,usage:{tokens:1,cost:0,untrusted:true}}));\n`);
+    writeFileSync(commandPath, `#!/usr/bin/env node
+let input="";for await(const chunk of process.stdin)input+=chunk;const request=JSON.parse(input);
+const mode=request.attempt.attemptId;
+if(mode==="block"){setInterval(()=>{},1000);await new Promise(()=>{});}
+if(mode==="non-json"){process.stdout.write("not-json");process.exit(0);}
+if(mode==="transient-provider"){process.stdout.write(JSON.stringify({
+  type:"maze-arena.harness-evolution.response",protocolVersion:1,sessionId:request.session.id,
+  error:{kind:"transient-provider",code:"RATE_LIMITED"},usage:{tokens:7,cost:0.02},
+}));process.exit(0);}
+if(mode==="unknown-field"){process.stdout.write(JSON.stringify({
+  type:"maze-arena.harness-evolution.response",protocolVersion:1,sessionId:request.session.id,
+  result:{hypothesis:"h",strategyPlan:"p",submitted:true},usage:{tokens:37,cost:0.25},unexpected:true,
+}));process.exit(0);}
+process.stdout.write(JSON.stringify({
+  type:"maze-arena.harness-evolution.response",
+  protocolVersion:mode==="future-version"?2:1,
+  sessionId:request.session.id,
+  result:{hypothesis:"h",strategyPlan:"p",submitted:true},
+  usage:mode==="excessive-usage"?{tokens:5001,cost:0}:{tokens:1,cost:0,untrusted:true},
+}));
+`);
     chmodSync(commandPath, 0o755);
     const adapter = createProductionHarnessAdapter({
       ARENA_MODEL_CATALOG_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
@@ -999,9 +1314,24 @@ describe("实验工作台 API", () => {
     });
     const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model", credentialRef: "dsh-credential://production",
       contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
-    const request = { experimentId: "exp", generation: 1, role: "generator" as const,
-      modelProfile, workspace: directory, repairAttempt: 0, diagnostics: [] };
+    const request = productionEvolutionRequest({ experimentId: "exp", generation: 1, role: "generator" as const,
+      attemptId: "invalid", modelProfile, workspace: directory, repairAttempt: 0, diagnostics: [] });
     await expect(adapter.evolvePlugin!({ ...request, attemptId: "invalid" })).rejects.toThrow(/响应字段非法/);
+    await expect(adapter.evolvePlugin!(productionEvolutionRequest({ ...request, attemptId: "future-version" })))
+      .rejects.toThrow(/响应字段非法/);
+    await expect(adapter.evolvePlugin!(productionEvolutionRequest({ ...request, attemptId: "excessive-usage" })))
+      .rejects.toMatchObject({ name: "HarnessInvocationError", kind: "protocol", usage: undefined });
+    await expect(adapter.evolvePlugin!(productionEvolutionRequest({ ...request, attemptId: "non-json" })))
+      .rejects.toThrow(/未返回合法 JSON/);
+    await expect(adapter.evolvePlugin!(productionEvolutionRequest({ ...request, attemptId: "transient-provider" })))
+      .rejects.toMatchObject({ name: "HarnessInvocationError", kind: "transient-provider", usage: { tokens: 7, cost: 0.02 } });
+    await expect(adapter.evolvePlugin!(productionEvolutionRequest({ ...request, attemptId: "unknown-field" })))
+      .rejects.toMatchObject({
+        name: "HarnessInvocationError",
+        kind: "protocol",
+        usage: { tokens: 37, cost: 0.25 },
+        execution: { kind: "real-provider", harnessVersion: "2026.09.2", providerId: "provider", modelId: "model" },
+      });
 
     const controller = new AbortController();
     const blocked = adapter.evolvePlugin!({ ...request, attemptId: "block", signal: controller.signal });
@@ -1025,19 +1355,20 @@ import { spawn } from "node:child_process";
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const request = JSON.parse(input);
-const marker = ${JSON.stringify(directory)} + ":" + request.attemptId;
+const marker = ${JSON.stringify(directory)} + ":" + request.attempt.attemptId;
 spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)", marker], {
   stdio: "ignore",
   detached: true,
 });
-writeFileSync(${JSON.stringify(directory)} + "/" + request.attemptId + ".ready", marker);
+writeFileSync(${JSON.stringify(directory)} + "/" + request.attempt.attemptId + ".ready", marker);
 process.on("SIGTERM", () => {});
 setTimeout(() => {
-  if (request.attemptId === "stdout-limit") process.stdout.write(Buffer.alloc(1024 * 1024 + 1, 0x78));
-  if (request.attemptId === "stderr-limit") process.stderr.write(Buffer.alloc(1024 * 1024 + 1, 0x78));
-  if (request.attemptId === "error") process.exit(7);
-  if (request.attemptId === "success") {
-    process.stdout.write(JSON.stringify({ hypothesis: "h", strategyPlan: "p", submitted: true, usage: { tokens: 1, cost: 0 } }));
+  if (request.attempt.attemptId === "stdout-limit") process.stdout.write(Buffer.alloc(1024 * 1024 + 1, 0x78));
+  if (request.attempt.attemptId === "stderr-limit") process.stderr.write(Buffer.alloc(1024 * 1024 + 1, 0x78));
+  if (request.attempt.attemptId === "error") process.exit(7);
+  if (request.attempt.attemptId === "success") {
+    process.stdout.write(JSON.stringify({ type: "maze-arena.harness-evolution.response", protocolVersion: 1,
+      sessionId: request.session.id, result: { hypothesis: "h", strategyPlan: "p", submitted: true }, usage: { tokens: 1, cost: 0 } }));
     process.exit(0);
   }
 }, 100);
@@ -1053,8 +1384,8 @@ setInterval(() => {}, 1000);
       credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
     const assertTreeStopped = async (attemptId: "success" | "cancel" | "timeout" | "stdout-limit" | "stderr-limit" | "error") => {
       const controller = new AbortController();
-      const running = adapter.evolvePlugin!({ experimentId: "exp", generation: 1, role: "generator", attemptId,
-        modelProfile, workspace: directory, repairAttempt: 0, diagnostics: [], signal: controller.signal });
+      const running = adapter.evolvePlugin!(productionEvolutionRequest({ experimentId: "exp", generation: 1, role: "generator", attemptId,
+        modelProfile, workspace: directory, repairAttempt: 0, diagnostics: [], signal: controller.signal }));
       const readyPath = join(directory, `${attemptId}.ready`);
       for (let attempt = 0; attempt < 100 && !existsSync(readyPath); attempt += 1) {
         await new Promise((resolveWait) => setTimeout(resolveWait, 10));

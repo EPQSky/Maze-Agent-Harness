@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  createHarnessNetworkSeccompProgram,
   DeterministicFakeHarnessAdapter,
   ExportedHarnessConfigAdapter,
   HarnessConfigurationError,
@@ -14,6 +15,24 @@ import {
 
 describe("Harness 模型适配层", () => {
   const adapter = new DeterministicFakeHarnessAdapter();
+
+  it.each([
+    ["x64", 0xc000003e, 41, 53],
+    ["arm64", 0xc00000b7, 198, 199],
+  ])("为 %s 生成阻断 AF_UNIX 的 seccomp 程序", (architecture, auditArchitecture, socketSystemCall, socketPairSystemCall) => {
+    const program = createHarnessNetworkSeccompProgram(architecture);
+    expect(program.length).toBe(14 * 8);
+    expect(program.readUInt32LE(12)).toBe(auditArchitecture);
+    expect(program.readUInt32LE(6 * 8 + 4)).toBe(socketSystemCall);
+    expect(program.readUInt32LE(7 * 8 + 4)).toBe(socketPairSystemCall);
+    expect(program.readUInt32LE(12 * 8 + 4)).toBe(0x00050061);
+    expect(program.readUInt32LE(13 * 8 + 4)).toBe(0x7fff0000);
+  });
+
+  it("对未知 CPU 架构关闭失败", () => {
+    expect(() => createHarnessNetworkSeccompProgram("unsupported-test-architecture"))
+      .toThrowError(/不支持当前 CPU 架构/);
+  });
 
   it("暴露能力集合不同的提供方并规范化有效配置", () => {
     const catalog = adapter.listModels();

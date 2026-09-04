@@ -250,6 +250,9 @@ importers:
       '@maze-arena/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@maze-arena/dsh-integration':
+        specifier: workspace:*
+        version: link:../dsh-integration
       '@maze-arena/engine':
         specifier: workspace:*
         version: link:../engine

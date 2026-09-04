@@ -1,4 +1,4 @@
-import { cpSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -127,5 +127,18 @@ describe("插件 Git 谱系与晋级标签", () => {
     const solver = await repository.commitCandidate({ experimentId: "exp-5", role: "solver", sourceRoot: candidate(root, "s"), attemptId: "s1", hypothesis: "s", resultSummary: "ok", outcome: "promoted", generation: 2 });
     expect(generator.promotionTag).toBe("promotion/exp-5/generator/g0002");
     expect(solver.promotionTag).toBe("promotion/exp-5/solver/g0002");
+  });
+
+  it("候选复制入口拒绝符号链接源树且不会污染谱系工作树", async () => {
+    const { root, repository } = setup();
+    await repository.initialize("exp-unsafe", "generator", fixture);
+    const source = candidate(root, "unsafe");
+    symlinkSync("/etc/passwd", join(source, "unsafe-link"));
+
+    await expect(repository.commitCandidate({
+      experimentId: "exp-unsafe", role: "generator", sourceRoot: source, attemptId: "unsafe",
+      hypothesis: "链接绕过", resultSummary: "不应保存", outcome: "failed",
+    })).rejects.toThrow(/符号链接/);
+    expect(repository.listHistory("exp-unsafe", "generator")).toHaveLength(1);
   });
 });

@@ -1,6 +1,20 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import {
+  closeSync,
+  lstatSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  readSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   isSensitiveProviderOptionName,
   type HarnessAgentEnvironments,
@@ -19,13 +33,436 @@ export interface HarnessAdapter {
   evolvePlugin?(request: HarnessEvolutionRequest): Promise<HarnessEvolutionResponse>;
 }
 
+export const HARNESS_EVOLUTION_PROTOCOL_VERSION = 1 as const;
+export const HARNESS_EVOLUTION_REQUEST_TYPE = "maze-arena.harness-evolution.request" as const;
+export const HARNESS_EVOLUTION_RESPONSE_TYPE = "maze-arena.harness-evolution.response" as const;
+export const HARNESS_EVOLUTION_ALLOWED_TOOLS = Object.freeze([
+  "read", "edit", "search", "shell", "test", "public-check", "submit",
+] as const);
+
+const SECCOMP_DATA_ARCH_OFFSET = 4;
+const SECCOMP_DATA_ARGUMENTS_OFFSET = 16;
+const X32_SYSCALL_BIT = 0x40000000;
+const ADDRESS_FAMILY_UNIX = 1;
+const SECCOMP_RETURN_ALLOW = 0x7fff0000;
+const SECCOMP_RETURN_KILL_PROCESS = 0x80000000;
+const SECCOMP_RETURN_ERRNO = 0x00050000;
+const ERROR_ADDRESS_FAMILY_NOT_SUPPORTED = 97;
+const ERROR_FUNCTION_NOT_IMPLEMENTED = 38;
+const ISOLATED_PROCESS_POLL_MS = 10;
+const ISOLATED_NAMESPACE_STARTUP_TIMEOUT_MS = 1_000;
+const ISOLATED_TERMINATION_GRACE_MS = 250;
+const ISOLATED_FORCE_KILL_CONFIRMATION_MS = 1_000;
+
+interface SeccompArchitecture {
+  auditArchitecture: number;
+  socketSystemCall: number;
+  socketPairSystemCall: number;
+}
+
+const seccompArchitectures: Readonly<Record<string, SeccompArchitecture>> = Object.freeze({
+  x64: { auditArchitecture: 0xc000003e, socketSystemCall: 41, socketPairSystemCall: 53 },
+  arm64: { auditArchitecture: 0xc00000b7, socketSystemCall: 198, socketPairSystemCall: 199 },
+});
+
+/** 生成供 bubblewrap 使用的经典 BPF，阻断宿主路径和抽象命名空间中的 Unix socket。 */
+export function createHarnessNetworkSeccompProgram(architecture: string = process.arch): Buffer {
+  const selected = seccompArchitectures[architecture];
+  if (!selected) throw new HarnessConfigurationError(`Harness 网络隔离不支持当前 CPU 架构：${architecture}`);
+  const instructions = [
+    [0x20, 0, 0, SECCOMP_DATA_ARCH_OFFSET],
+    [0x15, 1, 0, selected.auditArchitecture],
+    [0x06, 0, 0, SECCOMP_RETURN_KILL_PROCESS],
+    [0x20, 0, 0, 0],
+    [0x35, 0, 1, X32_SYSCALL_BIT],
+    [0x06, 0, 0, SECCOMP_RETURN_ERRNO | ERROR_FUNCTION_NOT_IMPLEMENTED],
+    [0x15, 1, 0, selected.socketSystemCall],
+    [0x15, 2, 5, selected.socketPairSystemCall],
+    [0x20, 0, 0, SECCOMP_DATA_ARGUMENTS_OFFSET],
+    [0x15, 2, 3, ADDRESS_FAMILY_UNIX],
+    [0x20, 0, 0, SECCOMP_DATA_ARGUMENTS_OFFSET],
+    [0x15, 0, 1, ADDRESS_FAMILY_UNIX],
+    [0x06, 0, 0, SECCOMP_RETURN_ERRNO | ERROR_ADDRESS_FAMILY_NOT_SUPPORTED],
+    [0x06, 0, 0, SECCOMP_RETURN_ALLOW],
+  ] as const;
+  const program = Buffer.alloc(instructions.length * 8);
+  instructions.forEach(([code, jumpTrue, jumpFalse, value], index) => {
+    const offset = index * 8;
+    program.writeUInt16LE(code, offset);
+    program.writeUInt8(jumpTrue, offset + 2);
+    program.writeUInt8(jumpFalse, offset + 3);
+    program.writeUInt32LE(value >>> 0, offset + 4);
+  });
+  return program;
+}
+
+/** 对正式运行载荷的目录、权限、链接目标和文件内容生成稳定身份。 */
+export function hashHarnessRuntimePayload(runtimeRoot: string): string {
+  const root = realpathSync(resolve(runtimeRoot));
+  if (!lstatSync(root).isDirectory()) throw new HarnessConfigurationError("Harness runtime root 必须为目录");
+  const digest = createHash("sha256");
+  const pending = [root];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    const local = relative(root, current).split(sep).join("/") || ".";
+    const stat = lstatSync(current);
+    if (stat.isDirectory()) {
+      digest.update(`directory\0${local}\0${stat.mode & 0o777}\0`);
+      pending.push(...readdirSync(current).map((entry) => join(current, entry)).sort().reverse());
+    } else if (stat.isFile()) {
+      digest.update(`file\0${local}\0${stat.mode & 0o777}\0${stat.size}\0`);
+      digest.update(readFileSync(current));
+      digest.update("\0");
+    } else if (stat.isSymbolicLink()) {
+      const target = readlinkSync(current);
+      const resolvedTarget = realpathSync(current);
+      const relation = relative(root, resolvedTarget);
+      if (relation === ".." || relation.startsWith(`..${sep}`) || isAbsolute(relation)) {
+        throw new HarnessConfigurationError(`Harness runtime 载荷符号链接越出运行根：${local}`);
+      }
+      digest.update(`symlink\0${local}\0${target}\0`);
+    } else {
+      throw new HarnessConfigurationError(`Harness runtime 载荷包含不支持的文件类型：${local}`);
+    }
+  }
+  return digest.digest("hex");
+}
+
+export interface IsolatedHarnessCommandOptions {
+  command: string;
+  args: readonly string[];
+  runtimeRoot: string;
+  expectedRuntimePayloadSha256: string;
+  environment: NodeJS.ProcessEnv;
+  timeoutMs: number;
+  stdin?: string;
+  outputLimitBytes?: number;
+  cwd?: string;
+  writablePaths?: readonly string[];
+  readOnlyPaths?: readonly string[];
+  unshareCommand?: string;
+  bubblewrapCommand?: string;
+  signal?: AbortSignal;
+}
+
+export interface IsolatedHarnessCommandResult {
+  stdout: string;
+  exitCode: number;
+}
+
+export class IsolatedHarnessCommandError extends Error {
+  constructor(
+    message: string,
+    readonly kind: "cancelled" | "timeout" | "output" | "process" | "exit",
+    readonly exitCode?: number | null,
+  ) {
+    super(message);
+    this.name = "IsolatedHarnessCommandError";
+  }
+}
+
+/** 在最小只读宿主视图中执行 Harness 子命令，并在返回前收敛整个 PID namespace。 */
+export async function runIsolatedHarnessCommand(
+  options: IsolatedHarnessCommandOptions,
+): Promise<IsolatedHarnessCommandResult> {
+  const timeoutMs = options.timeoutMs;
+  const outputLimitBytes = options.outputLimitBytes ?? 1024 * 1024;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || !Number.isSafeInteger(outputLimitBytes) || outputLimitBytes < 1) {
+    throw new IsolatedHarnessCommandError("Harness 隔离命令资源限制无效", "process");
+  }
+  const runtimeRoot = isolatedRealDirectory(options.runtimeRoot, "Harness runtime root");
+  if (hashHarnessRuntimePayload(runtimeRoot) !== options.expectedRuntimePayloadSha256) {
+    throw new IsolatedHarnessCommandError("Harness runtime 冻结载荷身份已漂移", "process");
+  }
+  const command = isolatedRealFile(options.command, "Harness 命令");
+  if (!isolatedNestedPath(runtimeRoot, command)) {
+    throw new IsolatedHarnessCommandError("Harness 命令必须位于冻结 runtime root 内", "process");
+  }
+  const writablePaths = (options.writablePaths ?? []).map((path) => isolatedRealPath(path, "Harness 可写路径"));
+  const readOnlyPaths = (options.readOnlyPaths ?? []).map((path) => isolatedRealPath(path, "Harness 只读路径"));
+  const cwd = options.cwd ? isolatedRealDirectory(options.cwd, "Harness 工作目录") : undefined;
+  if (cwd && !writablePaths.some((path) => isolatedNestedPath(path, cwd))) {
+    throw new IsolatedHarnessCommandError("Harness 工作目录必须位于显式可写路径内", "process");
+  }
+  const sandboxArguments = isolatedRuntimeArguments(command, options.environment, runtimeRoot);
+  for (const path of writablePaths) sandboxArguments.push("--bind", path, path);
+  for (const path of readOnlyPaths) sandboxArguments.push("--ro-bind", path, path);
+  if (cwd) sandboxArguments.push("--chdir", cwd);
+  sandboxArguments.push(
+    "--remount-ro", "/run", "--remount-ro", "/tmp", "--remount-ro", "/var/tmp",
+    "--seccomp", "3", "--", "/bin/sh", "-c", 'IFS= read -r _; exec "$@"',
+    "maze-harness-command-gate", command, ...options.args,
+  );
+  const seccompDescriptor = openIsolatedHarnessSeccompDescriptor();
+  let child: ChildProcessWithoutNullStreams;
+  try {
+    child = spawn(options.unshareCommand ?? "/usr/bin/unshare", [
+      "--user", "--map-current-user", "--pid", "--fork", "--kill-child=SIGKILL", "--mount-proc",
+      options.bubblewrapCommand ?? "/usr/bin/bwrap", ...sandboxArguments,
+    ], {
+      detached: true,
+      stdio: ["pipe", "pipe", "pipe", seccompDescriptor],
+      cwd: "/",
+      env: options.environment,
+    }) as ChildProcessWithoutNullStreams;
+  } finally {
+    closeSync(seccompDescriptor);
+  }
+  const processGroupId = child.pid;
+  const hostNamespace = readlinkSync("/proc/self/ns/pid");
+  const stdout: Buffer[] = [];
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  const code = await new Promise<number | null>((resolveCode, reject) => {
+    let settled = false;
+    let terminalError: Error | undefined;
+    let killTimer: NodeJS.Timeout | undefined;
+    let confirmationTimer: NodeJS.Timeout | undefined;
+    let pollTimer: NodeJS.Timeout | undefined;
+    let closeCode: number | null | undefined;
+    let shuttingDown = false;
+    let namespaceInit: { pid: number; identity: string } | undefined;
+    let namespaceDiscoveryDone = false;
+    const stdoutData = (chunk: Buffer) => append(stdout, chunk, "stdout");
+    const stderrData = (chunk: Buffer) => append(undefined, chunk, "stderr");
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutTimer);
+      if (killTimer) clearTimeout(killTimer);
+      if (confirmationTimer) clearTimeout(confirmationTimer);
+      if (pollTimer) clearTimeout(pollTimer);
+      options.signal?.removeEventListener("abort", abort);
+      child.stdout.off("data", stdoutData);
+      child.stderr.off("data", stderrData);
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      callback();
+    };
+    const groupExists = () => {
+      if (!processGroupId) return false;
+      try { process.kill(-processGroupId, 0); return true; }
+      catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+    };
+    const namespaceExists = () => {
+      if (!namespaceDiscoveryDone) return true;
+      if (!namespaceInit) return false;
+      try { return readlinkSync(`/proc/${namespaceInit.pid}/ns/pid`) === namespaceInit.identity; }
+      catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
+    };
+    const signalGroup = (signal: NodeJS.Signals) => {
+      if (!processGroupId) return;
+      try { process.kill(-processGroupId, signal); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+    };
+    const signalNamespace = (signal: NodeJS.Signals) => {
+      if (!namespaceInit || !namespaceExists()) return;
+      try { process.kill(namespaceInit.pid, signal); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+    };
+    const maybeFinish = () => {
+      if (closeCode === undefined || groupExists() || namespaceExists()) return false;
+      finish(() => terminalError ? reject(terminalError) : resolveCode(closeCode!));
+      return true;
+    };
+    const poll = () => {
+      if (maybeFinish() || settled) return;
+      pollTimer = setTimeout(poll, ISOLATED_PROCESS_POLL_MS);
+    };
+    const terminate = (error?: Error) => {
+      terminalError ??= error;
+      if (shuttingDown) return;
+      shuttingDown = true;
+      child.stdin.destroy();
+      if (namespaceInit) signalNamespace("SIGTERM");
+      else signalGroup("SIGTERM");
+      poll();
+      killTimer = setTimeout(() => {
+        if (groupExists()) signalGroup("SIGKILL");
+        if (namespaceExists()) signalNamespace("SIGKILL");
+        confirmationTimer = setTimeout(() => {
+          if (maybeFinish()) return;
+          finish(() => reject(new IsolatedHarnessCommandError(
+            "Harness 进程组强制终止后无法确认退出",
+            "process",
+          )));
+        }, ISOLATED_FORCE_KILL_CONFIRMATION_MS);
+      }, ISOLATED_TERMINATION_GRACE_MS);
+    };
+    const append = (target: Buffer[] | undefined, chunk: Buffer, kind: "stdout" | "stderr") => {
+      if (kind === "stdout") stdoutBytes += chunk.length;
+      else stderrBytes += chunk.length;
+      if ((kind === "stdout" ? stdoutBytes : stderrBytes) > outputLimitBytes) {
+        terminate(new IsolatedHarnessCommandError(`Harness 进程 ${kind} 超过 ${outputLimitBytes} 字节限制`, "output"));
+        return;
+      }
+      target?.push(chunk);
+    };
+    const abort = () => terminate(new IsolatedHarnessCommandError("Harness 进程已取消", "cancelled"));
+    const timeoutTimer = setTimeout(
+      () => terminate(new IsolatedHarnessCommandError(`Harness 进程超过 ${timeoutMs}ms 超时限制`, "timeout")),
+      timeoutMs,
+    );
+    child.stdout.on("data", stdoutData);
+    child.stderr.on("data", stderrData);
+    child.stdin.on("error", () => { /* 终止期间的 EPIPE 由进程退出统一处理。 */ });
+    child.once("error", () => finish(() => reject(new IsolatedHarnessCommandError("无法启动隔离 Harness 进程", "process"))));
+    child.once("close", (exitCode) => {
+      closeCode = exitCode;
+      if (!maybeFinish() && namespaceExists() && !shuttingDown) terminate();
+    });
+    options.signal?.addEventListener("abort", abort, { once: true });
+    void discoverIsolatedNamespaceInit(processGroupId, hostNamespace, ISOLATED_NAMESPACE_STARTUP_TIMEOUT_MS).then((discovered) => {
+      namespaceInit = discovered;
+      namespaceDiscoveryDone = true;
+      if (options.signal?.aborted) return abort();
+      if (settled || shuttingDown) return;
+      child.stdin.write("\n");
+      child.stdin.end(options.stdin ?? "");
+    }, () => {
+      namespaceDiscoveryDone = true;
+      if (!settled) terminate(new IsolatedHarnessCommandError("Harness 进程无法建立受控 PID namespace", "process"));
+    });
+  });
+  if (code !== 0) throw new IsolatedHarnessCommandError(`Harness 进程失败（退出码 ${code ?? "未知"}）`, "exit", code);
+  return { stdout: Buffer.concat(stdout).toString("utf8"), exitCode: code };
+}
+
+function isolatedRuntimeArguments(command: string, environment: NodeJS.ProcessEnv, runtimeRoot: string): string[] {
+  const argumentsList = ["--die-with-parent", "--new-session", "--unshare-ipc", "--ro-bind", "/usr", "/usr"];
+  for (const [target, source] of [["/bin", "usr/bin"], ["/sbin", "usr/sbin"], ["/lib", "usr/lib"], ["/lib64", "usr/lib64"]] as const) {
+    if (lstatSync(target, { throwIfNoEntry: false })?.isSymbolicLink()) argumentsList.push("--symlink", source, target);
+  }
+  for (const path of ["/etc/hosts", "/etc/nsswitch.conf", "/etc/resolv.conf", "/etc/localtime", "/etc/passwd", "/etc/group", "/etc/ssl/certs", "/etc/pki"]) {
+    if (lstatSync(path, { throwIfNoEntry: false })) argumentsList.push("--ro-bind", realpathSync(path), path);
+  }
+  argumentsList.push("--proc", "/proc", "--dev", "/dev", "--tmpfs", "/run", "--tmpfs", "/tmp", "--tmpfs", "/var/tmp");
+  if (!isolatedNestedPath("/usr", runtimeRoot)) argumentsList.push("--ro-bind", runtimeRoot, runtimeRoot);
+  const interpreter = isolatedCommandInterpreter(command, environment);
+  if (interpreter && !isolatedNestedPath("/usr", interpreter) && !isolatedNestedPath(runtimeRoot, interpreter)) {
+    argumentsList.push("--ro-bind", interpreter, interpreter);
+  }
+  return argumentsList;
+}
+
+function isolatedCommandInterpreter(command: string, environment: NodeJS.ProcessEnv): string | undefined {
+  const buffer = Buffer.alloc(4_096);
+  const descriptor = openSync(command, "r");
+  let length: number;
+  try { length = readSync(descriptor, buffer, 0, buffer.length, 0); }
+  finally { closeSync(descriptor); }
+  const prefix = buffer.subarray(0, length).toString("utf8");
+  if (!prefix.startsWith("#!")) return undefined;
+  const words = prefix.slice(2, prefix.indexOf("\n") === -1 ? undefined : prefix.indexOf("\n")).trim().split(/\s+/);
+  const declared = words[0];
+  if (!declared || !isAbsolute(declared)) throw new IsolatedHarnessCommandError("Harness shebang 必须使用绝对解释器路径", "process");
+  const resolved = isolatedRealFile(declared, "Harness shebang 解释器");
+  if (resolved !== "/usr/bin/env") return resolved;
+  const program = words.find((word, index) => index > 0 && !word.startsWith("-"));
+  if (!program || program.includes("/")) throw new IsolatedHarnessCommandError("Harness env shebang 缺少受控解释器名称", "process");
+  for (const directory of (environment.PATH ?? "").split(delimiter)) {
+    if (!directory || !isAbsolute(directory)) continue;
+    const candidate = resolve(directory, program);
+    if (lstatSync(candidate, { throwIfNoEntry: false })) return isolatedRealFile(candidate, `Harness 解释器 ${program}`);
+  }
+  throw new IsolatedHarnessCommandError(`Harness 命令解释器不可用：${program}`, "process");
+}
+
+function openIsolatedHarnessSeccompDescriptor(): number {
+  const directory = mkdtempSync(join(tmpdir(), "maze-harness-seccomp-"));
+  const path = join(directory, "network.bpf");
+  try {
+    writeFileSync(path, createHarnessNetworkSeccompProgram(), { mode: 0o600 });
+    const descriptor = openSync(path, "r");
+    rmSync(directory, { recursive: true, force: true });
+    return descriptor;
+  } catch (error) {
+    rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function discoverIsolatedNamespaceInit(
+  supervisorPid: number | undefined,
+  hostNamespace: string,
+  timeoutMs: number,
+): Promise<{ pid: number; identity: string }> {
+  if (!supervisorPid) throw new Error("unshare supervisor 缺少 PID");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const children = readFileSync(`/proc/${supervisorPid}/task/${supervisorPid}/children`, "utf8").trim().split(/\s+/);
+      for (const value of children) {
+        const pid = Number(value);
+        if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+        const identity = readlinkSync(`/proc/${pid}/ns/pid`);
+        if (identity !== hostNamespace) return { pid, identity };
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+      throw error;
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, ISOLATED_PROCESS_POLL_MS));
+  }
+  throw new Error("未发现隔离 namespace init");
+}
+
+function isolatedRealPath(path: string, label: string): string {
+  try { return realpathSync(resolve(path)); }
+  catch { throw new IsolatedHarnessCommandError(`${label}不存在`, "process"); }
+}
+
+function isolatedRealFile(path: string, label: string): string {
+  const resolved = isolatedRealPath(path, label);
+  if (!lstatSync(resolved).isFile()) throw new IsolatedHarnessCommandError(`${label}必须为文件`, "process");
+  return resolved;
+}
+
+function isolatedRealDirectory(path: string, label: string): string {
+  const resolved = isolatedRealPath(path, label);
+  if (!lstatSync(resolved).isDirectory()) throw new IsolatedHarnessCommandError(`${label}必须为目录`, "process");
+  return resolved;
+}
+
+function isolatedNestedPath(parent: string, candidate: string): boolean {
+  const local = relative(parent, candidate);
+  return local === "" || (!local.startsWith("..") && !isAbsolute(local));
+}
+
+export type HarnessEvolutionTool = (typeof HARNESS_EVOLUTION_ALLOWED_TOOLS)[number];
+export type HarnessExecutionKind = "fake" | "deterministic-fixture" | "real-provider";
+export interface HarnessEvolutionTrustedInput {
+  role: "generator" | "solver";
+  championRoot: string;
+  lineagePlans: readonly { attemptId: string; hypothesis: string }[];
+  trustedResults: readonly { generation: number; promoted: boolean; primaryMetric: number }[];
+  publicTraces: readonly {
+    caseId: string;
+    outcome: "success" | "failure";
+    actions: number;
+    illegalActions: number;
+    observations?: readonly {
+      position: { x: number; y: number };
+      openDirections: readonly string[];
+      remainingSteps: number;
+      moved: boolean | null;
+    }[];
+  }[];
+  hiddenAggregate: Readonly<Record<string, number>>;
+}
+
 export interface HarnessEvolutionRequest {
+  sessionId: string;
   experimentId: string;
   generation: number;
   role: "generator" | "solver";
   attemptId: string;
   modelProfile: ModelProfile;
+  home: string;
   workspace: string;
+  input: HarnessEvolutionTrustedInput;
+  allowedTools: readonly HarnessEvolutionTool[];
   repairAttempt: number;
   diagnostics: readonly string[];
   signal?: AbortSignal;
@@ -38,6 +475,60 @@ export interface HarnessEvolutionResponse {
   usage: { tokens: number; cost: number };
   reasoning?: string;
   toolActivity?: string;
+  execution: HarnessExecutionIdentity;
+}
+
+export interface HarnessExecutionIdentity {
+  kind: HarnessExecutionKind;
+  protocolVersion: typeof HARNESS_EVOLUTION_PROTOCOL_VERSION;
+  sessionId: string;
+  harnessVersion: string;
+  providerId: string;
+  modelId: string;
+}
+
+export interface HarnessEvolutionProtocolRequest {
+  type: typeof HARNESS_EVOLUTION_REQUEST_TYPE;
+  protocolVersion: typeof HARNESS_EVOLUTION_PROTOCOL_VERSION;
+  session: {
+    id: string;
+    home: string;
+    workspace: string;
+    role: "generator" | "solver";
+    roleConstraint: string;
+    allowedTools: readonly HarnessEvolutionTool[];
+  };
+  attempt: {
+    experimentId: string;
+    generation: number;
+    attemptId: string;
+    repairAttempt: number;
+    diagnostics: readonly string[];
+  };
+  modelProfile: ModelProfile;
+  input: HarnessEvolutionTrustedInput;
+}
+
+export interface HarnessEvolutionProtocolResponse {
+  type: typeof HARNESS_EVOLUTION_RESPONSE_TYPE;
+  protocolVersion: typeof HARNESS_EVOLUTION_PROTOCOL_VERSION;
+  sessionId: string;
+  result: {
+    hypothesis: string;
+    strategyPlan: string;
+    submitted: boolean;
+    reasoning?: string;
+    toolActivity?: string;
+  };
+  usage: { tokens: number; cost: number };
+}
+
+export interface HarnessEvolutionProtocolErrorResponse {
+  type: typeof HARNESS_EVOLUTION_RESPONSE_TYPE;
+  protocolVersion: typeof HARNESS_EVOLUTION_PROTOCOL_VERSION;
+  sessionId: string;
+  error: { kind: "transient-provider" | "provider"; code: string };
+  usage: { tokens: number; cost: number };
 }
 
 export interface ModelProfileIssue {
@@ -432,6 +923,14 @@ export class DeterministicFakeHarnessAdapter implements HarnessAdapter {
       usage: { tokens: 100, cost: 0 },
       reasoning: "确定性假 Harness 已完成候选分析",
       toolActivity: "read,test,submit",
+      execution: {
+        kind: "fake",
+        protocolVersion: HARNESS_EVOLUTION_PROTOCOL_VERSION,
+        sessionId: request.sessionId,
+        harnessVersion: "fake",
+        providerId: request.modelProfile.providerId,
+        modelId: request.modelProfile.modelId,
+      },
     };
   }
 }

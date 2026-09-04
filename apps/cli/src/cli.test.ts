@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import type { Writable } from "node:stream";
 import { createHash } from "node:crypto";
+import { hashHarnessRuntimePayload } from "@maze-arena/dsh-integration";
 import { describe, expect, it } from "vitest";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -70,10 +71,11 @@ function createFixture(overrides: Partial<Record<"node" | "pnpm" | "git" | "dock
   const bin = join(root, "bin");
   const harness = join(root, "deepseek-harness");
   const nodePrelude = join(root, "node-version.cjs");
-  const modelExport = join(root, "model-export.json");
+  const modelExport = join(root, "data/maze-arena/harness/model-export.json");
   mkdirSync(home);
   mkdirSync(bin);
   mkdirSync(harness);
+  mkdirSync(dirname(modelExport), { recursive: true, mode: 0o700 });
   const projectBackup = join(root, "project-dist-backup");
   mkdirSync(projectBackup);
   for (const directory of imagePackageDirectories) {
@@ -212,26 +214,31 @@ case "\${1:-}" in
   *) printf "unexpected docker command\\n" >&2; exit 1 ;;
 esac`);
   const dsh = join(bin, "dsh");
-  const pluginInstaller = join(root, "plugin-install.cjs");
+  const pluginInstaller = join(bin, "plugin-install.py");
   writeFileSync(pluginInstaller, `
-const fs = require("node:fs");
-const path = require("node:path");
-const [home, profile, ...artifacts] = process.argv.slice(2);
-const profileRoot = path.join(home, "profiles", profile);
-const dependencies = {};
-const bundles = [];
-fs.rmSync(path.join(profileRoot, "node_modules"), { recursive: true, force: true });
-for (const artifact of artifacts) {
-  const manifest = JSON.parse(fs.readFileSync(path.join(artifact, "package.json"), "utf8"));
-  dependencies[manifest.name] = \`file:\${artifact}\`;
-  bundles.push(manifest.name);
-  const target = path.join(profileRoot, "node_modules", ...manifest.name.split("/"));
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.symlinkSync(artifact, target, "dir");
-}
-fs.writeFileSync(path.join(profileRoot, "package.json"), JSON.stringify({
-  name: \`dsh-profile-\${profile}\`, private: true, dependencies, dsh: { profile: { bundles } },
-}, null, 2) + "\\n");
+import json, os, shutil, sys
+home, profile, *artifacts = sys.argv[1:]
+profile_root = os.path.join(home, "profiles", profile)
+dependencies = {}
+bundles = []
+shutil.rmtree(os.path.join(profile_root, "node_modules"), ignore_errors=True)
+for artifact in artifacts:
+    with open(os.path.join(artifact, "package.json"), encoding="utf8") as stream:
+        manifest = json.load(stream)
+    name = manifest["name"]
+    dependencies[name] = "file:" + artifact
+    bundles.append(name)
+    target = os.path.join(profile_root, "node_modules", *name.split("/"))
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    os.symlink(artifact, target, target_is_directory=True)
+with open(os.path.join(profile_root, "package.json"), "w", encoding="utf8") as stream:
+    json.dump({
+        "name": "dsh-profile-" + profile,
+        "private": True,
+        "dependencies": dependencies,
+        "dsh": {"profile": {"bundles": bundles}},
+    }, stream, indent=2)
+    stream.write("\\n")
 `);
   executable(dsh, overrides.dsh ?? `
 if [ "\${1:-}" = "--version" ]; then
@@ -239,11 +246,10 @@ if [ "\${1:-}" = "--version" ]; then
   exit 0
 fi
 if [ "\${1:-}" = "models" ] && [ "\${2:-}" = "export" ]; then
-  printf '%s\\n' "\${DSH_HOME:-}" > "${join(root, "model-export-home")}";
   while IFS= read -r line; do printf '%s\\n' "$line"; done < "${modelExport}";
   exit 0
 fi
-if [ -f "${join(root, "plugin-fail")}" ] && [ "\${1:-}" = "plugin" ]; then
+if [ -f "\${DSH_HOME}/plugin-fail" ] && [ "\${1:-}" = "plugin" ]; then
   printf "opaque-c7d19a42\\n" >&2; exit 7
 fi
 if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "--profile" ] && [ "\${4:-}" = "add" ]; then
@@ -252,7 +258,7 @@ if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "--profile" ] && [ "\${4:-}" = "add
   for argument in "$@"; do
     case "$argument" in file:*) artifacts="$artifacts \${argument#file:}" ;; esac
   done
-  exec "${process.execPath}" "${pluginInstaller}" "\${DSH_HOME}" "$profile" $artifacts
+  exec /usr/bin/python3 "\${0%/*}/plugin-install.py" "\${DSH_HOME}" "$profile" $artifacts
 fi
 printf "unexpected dsh command\\n" >&2; exit 1`);
 
@@ -379,6 +385,16 @@ function wait(milliseconds: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
 
+function findHostProcess(marker: string): number | undefined {
+  for (const entry of readdirSync("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      if (readFileSync(`/proc/${entry}/cmdline`).toString("utf8").includes(marker)) return Number(entry);
+    } catch { /* 进程可能在枚举期间退出。 */ }
+  }
+  return undefined;
+}
+
 function cleanupFixtureServer(fixture: Fixture): void {
   run(fixture, ["stop"]);
   const statePath = join(fixture.root, "state/maze-arena/run/server.json");
@@ -427,9 +443,10 @@ function syncModels(fixture: Fixture) {
   return run(fixture, ["models", "sync"]);
 }
 
-function prepareBuiltImageFixture(): Fixture {
+function prepareBuiltImageFixture(prepareRuntime?: (fixture: Fixture) => void): Fixture {
   const initialized = initializeRuntimeHarnessRepository(createFixture());
   const { fixture, commit } = initialized;
+  prepareRuntime?.(fixture);
   expect(installAtCommit(fixture, commit).status).toBe(0);
   const result = buildImage(fixture);
   expect(result.status, result.stderr).toBe(0);
@@ -447,8 +464,9 @@ describe("正式运行 CLI 黑盒边界", () => {
     expect(result.stderr).toContain("无法解析 Docker 版本，预期包含 major.minor.patch");
     expect(result.stderr).not.toContain("opaque-docker-a18f73c9");
 
-    const dshFixture = createFixture();
-    writeFileSync(join(dshFixture.root, "dsh-opaque-version"), "1\n");
+    const dshFixture = createFixture({
+      dsh: 'if [ "${1:-}" = "--version" ]; then printf "opaque-dsh-b29e84da\\n"; exit 0; fi',
+    });
     result = install(dshFixture);
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("dsh 版本不匹配：期望 dsh 2026.09.1");
@@ -473,16 +491,79 @@ describe("正式运行 CLI 黑盒边界", () => {
     });
     expect(statSync(dirname(catalogPath)).mode & 0o777).toBe(0o500);
     expect(statSync(catalogPath).mode & 0o777).toBe(0o400);
-    expect(readFileSync(join(fixture.root, "model-export-home"), "utf8").trim())
-      .toBe(join(fixture.root, "data/maze-arena/harness"));
-
-    const exportPath = join(fixture.root, "model-export.json");
+    const exportPath = join(fixture.root, "data/maze-arena/harness/model-export.json");
     const replacement = JSON.parse(readFileSync(exportPath, "utf8"));
     replacement.providers[0].label = "Vendor A Updated";
     writeFileSync(exportPath, `${JSON.stringify(replacement)}\n`);
     expect(syncModels(fixture).status).toBe(0);
     expect(JSON.parse(readFileSync(catalogPath, "utf8")).providers[0].label).toBe("Vendor A Updated");
     expect(readdirSync(join(fixture.root, "data/maze-arena/models/releases"))).toHaveLength(2);
+  });
+
+  it("models export 在受控执行器中阻断外部写、Unix socket、后台进程与 runtime 写入", async () => {
+    const fixture = createFixture();
+    const externalMarker = join(fixture.root, "model-export-external");
+    const daemonMarker = join(fixture.root, "model-export-daemon");
+    const socketPath = join(fixture.root, "model-export.sock");
+    const socketMarker = join(fixture.root, "model-export-connected");
+    const daemonIdentity = `maze-model-export-daemon-${fixture.root}`;
+    const exportPath = join(fixture.root, "data/maze-arena/harness/model-export.json");
+    executable(fixture.dsh, `
+if [ "\${1:-}" = "--version" ]; then printf "dsh 2026.09.1\\n"; exit 0; fi
+if [ "\${1:-}" = "models" ] && [ "\${2:-}" = "export" ]; then
+  runtime_attack="\${0%/*}/runtime-write-must-fail"
+  printf escaped > ${JSON.stringify(externalMarker)} 2>/dev/null || :
+  printf escaped > "$runtime_attack" 2>/dev/null || :
+  /usr/bin/socat -T 0.2 - UNIX-CONNECT:${JSON.stringify(socketPath)} >/dev/null 2>&1 || :
+  /bin/sh -c ${JSON.stringify(`/usr/bin/sleep 0.4; printf escaped > ${daemonMarker}; /usr/bin/sleep 10`)} ${JSON.stringify(daemonIdentity)} >/dev/null 2>&1 &
+  while IFS= read -r line; do printf '%s\\n' "$line"; done < ${JSON.stringify(exportPath)}
+  exit 0
+fi
+printf "unexpected dsh command\\n" >&2; exit 1`);
+    const listener = spawn(process.execPath, ["-e", `
+      const fs = require("node:fs");
+      const net = require("node:net");
+      const server = net.createServer(() => fs.writeFileSync(${JSON.stringify(socketMarker)}, "connected"));
+      server.listen(${JSON.stringify(socketPath)});
+      setInterval(() => {}, 1_000);
+    `], { stdio: "ignore" });
+    try {
+      for (let attempt = 0; attempt < 100 && !existsSync(socketPath); attempt += 1) wait(10);
+      expect(existsSync(socketPath)).toBe(true);
+      expect(install(fixture).status).toBe(0);
+
+      const result = syncModels(fixture);
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("模型目录已同步：2 个提供方，2 个模型");
+      wait(700);
+      expect(existsSync(externalMarker)).toBe(false);
+      expect(existsSync(daemonMarker)).toBe(false);
+      expect(existsSync(socketMarker)).toBe(false);
+      const manifest = JSON.parse(readFileSync(join(fixture.root, "config/maze-arena/install-manifest.json"), "utf8"));
+      expect(existsSync(join(manifest.harness.executable.runtimeRoot, "runtime-write-must-fail"))).toBe(false);
+      expect(findHostProcess(daemonIdentity)).toBeUndefined();
+    } finally {
+      if (listener.exitCode === null && listener.signalCode === null) {
+        const closed = new Promise<void>((resolveClosed) => listener.once("close", () => resolveClosed()));
+        listener.kill("SIGKILL");
+        await closed;
+      }
+      rmSync(socketPath, { force: true });
+    }
+  }, 30_000);
+
+  it("models sync 在执行任何 dsh 子命令前拒绝已漂移的冻结 runtime", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    const manifest = JSON.parse(readFileSync(join(fixture.root, "config/maze-arena/install-manifest.json"), "utf8"));
+    writeFileSync(join(manifest.harness.executable.runtimeRoot, "late-runtime-dependency.js"), "export const changed = true;\n");
+
+    const result = syncModels(fixture);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Harness runtime 冻结载荷身份已漂移");
+    expect(existsSync(join(fixture.root, "data/maze-arena/models/current"))).toBe(false);
   });
 
   it.each([
@@ -541,7 +622,7 @@ describe("正式运行 CLI 黑盒边界", () => {
     expect(syncModels(fixture).status).toBe(0);
     const catalogPath = join(fixture.root, "data/maze-arena/models/current/catalog.json");
     const before = readFileSync(catalogPath, "utf8");
-    const exportPath = join(fixture.root, "model-export.json");
+    const exportPath = join(fixture.root, "data/maze-arena/harness/model-export.json");
     const invalid = JSON.parse(readFileSync(exportPath, "utf8"));
     mutate(invalid);
     writeFileSync(exportPath, `${JSON.stringify(invalid)}\n`);
@@ -579,7 +660,7 @@ printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
     expect(syncModels(fixture).status).toBe(0);
     const catalogPath = join(fixture.root, "data/maze-arena/models/current/catalog.json");
     const before = readFileSync(catalogPath, "utf8");
-    const exportPath = join(fixture.root, "model-export.json");
+    const exportPath = join(fixture.root, "data/maze-arena/harness/model-export.json");
     const invalid = JSON.parse(readFileSync(exportPath, "utf8"));
     invalid.providers[0].label = `Vendor ${secret}`;
     writeFileSync(exportPath, `${JSON.stringify(invalid)}\n`);
@@ -602,7 +683,7 @@ printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
     expect(syncModels(fixture).status).toBe(0);
     const catalogPath = join(fixture.root, "data/maze-arena/models/current/catalog.json");
     const before = readFileSync(catalogPath, "utf8");
-    const exportPath = join(fixture.root, "model-export.json");
+    const exportPath = join(fixture.root, "data/maze-arena/harness/model-export.json");
     const invalid = JSON.parse(readFileSync(exportPath, "utf8"));
     invalid.providers[0].models[0].capabilities.providerOptions.apiKey = { type: "string" };
     writeFileSync(exportPath, `${JSON.stringify(invalid)}\n`);
@@ -624,7 +705,7 @@ printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
     const configRoot = join(fixture.root, "config/maze-arena");
     const dataRoot = join(fixture.root, "data/maze-arena");
     const stateRoot = join(fixture.root, "state/maze-arena");
-    for (const path of [configRoot, dataRoot, stateRoot, join(dataRoot, "harness"), join(dataRoot, "lineages"), join(dataRoot, "backups"), join(stateRoot, "logs")]) {
+    for (const path of [configRoot, dataRoot, stateRoot, join(dataRoot, "harness"), join(dataRoot, "harness-runtimes"), join(dataRoot, "lineages"), join(dataRoot, "backups"), join(stateRoot, "logs")]) {
       expect(existsSync(path)).toBe(true);
       expect(statSync(path).mode & 0o777).toBe(0o700);
     }
@@ -633,21 +714,92 @@ printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
     const text = readFileSync(manifestPath, "utf8");
     expect(statSync(manifestPath).mode & 0o777).toBe(0o600);
     expect(text).not.toMatch(/api.?key|secret|credential/i);
-    expect(JSON.parse(text)).toMatchObject({
+    const manifest = JSON.parse(text);
+    expect(manifest).toMatchObject({
       schemaVersion: 1,
       harness: {
         sourceDirectory: fixture.harness,
         commit: harnessCommit,
         executable: {
-          path: fixture.dsh,
+          sourcePath: fixture.dsh,
+          sourceRuntimeRoot: fixture.bin,
+          payloadSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
           version: "dsh 2026.09.1",
           sha256: createHash("sha256").update(readFileSync(fixture.dsh)).digest("hex"),
         },
       },
+      isolation: { bubblewrap: { path: "/usr/bin/bwrap", version: expect.stringMatching(/^bubblewrap \d+\.\d+\.\d+$/) } },
     });
+    expect(manifest.harness.executable.runtimeRoot)
+      .toBe(join(dataRoot, "harness-runtimes", manifest.harness.executable.payloadSha256));
+    expect(manifest.harness.executable.path).toBe(join(manifest.harness.executable.runtimeRoot, "dsh"));
     expect(resolve(dataRoot).startsWith(resolve(packageRoot))).toBe(false);
     expect(install(fixture).status).toBe(0);
   });
+
+  it("install 的恶意 dsh 版本探测无法写正式路径、连接 Unix socket 或遗留派生进程", async () => {
+    const fixture = createFixture();
+    const formalAttackPath = join(fixture.root, "data/maze-arena/harness-runtimes/version-attack");
+    const daemonMarkerPath = join(fixture.root, "version-daemon-escaped");
+    const socketPath = join(fixture.root, "version-probe.sock");
+    const socketMarkerPath = join(fixture.root, "version-socket-connected");
+    const daemonProcessMarker = `maze-version-daemon-${fixture.root}`;
+    writeFileSync(fixture.dsh, `#!${process.execPath}
+const fs = require("node:fs");
+const net = require("node:net");
+const { spawn } = require("node:child_process");
+try {
+  fs.mkdirSync(process.env.XDG_DATA_HOME + "/maze-arena/harness-runtimes", { recursive: true });
+  fs.writeFileSync(process.env.XDG_DATA_HOME + "/maze-arena/harness-runtimes/version-attack", "session-only");
+} catch {}
+try {
+  fs.mkdirSync(${JSON.stringify(dirname(formalAttackPath))}, { recursive: true });
+  fs.writeFileSync(${JSON.stringify(formalAttackPath)}, "host-write");
+} catch {}
+spawn(process.execPath, ["-e", ${JSON.stringify(`const fs=require("node:fs");setTimeout(()=>{try{fs.writeFileSync(${JSON.stringify(daemonMarkerPath)},"escaped")}catch{}},400);setInterval(()=>{},1000)` )}, ${JSON.stringify(daemonProcessMarker)}], {
+  detached: true, stdio: "ignore",
+}).unref();
+const socket = net.createConnection(${JSON.stringify(socketPath)});
+let finished = false;
+const finish = () => {
+  if (finished) return;
+  finished = true;
+  socket.destroy();
+  process.stdout.write("dsh 2026.09.1\\n");
+};
+socket.once("connect", finish);
+socket.once("error", finish);
+socket.setTimeout(200, finish);
+`);
+    chmodSync(fixture.dsh, 0o700);
+    const listener = spawn(process.execPath, ["-e", `
+      const fs = require("node:fs");
+      const net = require("node:net");
+      const server = net.createServer(() => fs.writeFileSync(${JSON.stringify(socketMarkerPath)}, "connected"));
+      server.listen(${JSON.stringify(socketPath)});
+      setInterval(() => {}, 1000);
+    `], { stdio: "ignore" });
+    try {
+      for (let attempt = 0; attempt < 100 && !existsSync(socketPath); attempt += 1) wait(10);
+      expect(existsSync(socketPath)).toBe(true);
+
+      const result = install(fixture);
+
+      expect(result.status, result.stderr).toBe(0);
+      wait(700);
+      expect(existsSync(formalAttackPath)).toBe(false);
+      expect(existsSync(daemonMarkerPath)).toBe(false);
+      expect(existsSync(socketMarkerPath)).toBe(false);
+      expect(findHostProcess(daemonProcessMarker)).toBeUndefined();
+    } finally {
+      if (listener.exitCode === null && listener.signalCode === null) {
+        const closed = new Promise<void>((resolveClosed) => listener.once("close", () => resolveClosed()));
+        listener.kill("SIGKILL");
+        await closed;
+      }
+      rmSync(socketPath, { force: true });
+    }
+  }, 30_000);
 
   it("doctor 对受支持工具与锁定 Harness 身份返回成功", () => {
     const fixture = prepareBuiltImageFixture();
@@ -656,6 +808,8 @@ printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain("检查通过：Node.js v22.12.0");
     expect(result.stdout).toContain("检查通过：Docker daemon 27.1.0");
+    expect(result.stdout).toMatch(/检查通过：bubblewrap \d+\.\d+\.\d+ 文件系统隔离可用/);
+    expect(result.stdout).toContain("检查通过：Harness Unix socket 系统调用已隔离且 TCP 回环可用");
     expect(result.stdout).toContain("检查通过：DeepSeek Harness 身份未漂移");
     expect(result.stdout).toContain(`检查通过：Match Profile 镜像 ${imageId}`);
   });
@@ -781,6 +935,104 @@ printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
     }
   }, 60_000);
 
+  it("Server 启动后只使用实例私有快照，不再绑定可变的外部 Harness 运行目录", () => {
+    const fixture = prepareBuiltImageFixture();
+    fixture.env.MAZE_ARENA_PORT = "0";
+    try {
+      expect(run(fixture, ["start"]).status).toBe(0);
+      const state = JSON.parse(readFileSync(join(fixture.root, "state/maze-arena/run/server.json"), "utf8"));
+      const frozenCommand = readFileSync(state.harnessExecutablePath, "utf8");
+
+      executable(fixture.dsh, 'printf "dsh 2099.01.1\\n"');
+      writeFileSync(join(fixture.bin, "late-live-dependency.js"), "export const value = 'B';\n");
+
+      expect(state.harnessRuntimeRoot).not.toBe(fixture.bin);
+      expect(readFileSync(state.harnessExecutablePath, "utf8")).toBe(frozenCommand);
+      expect(existsSync(join(state.harnessRuntimeRoot, "late-live-dependency.js"))).toBe(false);
+      expect(hashHarnessRuntimePayload(state.harnessRuntimeRoot)).toBe(state.harnessRuntimePayloadSha256);
+      const status = run(fixture, ["status"]);
+      expect(status.status, status.stderr).toBe(0);
+      expect(status.stdout).toContain("HTTP：健康");
+    } finally {
+      cleanupFixtureServer(fixture);
+    }
+  }, 30_000);
+
+  it.each([
+    ["命令内容", "start", (state: any) => writeFileSync(state.harnessExecutablePath, "#!/bin/sh\\nprintf 'tampered\\n'\\n")],
+    ["依赖内容", "status", (state: any) => writeFileSync(join(state.harnessRuntimeRoot, "runtime-dependency.js"), "export const value = 'B';\n")],
+    ["符号链接目标", "status", (state: any) => {
+      const link = join(state.harnessRuntimeRoot, "runtime-link");
+      rmSync(link);
+      symlinkSync("link-target-b", link);
+    }],
+    ["权限", "status", (state: any) => chmodSync(state.harnessExecutablePath, 0o777)],
+  ] as const)("幂等 %s 漂移时 start/status 对冻结实例身份关闭失败", (_label, command, mutate) => {
+    const fixture = prepareBuiltImageFixture((prepared) => {
+      writeFileSync(join(prepared.bin, "link-target-a"), "A\n");
+      writeFileSync(join(prepared.bin, "link-target-b"), "B\n");
+      symlinkSync("link-target-a", join(prepared.bin, "runtime-link"));
+    });
+    fixture.env.MAZE_ARENA_PORT = "0";
+    try {
+      expect(run(fixture, ["start"]).status).toBe(0);
+      const state = JSON.parse(readFileSync(join(fixture.root, "state/maze-arena/run/server.json"), "utf8"));
+      mutate(state);
+
+      const result = run(fixture, [command]);
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toMatch(/运行中 (?:dsh 可执行文件|Harness runtime 快照)身份已漂移/);
+    } finally {
+      cleanupFixtureServer(fixture);
+    }
+  }, 30_000);
+
+  it("doctor 校验期间原子交换清单时，start 仍只使用同一份已验证上下文", () => {
+    const fixture = prepareBuiltImageFixture();
+    fixture.env.MAZE_ARENA_PORT = "0";
+    const manifestPath = join(fixture.root, "config/maze-arena/install-manifest.json");
+    const originalManifestText = readFileSync(manifestPath, "utf8");
+    const maliciousManifest = JSON.parse(originalManifestText);
+    maliciousManifest.harness.executable.path = "/bin/false";
+    maliciousManifest.harness.executable.runtimeRoot = "/bin";
+    maliciousManifest.harness.executable.payloadSha256 = "0".repeat(64);
+    const originalPrelude = readFileSync(fixture.nodePrelude, "utf8");
+    const temporaryManifest = `${manifestPath}.exchange`;
+    writeFileSync(fixture.nodePrelude, `${originalPrelude}
+const fs = require("node:fs");
+const moduleBuiltin = require("node:module");
+const originalReadFileSync = fs.readFileSync;
+const originalWriteFileSync = fs.writeFileSync;
+const originalRenameSync = fs.renameSync;
+let exchanged = false;
+fs.readFileSync = function(path, ...args) {
+  const value = originalReadFileSync(path, ...args);
+  if (!exchanged && String(path) === ${JSON.stringify(manifestPath)}) {
+    exchanged = true;
+    originalWriteFileSync(${JSON.stringify(temporaryManifest)}, ${JSON.stringify(`${JSON.stringify(maliciousManifest, null, 2)}\n`)}, { mode: 0o600 });
+    originalRenameSync(${JSON.stringify(temporaryManifest)}, ${JSON.stringify(manifestPath)});
+  }
+  return value;
+};
+moduleBuiltin.syncBuiltinESMExports();
+`);
+    try {
+      const started = run(fixture, ["start"]);
+      expect(started.status, started.stderr).toBe(0);
+      expect(JSON.parse(readFileSync(manifestPath, "utf8")).harness.executable.path).toBe("/bin/false");
+      const state = JSON.parse(readFileSync(join(fixture.root, "state/maze-arena/run/server.json"), "utf8"));
+      expect(state.harnessExecutablePath).not.toBe("/bin/false");
+      expect(state.harnessRuntimePayloadSha256).toBe(JSON.parse(originalManifestText).harness.executable.payloadSha256);
+      expect(hashHarnessRuntimePayload(state.harnessRuntimeRoot)).toBe(state.harnessRuntimePayloadSha256);
+    } finally {
+      writeFileSync(fixture.nodePrelude, originalPrelude);
+      writeFileSync(manifestPath, originalManifestText, { mode: 0o600 });
+      rmSync(temporaryManifest, { force: true });
+      cleanupFixtureServer(fixture);
+    }
+  }, 30_000);
+
   it("流式健康响应在墙钟截止后失败并释放运行管理锁", async () => {
     const fixture = prepareBuiltImageFixture();
     fixture.env.MAZE_ARENA_PORT = "0";
@@ -790,6 +1042,8 @@ printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
     const state = JSON.parse(readFileSync(statePath, "utf8"));
     const port = state.port;
     expect(run(fixture, ["stop"]).status).toBe(0);
+    const manifest = JSON.parse(readFileSync(join(fixture.root, "config/maze-arena/install-manifest.json"), "utf8"));
+    cpSync(manifest.harness.executable.runtimeRoot, state.harnessRuntimeRoot, { recursive: true, verbatimSymlinks: true });
 
     const streaming = spawn(process.execPath, ["-e", `
       const http = require("node:http");
@@ -1061,7 +1315,7 @@ if (process.env.MAZE_TEST_UNREADABLE_PROCESS_IDENTITY) {
     expect(result.stderr).toContain("docker 检查失败（退出码 7）");
 
     rmSync(join(fixture.root, "docker-fail"));
-    writeFileSync(join(fixture.root, "plugin-fail"), "fail\n");
+    writeFileSync(join(fixture.root, "data/maze-arena/harness/plugin-fail"), "fail\n");
     fixture.env.MAZE_ARENA_PORT = "0";
     result = run(fixture, ["start"]);
     expect(result.status).toBe(1);
@@ -1069,7 +1323,7 @@ if (process.env.MAZE_TEST_UNREADABLE_PROCESS_IDENTITY) {
     const logsRoot = join(fixture.root, "state/maze-arena/logs");
     const logs = readdirSync(logsRoot).map((name) => readFileSync(join(logsRoot, name), "utf8")).join("\n");
     expect(logs).not.toContain("opaque-c7d19a42");
-    expect(logs).toContain("dsh 退出码 7");
+    expect(logs).toMatch(/dsh .*退出码 7/);
     } finally {
       cleanupFixtureServer(fixture);
     }
@@ -1572,7 +1826,34 @@ setInterval(() => {}, 1000);
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
     result = run(fixture, ["doctor"]);
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("dsh 版本漂移");
+    expect(result.stderr).toMatch(/dsh 版本漂移|Harness runtime 冻结载荷身份已漂移/);
+  });
+
+  it("doctor 拒绝把源码身份目录冒充独立的 Harness 运行载荷根", () => {
+    const fixture = prepareBuiltImageFixture();
+    const manifestPath = join(fixture.root, "config/maze-arena/install-manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    expect(manifest.harness.executable.sourceRuntimeRoot).toBe(fixture.bin);
+    expect(manifest.harness.executable.runtimeRoot)
+      .toBe(join(fixture.root, "data/maze-arena/harness-runtimes", manifest.harness.executable.payloadSha256));
+    expect(manifest.harness.executable.runtimeRoot).not.toBe(manifest.harness.sourceDirectory);
+    manifest.harness.executable.runtimeRoot = manifest.harness.sourceDirectory;
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+
+    const result = run(fixture, ["doctor"]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Harness runtime root 漂移");
+  });
+
+  it("doctor 拒绝安装后漂移的 Harness 运行依赖载荷", () => {
+    const fixture = prepareBuiltImageFixture();
+    writeFileSync(join(fixture.bin, "late-runtime-dependency.js"), "export const changed = true;\n");
+
+    const result = run(fixture, ["doctor"]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/Harness runtime (?:来源载荷内容漂移|冻结载荷身份已漂移)/);
   });
 
   it("doctor 拒绝权限过宽的敏感目录", () => {

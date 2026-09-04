@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { PluginLineageRepository } from "@maze-arena/lineage";
@@ -54,6 +54,37 @@ describe("自主进化闭环", () => {
     expect(readFileSync(join(workspace, "lineage/attempt-1.md"), "utf8")).toBe("尝试新的启发式");
   });
 
+  it("每次候选尝试从源码创建空 home，并剔除 Git、依赖、产物和缓存目录", async () => {
+    const isolatedSource = mkdtempSync(join(tmpdir(), "maze-evolution-source-"));
+    writeFileSync(join(isolatedSource, "package.json"), JSON.stringify({ name: "fixture", version: "1.0.0" }));
+    mkdirSync(join(isolatedSource, "src"));
+    writeFileSync(join(isolatedSource, "src/index.ts"), "export const baseline = true;\n");
+    for (const directory of [".git", "node_modules", "dist", ".cache", ".turbo", "coverage"]) {
+      mkdirSync(join(isolatedSource, directory), { recursive: true });
+      writeFileSync(join(isolatedSource, directory, "inherited"), "forbidden");
+    }
+    const { lineage } = fakeLineage();
+    const session: EvolutionHarnessSession = {
+      run: async (request) => {
+        expect(request.home).not.toBe(request.workspace);
+        expect(existsSync(request.home)).toBe(true);
+        expect(readFileSync(join(request.workspace, "src/index.ts"), "utf8")).toContain("baseline");
+        for (const directory of [".git", "node_modules", "dist", ".cache", ".turbo", "coverage"]) {
+          expect(existsSync(join(request.workspace, directory))).toBe(false);
+        }
+        return { hypothesis: "隔离候选", strategyPlan: "保持工作区净化", submitted: false };
+      },
+      close: () => undefined,
+    };
+
+    await expect(runEvolutionAttempt({
+      ...baseOptions(session, lineage),
+      championRoot: isolatedSource,
+      publicGate: vi.fn(),
+      hiddenEvaluate: vi.fn(),
+    })).resolves.toMatchObject({ status: "invalid-candidate" });
+  });
+
   it("三次修复仍失败时保留失败候选且不运行隐藏评测", async () => {
     const session: EvolutionHarnessSession = {
       run: async () => ({ hypothesis: "无效尝试", strategyPlan: "记录失败", submitted: true }), close: () => undefined,
@@ -77,6 +108,29 @@ describe("自主进化闭环", () => {
       ...baseOptions(session, lineage), publicGate: vi.fn(), hiddenEvaluate: vi.fn(),
     });
     expect(result.status).toBe("invalid-candidate");
+    expect(commitCandidate).not.toHaveBeenCalled();
+  });
+
+  it.each(["relative-link", "absolute-link", "fifo"] as const)("Harness 返回后在公开门禁前拒绝工作区异常文件：%s", async (kind) => {
+    const { lineage, commitCandidate } = fakeLineage();
+    const publicGate = vi.fn();
+    const session: EvolutionHarnessSession = {
+      run: async (request) => {
+        const unsafePath = join(request.workspace, "unsafe-entry");
+        if (kind === "relative-link") symlinkSync("src/index.ts", unsafePath);
+        else if (kind === "absolute-link") symlinkSync("/etc/passwd", unsafePath);
+        else {
+          const { spawnSync } = await import("node:child_process");
+          expect(spawnSync("mkfifo", [unsafePath]).status).toBe(0);
+        }
+        return { hypothesis: "链接绕过", strategyPlan: "不应进入门禁", submitted: true };
+      },
+      close: () => undefined,
+    };
+    await expect(runEvolutionAttempt({
+      ...baseOptions(session, lineage), publicGate, hiddenEvaluate: vi.fn(),
+    })).rejects.toThrow(kind === "fifo" ? /不支持的文件类型/ : /符号链接/);
+    expect(publicGate).not.toHaveBeenCalled();
     expect(commitCandidate).not.toHaveBeenCalled();
   });
 

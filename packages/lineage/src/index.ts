@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { validatePluginPackage, type LineageBaseline } from "@maze-arena/match-profile";
@@ -80,6 +80,7 @@ export class PluginLineageRepository {
     this.ensureNotBlocked(experimentId);
     const existing = this.repositoryRow(experimentId, role);
     if (existing) { this.verifyIntegrity(experimentId, role); return existing.baseline_commit; }
+    assertSafeSourceTree(baselineSource);
     await validatePluginPackage(baselineSource);
     const repository = this.repositoryPath(experimentId, role);
     if (existsSync(repository)) throw new Error(`谱系目录已存在但未登记：${repository}`);
@@ -105,6 +106,7 @@ export class PluginLineageRepository {
     validateIdentity(input.experimentId);
     this.ensureNotBlocked(input.experimentId);
     this.verifyIntegrity(input.experimentId, input.role);
+    assertSafeSourceTree(input.sourceRoot);
     await validatePluginPackage(input.sourceRoot, input.lineageBaseline);
     const repository = this.repositoryPath(input.experimentId, input.role);
     const metadata = canonicalJson({
@@ -249,7 +251,8 @@ export class PluginLineageRepository {
     const destination = this.repositoryPath(childId, role);
     if (existsSync(destination) || this.repositoryRow(childId, role)) throw new Error(`派生 ${role} 谱系已经存在`);
     mkdirSync(dirname(destination), { recursive: true });
-    cpSync(source, destination, { recursive: true });
+    assertSafeSourceTree(source);
+    cpSync(source, destination, { recursive: true, dereference: false });
     const tagName = `baseline/${childId}/${role}`;
     const metadata = canonicalJson({ experimentId: childId, role, kind: "baseline", targetCommit: resolved });
     git(destination, ["tag", "-a", tagName, resolved, "-m", metadata]);
@@ -322,6 +325,7 @@ export class PluginLineageRepository {
 }
 
 function replaceWorktree(repository: string, sourceRoot: string): void {
+  assertSafeSourceTree(sourceRoot);
   for (const entry of readdirSync(repository)) if (entry !== ".git") rmSync(join(repository, entry), { recursive: true, force: true });
   copyTree(sourceRoot, repository, sourceRoot);
 }
@@ -334,8 +338,31 @@ function copyTree(source: string, destination: string, root: string): void {
     if (local.split(sep).includes(".git")) continue;
     const to = join(destination, entry);
     if (statSync(from).isDirectory()) { mkdirSync(to, { recursive: true }); copyTree(from, to, root); }
-    else cpSync(from, to);
+    else cpSync(from, to, { dereference: false });
   }
+}
+
+export function assertSafeSourceTree(root: string): void {
+  const absoluteRoot = resolve(root);
+  const rootStat = lstatSync(absoluteRoot);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("插件源树根目录必须为真实目录");
+  const canonicalRoot = realpathSync(absoluteRoot);
+  const visit = (current: string): void => {
+    for (const name of readdirSync(current)) {
+      if (name === ".git" || name === "node_modules") continue;
+      const path = join(current, name);
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink()) throw new Error(`插件源树不得包含符号链接：${relative(absoluteRoot, path)}`);
+      const canonical = realpathSync(path);
+      const relation = relative(canonicalRoot, canonical);
+      if (relation === ".." || relation.startsWith(`..${sep}`) || isAbsolute(relation)) {
+        throw new Error(`插件源树路径越出工作区：${relative(absoluteRoot, path)}`);
+      }
+      if (stat.isDirectory()) visit(path);
+      else if (!stat.isFile()) throw new Error(`插件源树包含不支持的文件类型：${relative(absoluteRoot, path)}`);
+    }
+  };
+  visit(absoluteRoot);
 }
 
 function git(repository: string, args: string[]): string {

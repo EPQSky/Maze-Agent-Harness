@@ -197,12 +197,13 @@ export function registerControlRoutes(options: ControlRouteOptions): void {
           if (path === "start" || path === "resume") {
             controlPlane.requireReady(request.params.id, options.compatibilityFingerprint);
           }
-          const snapshot = action(request.params.id);
+          let snapshot = action(request.params.id);
           const status = snapshot.state === "ready" ? "draft" : snapshot.state;
           experiments.setStatus(request.params.id, status);
           audits.append(request.params.id, auditType);
           if (path === "start" || path === "resume") autonomousRunner.launch(request.params.id);
-          if (path === "cancel") autonomousRunner.cancel(request.params.id);
+          if (path === "pause") snapshot = await autonomousRunner.pause(request.params.id);
+          if (path === "cancel") await autonomousRunner.cancel(request.params.id);
           return snapshot;
         } catch (error) {
           return reply.code(409).send({ error: { code: "RUNTIME_STATE_INVALID", message: error instanceof Error ? error.message : "运行状态非法" } });

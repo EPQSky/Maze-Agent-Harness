@@ -35,7 +35,7 @@ async function mockApi(page: Page) {
       : path === "/api/harness/models" ? { credentialRefs: [], providers: [] }
       : path.endsWith("/baseline-validation") ? { experimentId: experiment.id, status: "ready", steps: [], operatorConfirmed: true, frozenConfiguration: {}, frozenDigest: "digest", smoke: { attempted: false, passed: null } }
       : path.endsWith("/runtime") ? runtime
-      : path.endsWith("/audit-events") ? { events: [{ id: 1, experimentId: experiment.id, type: "harness.activity", occurredAt: "2026-09-02T12:00:01.000Z", details: { reasoning: "实际提供方返回", toolActivity: "read,test" } }], nextId: 1 }
+      : path.endsWith("/audit-events") ? { events: [{ id: 1, experimentId: experiment.id, type: "harness.activity", occurredAt: "2026-09-02T12:00:01.000Z", details: { role: "generator", executionKind: "real-provider", protocolVersion: 1, outcome: "succeeded", usageTokens: 64, usageCost: 0 } }], nextId: 1 }
       : path.endsWith("/lineages") ? { generator: [{ commit: runtime.champions.generator, subject: "baseline: generator", tags: ["baseline/e2e/generator"] }], solver: [{ commit: runtime.champions.solver, subject: "baseline: solver", tags: ["baseline/e2e/solver"] }] }
       : path.endsWith("/matches/latest") ? match
       : path.endsWith("/matches") ? { matches: [match] }
