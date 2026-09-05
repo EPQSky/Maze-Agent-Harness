@@ -189,6 +189,20 @@ describe("确定性一代累积自进化", () => {
     expect(recoveredLineage.listHistory(experiment.id, "generator")).toHaveLength(2);
     expect(recoveredLineage.listHistory(experiment.id, "solver")).toHaveLength(2);
     expect(recoveredAudits.list(experiment.id).events.filter(({ type }) => type === "harness.activity")).toHaveLength(2);
+    const firstGenerationAudit = recoveredAudits.list(experiment.id).events;
+    expect(firstGenerationAudit.filter(({ type }) => type === "candidate.prepared")).toHaveLength(2);
+    expect(firstGenerationAudit.filter(({ type }) => type === "candidate.evaluated")).toHaveLength(2);
+    expect(firstGenerationAudit.filter(({ type }) => type === "candidate.promoted")).toEqual([
+      expect.objectContaining({ details: expect.objectContaining({
+        role: "generator", generation: 1, candidateCommit: generatorCheckpoint!.result.candidateCommit,
+        championBefore: baselines.generator, championAfter: generatorCheckpoint!.result.candidateCommit,
+        promotionTag: `promotion/${experiment.id}/generator/g0001`,
+      }) }),
+    ]);
+    expect(firstGeneration.generations[0]?.generator).toMatchObject({
+      attemptId: "g0001-generator", evidenceLevel: "deterministic-fixture", candidateStatus: "evaluated",
+      trustedBuildSha256: expect.stringMatching(/^[0-9a-f]{64}$/), isolatedEvaluation: true,
+    });
 
     recoveredRuntime.start(experiment.id);
     recoveredExperiments.setStatus(experiment.id, "running");
@@ -204,6 +218,12 @@ describe("确定性一代累积自进化", () => {
         outcome: "tie",
       },
       solver: { championBefore: baselines.solver, championAfter: baselines.solver, outcome: "failed" },
+    });
+    const committedAudit = recoveredAudits.list(experiment.id).events.filter(({ type }) => type === "generation.committed");
+    expect(committedAudit.at(-1)?.details).toMatchObject({
+      generation: 2, generatorStart: generatorCheckpoint!.result.candidateCommit,
+      generatorChampion: generatorCheckpoint!.result.candidateCommit,
+      solverStart: baselines.solver, solverChampion: baselines.solver,
     });
     const secondGenerator = secondGeneration.generations[1]?.generator?.candidateCommit;
     const secondSolver = secondGeneration.generations[1]?.solver?.candidateCommit;

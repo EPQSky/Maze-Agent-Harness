@@ -51,6 +51,7 @@ export interface BaselineValidationRecord {
 }
 
 export type EvolutionRole = "generator" | "solver";
+export type EvolutionEvidenceLevel = "fake" | "deterministic-fixture" | "real-provider";
 export interface GenerationRoleResult {
   candidateCommit: string;
   championBefore: string;
@@ -65,6 +66,12 @@ export interface GenerationRoleResult {
   hypothesis?: string;
   diffSummary?: string;
   gateDiagnostics?: string[];
+  /** 旧检查点没有证据字段；Web 会回退到对应 Harness 审计事件。 */
+  attemptId?: string;
+  evidenceLevel?: EvolutionEvidenceLevel;
+  candidateStatus?: "invalid" | "public-gate-failed" | "evaluated";
+  trustedBuildSha256?: string;
+  isolatedEvaluation?: boolean;
   trustedPublicTraces?: Array<{
     attemptId: string;
     generation: number;
@@ -124,8 +131,19 @@ export interface ExperimentObservation {
 }
 
 export interface LineageHistoryResponse {
-  generator: Array<{ commit: string; subject: string; tags: string[] }>;
-  solver: Array<{ commit: string; subject: string; tags: string[] }>;
+  generator: LineageHistoryEntry[];
+  solver: LineageHistoryEntry[];
+}
+
+export interface LineageHistoryEntry {
+  commit: string;
+  subject: string;
+  tags: string[];
+  kind: "baseline" | "candidate";
+  attemptId: string | null;
+  candidateStage: "intermediate" | "final" | null;
+  outcome: "failed" | "tie" | "public-only" | "promoted" | null;
+  generation: number | null;
 }
 
 export interface CreateExperimentRequest {
@@ -324,6 +342,10 @@ export type ExperimentAuditEventType =
   | "runtime.paused"
   | "runtime.cancelled"
   | "harness.activity"
+  | "candidate.invalid"
+  | "candidate.prepared"
+  | "candidate.evaluated"
+  | "candidate.promoted"
   | "generation.committed"
   | "exhibition.started";
 

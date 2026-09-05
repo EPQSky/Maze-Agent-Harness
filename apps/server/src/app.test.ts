@@ -13,6 +13,7 @@ import type {
   ExperimentListResponse,
   EvolutionRole,
   GenerationRoleResult,
+  LineageHistoryResponse,
   MatchEvent,
 } from "@maze-arena/contracts";
 import {
@@ -29,6 +30,7 @@ import {
   type HarnessEvolutionRequest,
 } from "@maze-arena/dsh-integration";
 import { ExperimentRuntimeRepository } from "@maze-arena/control-plane";
+import { PluginLineageRepository } from "@maze-arena/lineage";
 import { afterEach, describe, expect, it } from "vitest";
 import { createArenaServer as createArenaServerImpl, installPersistentShutdownHandlers, type ArenaServerOptions } from "./app.js";
 import { createProductionHarnessAdapter } from "./production-harness.js";
@@ -124,6 +126,18 @@ function createTestServer(databasePath: string, autonomousEvolutionAdapter?: Aut
   });
   servers.push(server);
   return server;
+}
+
+function createLineageCandidate(directory: string, suffix: string): string {
+  const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../../packages/generator-plugin");
+  const candidateRoot = join(directory, `candidate-${suffix}`);
+  cpSync(sourceRoot, candidateRoot, {
+    recursive: true,
+    filter: (source) => !source.includes("node_modules") && !source.includes("/dist"),
+  });
+  const source = join(candidateRoot, "src/index.ts");
+  writeFileSync(source, `${readFileSync(source, "utf8")}\n// API 谱系候选 ${suffix}\n`);
+  return candidateRoot;
 }
 
 function productionEvolutionRequest(
@@ -302,6 +316,54 @@ describe("实验工作台 API", () => {
       .toMatchObject({ status: "ready", frozenConfiguration: { compatibilityFingerprint: "maze-arena-v1" } });
   });
 
+  it("谱系 API 透传真实 Repository 的可信基线、中间候选与最终结果分类", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-lineage-api-"));
+    const databasePath = join(directory, "arena.sqlite");
+    const server = createTestServer(databasePath);
+    const experiment = await createExperiment(server, "可信谱系 API 实验");
+    await validateAndConfirm(server, experiment.id);
+
+    const repository = new PluginLineageRepository(join(directory, "lineages"), databasePath);
+    const intermediate = await repository.createCandidate({
+      experimentId: experiment.id,
+      role: "generator",
+      sourceRoot: createLineageCandidate(directory, "intermediate"),
+      attemptId: "g0001-generator",
+      hypothesis: "先冻结中间修复候选",
+    });
+    const final = await repository.createCandidate({
+      experimentId: experiment.id,
+      role: "generator",
+      sourceRoot: createLineageCandidate(directory, "final"),
+      attemptId: "g0001-generator",
+      hypothesis: "再冻结最终评测候选",
+    });
+    repository.recordCandidateResult({
+      experimentId: experiment.id,
+      role: "generator",
+      attemptId: "g0001-generator",
+      commit: final.commit,
+      hypothesis: "再冻结最终评测候选",
+      resultSummary: "与当前冠军平局",
+      outcome: "tie",
+    });
+    repository.close();
+
+    const response = await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/lineages` });
+    expect(response.statusCode).toBe(200);
+    const history = response.json<LineageHistoryResponse>();
+    expect(history.generator).toEqual([
+      expect.objectContaining({ kind: "baseline", attemptId: null, candidateStage: null, outcome: null, generation: null }),
+      expect.objectContaining({ commit: intermediate.commit, kind: "candidate", attemptId: "g0001-generator",
+        candidateStage: "intermediate", outcome: null, generation: null }),
+      expect.objectContaining({ commit: final.commit, kind: "candidate", attemptId: "g0001-generator",
+        candidateStage: "final", outcome: "tie", generation: null }),
+    ]);
+    expect(history.solver).toEqual([
+      expect.objectContaining({ kind: "baseline", attemptId: null, candidateStage: null, outcome: null, generation: null }),
+    ]);
+  });
+
   it("运行 API 通过取消信号立即暂停活动会话并释放单实验锁", async () => {
     const adapter: AutonomousEvolutionAdapter = {
       runRole: ({ signal }) => new Promise((_resolve, reject) => {
@@ -439,7 +501,62 @@ describe("实验工作台 API", () => {
     expect(new Set(harnessEvents.filter(({ details }) => details.role === "generator").map(({ details }) => details.sessionId)).size).toBe(2);
     expect(new Set(harnessEvents.filter(({ details }) => details.role === "solver").map(({ details }) => details.sessionId)).size).toBe(1);
     expect(allHarnessEvents.some(({ details }) => details.outcome === "failed" && details.failureKind === "unknown")).toBe(true);
+    const prepared = audit.events.filter(({ type }) => type === "candidate.prepared");
+    const evaluated = audit.events.filter(({ type }) => type === "candidate.evaluated");
+    expect(prepared).toHaveLength(3);
+    expect(prepared.every(({ details }) => details.payloadChanged === true && details.trustedBuild === "passed"
+      && typeof details.candidateCommit === "string" && typeof details.trustedBuildSha256 === "string")).toBe(true);
+    expect(evaluated).toHaveLength(3);
+    expect(evaluated.every(({ details }) => details.publicCaseCount === 8 && details.hiddenCaseCount === 24
+      && details.isolation === "docker-match-profile" && details.scope === "public-and-hidden")).toBe(true);
+    expect(snapshot.generations[0]?.generator).toMatchObject({
+      attemptId: "g0001-generator", evidenceLevel: "fake", candidateStatus: "evaluated",
+      trustedBuildSha256: expect.stringMatching(/^[0-9a-f]{64}$/), isolatedEvaluation: true,
+    });
+    expect(JSON.stringify(audit)).not.toContain("hidden-");
+    expect(JSON.stringify(audit)).not.toContain("sealed:");
   }, 20_000);
+
+  it("Harness 返回未提交时审计明确记录调用成功与候选无效且不进入评测", async () => {
+    const delegate = new DeterministicFakeHarnessAdapter();
+    const server = createArenaServer({
+      databasePath: ":memory:", matchRunner: deterministicMatchRunner,
+      harnessAdapter: {
+        listModels: () => delegate.listModels(),
+        validateModelProfile: (input) => delegate.validateModelProfile(input),
+        smokeModel: (profile) => delegate.smokeModel(profile),
+        evolvePlugin: async (request) => {
+          if (request.generation > 1) {
+            await new Promise((_resolve, reject) => {
+              const stop = () => reject(new Error("自治任务已取消"));
+              if (request.signal?.aborted) stop();
+              else request.signal?.addEventListener("abort", stop, { once: true });
+            });
+          }
+          return { ...(await delegate.evolvePlugin(request)), submitted: false };
+        },
+      },
+      pairedEvaluationRunner: { evaluate: async () => { throw new Error("无效候选不得进入评测"); } },
+    });
+    servers.push(server);
+    const experiment = await createExperiment(server, "无效候选审计实验");
+    await validateAndConfirm(server, experiment.id);
+    await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/start` });
+    let snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` }))
+      .json<import("@maze-arena/contracts").ExperimentRuntimeSnapshot>();
+    for (let attempt = 0; attempt < 200 && snapshot.generation === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json();
+    }
+    await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/pause` });
+    const audit = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/audit-events` }))
+      .json<import("@maze-arena/contracts").ExperimentAuditEventPage>();
+    expect(audit.events.filter(({ type, details }) => type === "harness.activity" && details.outcome === "succeeded").length).toBeGreaterThanOrEqual(2);
+    expect(audit.events.filter(({ type }) => type === "candidate.invalid").length).toBeGreaterThanOrEqual(2);
+    expect(audit.events.filter(({ type }) => type === "candidate.evaluated")).toHaveLength(0);
+    expect(audit.events.filter(({ type }) => type === "candidate.promoted")).toHaveLength(0);
+    expect(audit.events.filter(({ type }) => type === "candidate.invalid").every(({ details }) => details.reason === "not-submitted")).toBe(true);
+  });
 
   it("恢复 Ticket 05 旧检查点时向第二代 Harness 传递公开事实并标记隐藏指标不可用", async () => {
     const directory = mkdtempSync(join(tmpdir(), "maze-legacy-feedback-"));

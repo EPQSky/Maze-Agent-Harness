@@ -59,6 +59,7 @@ export function createLocalEvolutionAdapter(options: {
       options.lineage.materialize(input.experimentId, opponentRole, input.frozenChampions[opponentRole], opponentRoot);
       let provider: HarnessEvolutionResponse | undefined;
       let evaluationCandidate: { commit: string; root: string } | undefined;
+      let trustedBuildSha256: string | undefined;
       const trustedUsage = { tokens: 0, cost: 0 };
       const evaluationFacts = new CandidateEvaluationFacts();
       const context = {
@@ -159,12 +160,18 @@ export function createLocalEvolutionAdapter(options: {
               testRunner: options.candidateTestRunner,
               strategyRecord,
             });
-            return report.contentSha256;
+            trustedBuildSha256 = report.contentSha256;
+            return trustedBuildSha256;
           },
           candidatePrepared: (candidate) => {
             const root = join(scratch, "evaluation-candidate");
             options.lineage.materialize(input.experimentId, input.role, candidate.commit, root);
             evaluationCandidate = { commit: candidate.commit, root };
+            options.audits.append(input.experimentId, "candidate.prepared", {
+              role: input.role, generation: input.generation, attemptId: input.attemptId,
+              candidateCommit: candidate.commit, trustedBuildSha256: trustedBuildSha256 ?? null,
+              payloadChanged: true, trustedBuild: "passed",
+            });
           },
           verifyCandidate: verifyTrustedPluginCandidate,
           publicGate: async (workspace) => {
@@ -212,9 +219,40 @@ export function createLocalEvolutionAdapter(options: {
             }
           },
           lineage: options.lineage,
+        }).catch((error) => {
+          // 已取得模型响应但尚未形成可信构建时，异常属于候选验证失败；仍保留原关闭失败语义。
+          if (provider && !trustedBuildSha256 && !evaluationCandidate) {
+            options.audits.append(input.experimentId, "candidate.invalid", {
+              role: input.role, generation: input.generation, attemptId: input.attemptId,
+              reason: "candidate-validation-failed",
+            });
+          }
+          throw error;
         });
         const championBefore = input.frozenChampions[input.role];
         const candidateCommit = attempt.candidate?.commit ?? championBefore;
+        if (attempt.status === "invalid-candidate") {
+          options.audits.append(input.experimentId, "candidate.invalid", {
+            role: input.role, generation: input.generation, attemptId: input.attemptId,
+            reason: stableCandidateReason(attempt.diagnostics),
+          });
+        } else {
+          options.audits.append(input.experimentId, "candidate.evaluated", {
+            role: input.role, generation: input.generation, attemptId: input.attemptId,
+            candidateCommit, publicCaseCount: evaluationFacts.publicProgress,
+            hiddenCaseCount: evaluationFacts.hiddenProgress,
+            outcome: attempt.status === "evaluated" ? evaluationFacts.outcome : "failed",
+            scope: attempt.status === "evaluated" ? "public-and-hidden" : "public-only",
+            isolation: "docker-match-profile",
+          });
+          if (attempt.promoted && attempt.candidate?.promotionTag) {
+            options.audits.append(input.experimentId, "candidate.promoted", {
+              role: input.role, generation: input.generation, attemptId: input.attemptId,
+              candidateCommit, championBefore, championAfter: candidateCommit,
+              promotionTag: attempt.candidate.promotionTag,
+            });
+          }
+        }
         return {
           result: {
             candidateCommit, championBefore, championAfter: attempt.promoted ? candidateCommit : championBefore,
@@ -227,6 +265,11 @@ export function createLocalEvolutionAdapter(options: {
             diffSummary: attempt.candidate
               ? options.lineage.diff(input.experimentId, input.role, championBefore, candidateCommit).slice(0, 4_000)
               : undefined,
+            attemptId: input.attemptId,
+            evidenceLevel: provider?.execution.kind,
+            candidateStatus: attempt.status === "invalid-candidate" ? "invalid" : attempt.status,
+            trustedBuildSha256,
+            isolatedEvaluation: evaluationFacts.publicProgress > 0 || evaluationFacts.hiddenProgress > 0,
           },
           usage: trustedUsage,
         };
@@ -242,6 +285,11 @@ export function createLocalEvolutionAdapter(options: {
       });
     },
   };
+}
+
+function stableCandidateReason(diagnostics: readonly string[]): string {
+  if (diagnostics.includes("Harness 未提交候选")) return "not-submitted";
+  return diagnostics.length > 0 ? "candidate-validation-failed" : "unknown";
 }
 
 export function createFrozenEvaluationCases(

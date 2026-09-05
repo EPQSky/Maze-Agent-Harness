@@ -151,7 +151,13 @@ export class AutonomousExperimentRunner {
       }
       if (!committed) return;
       this.experiments.setStatus(experimentId, experimentStatus(committed));
-      this.audits.append(experimentId, "generation.committed", { generation: committed.generation });
+      this.audits.append(experimentId, "generation.committed", {
+        generation: committed.generation,
+        generatorStart: results.generator.championBefore,
+        generatorChampion: results.generator.championAfter,
+        solverStart: results.solver.championBefore,
+        solverChampion: results.solver.championAfter,
+      });
       if (committed.state !== "running") return;
       await Promise.resolve();
     }

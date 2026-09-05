@@ -8,14 +8,17 @@ const experiment = {
   harnessEnvironments: { generator: { home: "/g/home", workspace: "/g/work" }, solver: { home: "/s/home", workspace: "/s/work" } },
 };
 const runtime = {
-  experimentId: experiment.id, state: "paused", phase: "paused", generation: 1, stagnationCount: 0,
-  champions: { generator: "a".repeat(40), solver: "b".repeat(40) }, pauseRequested: false,
+  experimentId: experiment.id, state: "paused", phase: "paused", generation: 2, stagnationCount: 1,
+  champions: { generator: "c".repeat(40), solver: "b".repeat(40) }, pauseRequested: false,
   usage: { tokens: 200, cost: 0 }, budget: { tokenLimit: 5_000, costLimit: null },
   evaluationSuiteId: "suite-1", sealGroupId: "group-1", sealed: true, evolutionPermitted: true,
   compatibilityFingerprint: "maze-arena-v1",
   generations: [{ generation: 1, status: "completed", stagnationCount: 0, exhibitionMatchId: "match-exhibition",
-    generator: { candidateCommit: "c".repeat(40), championBefore: "a".repeat(40), championAfter: "c".repeat(40), outcome: "promoted", promotionTag: "promotion/e2e/generator/g0001", publicProgress: 2, hiddenProgress: 1, aggregate: { primary: 2 }, hiddenCandidateAggregate: { primary: 2 } },
-    solver: { candidateCommit: "d".repeat(40), championBefore: "b".repeat(40), championAfter: "b".repeat(40), outcome: "tie", promotionTag: null, publicProgress: 2, hiddenProgress: 1, aggregate: { primary: 1 }, hiddenCandidateAggregate: { primary: 1 } } }],
+    generator: { candidateCommit: "c".repeat(40), championBefore: "a".repeat(40), championAfter: "c".repeat(40), outcome: "promoted", promotionTag: "promotion/e2e/generator/g0001", publicProgress: 8, hiddenProgress: 24, aggregate: { primary: 2 }, hiddenCandidateAggregate: { hiddenSecretMetric: 2 }, hypothesis: "缩短生成器冗余路径", diffSummary: "src/index.ts | 4 ++--", gateDiagnostics: [], attemptId: "g0001-generator", evidenceLevel: "real-provider", candidateStatus: "evaluated", trustedBuildSha256: "1".repeat(64), isolatedEvaluation: true },
+    solver: { candidateCommit: "d".repeat(40), championBefore: "b".repeat(40), championAfter: "b".repeat(40), outcome: "tie", promotionTag: null, publicProgress: 8, hiddenProgress: 24, aggregate: { primary: 1 }, hiddenCandidateAggregate: { hiddenSecretMetric: 1 }, hypothesis: "减少回溯动作", diffSummary: "src/index.ts | 2 ++", gateDiagnostics: [], attemptId: "g0001-solver", evidenceLevel: "deterministic-fixture", candidateStatus: "evaluated", trustedBuildSha256: "2".repeat(64), isolatedEvaluation: true } },
+    { generation: 2, status: "completed", stagnationCount: 1, exhibitionMatchId: "match-exhibition-2",
+      generator: { candidateCommit: "e".repeat(40), championBefore: "c".repeat(40), championAfter: "c".repeat(40), outcome: "failed", promotionTag: null, publicProgress: 8, hiddenProgress: 0, aggregate: { primary: 0 }, hypothesis: "尝试压缩拓扑", diffSummary: "src/index.ts | 1 +", gateDiagnostics: ["公开主指标退化"], attemptId: "g0002-generator", evidenceLevel: "fake", candidateStatus: "public-gate-failed", trustedBuildSha256: "3".repeat(64), isolatedEvaluation: true },
+      solver: { candidateCommit: "f".repeat(40), championBefore: "b".repeat(40), championAfter: "b".repeat(40), outcome: "failed", promotionTag: null, publicProgress: 0, hiddenProgress: 0, aggregate: {}, hypothesis: "未形成有效候选", gateDiagnostics: ["仅修改测试"], attemptId: "g0002-solver", evidenceLevel: "fake", candidateStatus: "invalid", isolatedEvaluation: false } }],
 };
 const match = { id: "match-exhibition", experimentId: experiment.id, seed: "public-e2e", protocolVersion: 1,
   status: "completed", committedEventCount: 3, totalEventCount: 3,
@@ -35,8 +38,25 @@ async function mockApi(page: Page) {
       : path === "/api/harness/models" ? { credentialRefs: [], providers: [] }
       : path.endsWith("/baseline-validation") ? { experimentId: experiment.id, status: "ready", steps: [], operatorConfirmed: true, frozenConfiguration: {}, frozenDigest: "digest", smoke: { attempted: false, passed: null } }
       : path.endsWith("/runtime") ? runtime
-      : path.endsWith("/audit-events") ? { events: [{ id: 1, experimentId: experiment.id, type: "harness.activity", occurredAt: "2026-09-02T12:00:01.000Z", details: { role: "generator", executionKind: "real-provider", protocolVersion: 1, outcome: "succeeded", usageTokens: 64, usageCost: 0 } }], nextId: 1 }
-      : path.endsWith("/lineages") ? { generator: [{ commit: runtime.champions.generator, subject: "baseline: generator", tags: ["baseline/e2e/generator"] }], solver: [{ commit: runtime.champions.solver, subject: "baseline: solver", tags: ["baseline/e2e/solver"] }] }
+      : path.endsWith("/audit-events") ? { events: [
+        { id: 1, experimentId: experiment.id, type: "harness.activity", occurredAt: "2026-09-02T12:00:01.000Z", details: { role: "generator", attemptId: "g0001-generator", executionKind: "real-provider", protocolVersion: 1, outcome: "succeeded", usageTokens: 64, usageCost: 0, hiddenSeed: "hidden-secret-seed" } },
+        { id: 2, experimentId: experiment.id, type: "candidate.prepared", occurredAt: "2026-09-02T12:00:02.000Z", details: { role: "generator", candidateCommit: "c".repeat(40), trustedBuildSha256: "1".repeat(64), payloadChanged: true } },
+        { id: 3, experimentId: experiment.id, type: "candidate.evaluated", occurredAt: "2026-09-02T12:00:03.000Z", details: { role: "generator", publicCaseCount: 8, hiddenCaseCount: 24, outcome: "promoted", isolation: "docker-match-profile" } },
+        { id: 4, experimentId: experiment.id, type: "candidate.promoted", occurredAt: "2026-09-02T12:00:04.000Z", details: { role: "generator", promotionTag: "promotion/e2e/generator/g0001" } },
+        { id: 5, experimentId: experiment.id, type: "harness.activity", occurredAt: "2026-09-02T12:00:05.000Z", details: { role: "solver", executionKind: "deterministic-fixture", outcome: "succeeded" } },
+        { id: 6, experimentId: experiment.id, type: "harness.activity", occurredAt: "2026-09-02T12:00:06.000Z", details: { role: "solver", executionKind: "fake", outcome: "succeeded" } },
+        { id: 7, experimentId: experiment.id, type: "candidate.invalid", occurredAt: "2026-09-02T12:00:07.000Z", details: { role: "solver", reason: "candidate-validation-failed" } },
+      ], nextId: 7 }
+      : path.endsWith("/lineages") ? { generator: [
+        { commit: "a".repeat(40), subject: "baseline: generator", tags: ["baseline/e2e/generator"], kind: "baseline", attemptId: null, candidateStage: null, outcome: null, generation: null },
+        { commit: "9".repeat(40), subject: "candidate: g0001-generator", tags: [], kind: "candidate", attemptId: "g0001-generator", candidateStage: "intermediate", outcome: null, generation: null },
+        { commit: "c".repeat(40), subject: "candidate: g0001-generator", tags: ["promotion/e2e/generator/g0001"], kind: "candidate", attemptId: "g0001-generator", candidateStage: "final", outcome: "promoted", generation: 1 },
+        { commit: "e".repeat(40), subject: "candidate: g0002-generator", tags: [], kind: "candidate", attemptId: "g0002-generator", candidateStage: "final", outcome: "failed", generation: null },
+      ], solver: [
+        { commit: "b".repeat(40), subject: "baseline: solver", tags: ["baseline/e2e/solver"], kind: "baseline", attemptId: null, candidateStage: null, outcome: null, generation: null },
+        { commit: "d".repeat(40), subject: "candidate: g0001-solver", tags: [], kind: "candidate", attemptId: "g0001-solver", candidateStage: "final", outcome: "tie", generation: null },
+        { commit: "f".repeat(40), subject: "candidate: g0002-solver", tags: [], kind: "candidate", attemptId: "g0002-solver", candidateStage: "final", outcome: "failed", generation: null },
+      ] }
       : path.endsWith("/matches/latest") ? match
       : path.endsWith("/matches") ? { matches: [match] }
       : path.endsWith("/events") ? { match, events, nextSequence: 3 }
@@ -46,9 +66,51 @@ async function mockApi(page: Page) {
   });
 }
 
+async function inspectChineseFont(page: Page) {
+  return page.evaluate(async () => {
+    await document.fonts.ready;
+    const face = [...document.fonts].find((candidate) => candidate.family.replace(/["']/g, "") === "Maze Arena CJK");
+    const glyphSignature = (text: string) => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 64;
+      canvas.height = 64;
+      const context = canvas.getContext("2d")!;
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      context.fillStyle = "#fff";
+      context.font = '40px "Maze Arena CJK"';
+      context.textBaseline = "top";
+      context.fillText(text, 4, 4);
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      let ink = 0;
+      let hash = 2_166_136_261;
+      for (let index = 3; index < pixels.length; index += 4) {
+        const alpha = pixels[index]!;
+        if (alpha > 0) ink += 1;
+        hash = Math.imul(hash ^ alpha, 16_777_619) >>> 0;
+      }
+      return { ink, hash };
+    };
+    return {
+      faceStatus: face?.status ?? "missing",
+      computedFamily: getComputedStyle(document.body).fontFamily,
+      chineseA: glyphSignature("晋"),
+      chineseB: glyphSignature("级"),
+      replacement: glyphSignature("�"),
+    };
+  });
+}
+
 test("工作台导航、筛选、播放和画布布局可用", async ({ page }, testInfo) => {
-    await mockApi(page);
-    await page.goto("/");
+  await mockApi(page);
+  await page.goto("/");
+  const font = await inspectChineseFont(page);
+  expect(font.faceStatus, `${testInfo.project.name} 离线中文字体未加载`).toBe("loaded");
+  expect(font.computedFamily).toContain("Maze Arena CJK");
+  expect(font.chineseA.ink).toBeGreaterThan(100);
+  expect(font.chineseB.ink).toBeGreaterThan(100);
+  expect(font.chineseA.hash, "两个中文字符渲染成相同缺字方框").not.toBe(font.chineseB.hash);
+  expect(font.chineseA.hash, "中文字符渲染成替代字符").not.toBe(font.replacement.hash);
+  expect(font.chineseB.hash, "中文字符渲染成替代字符").not.toBe(font.replacement.hash);
     await expect(page.getByRole("heading", { name: "长期自治实验" })).toBeVisible();
     await expect(page.getByRole("img", { name: "迷宫比赛画布" })).toBeVisible();
     await expect.poll(() => page.getByLabel("事件位置").getAttribute("max")).toBe("3");
@@ -67,9 +129,34 @@ test("工作台导航、筛选、播放和画布布局可用", async ({ page }, 
     await page.getByLabel("角色筛选").selectOption("exhibition");
     await expect(page.getByText("match-exhibition")).toBeVisible();
     await page.getByRole("tab", { name: "Lineages" }).click();
-    await expect(page.getByText("baseline: generator baseline/e2e/generator", { exact: true })).toBeVisible();
+    await expect(page.getByText("baseline: generator", { exact: true })).toBeVisible();
+    await expect(page.getByText("baseline/e2e/generator", { exact: true })).toBeVisible();
+    await expect(page.getByText("可信基线")).toHaveCount(2);
+    await expect(page.getByText("中间修复候选")).toBeVisible();
+    await expect(page.getByText("当前冠军")).toHaveCount(2);
+    await expect(page.getByText("promotion/e2e/generator/g0001")).toBeVisible();
+    await page.getByRole("tab", { name: "Generations" }).click();
+    await expect(page.getByLabel("第 1 代证据").getByText("下一代已继承该冠军")).toHaveCount(2);
+    await expect(page.getByLabel("第 1 代证据").getByText("本代起点")).toHaveCount(2);
+    await page.getByRole("tab", { name: "Candidates" }).click();
+    await expect(page.getByLabel("第 1 代 Generator 候选").getByText("真实模型运行")).toBeVisible();
+    await expect(page.getByLabel("第 1 代 Solver 候选").getByText("确定性自治夹具")).toBeVisible();
+    await expect(page.getByLabel("第 2 代 Generator 候选").getByText("Fake Harness 测试")).toBeVisible();
+    await expect(page.getByText("公开主指标退化")).toBeVisible();
+    await expect(page.getByText("未形成可安装运行载荷差异")).toBeVisible();
+    await expect(page.getByText("未形成候选 Git 提交")).toBeVisible();
+    await expect(page.getByText("hiddenSecretMetric")).toHaveCount(0);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+    await page.screenshot({ path: testInfo.outputPath(`ticket-10-candidates-${testInfo.project.name}.png`), fullPage: true });
     await page.getByRole("tab", { name: "Audit" }).click();
     await expect(page.getByText(/实际提供方返回/)).toBeVisible();
+    await expect(page.getByText("Harness 已调用")).toHaveCount(3);
+    await expect(page.getByText("候选无效")).toBeVisible();
+    await expect(page.getByText("候选已评测")).toBeVisible();
+    await expect(page.getByText("候选已晋级")).toBeVisible();
+    await expect(page.getByText("hidden-secret-seed")).toHaveCount(0);
+
+    await page.screenshot({ path: testInfo.outputPath(`ticket-10-${testInfo.project.name}.png`), fullPage: true });
 
     const canvasPixels = await page.getByRole("img", { name: "迷宫比赛画布" }).evaluate((element) => {
       const canvas = element as HTMLCanvasElement;

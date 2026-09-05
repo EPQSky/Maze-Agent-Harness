@@ -50,6 +50,11 @@ export interface LineageEntry {
   commit: string;
   subject: string;
   tags: string[];
+  kind: "baseline" | "candidate";
+  attemptId: string | null;
+  candidateStage: "intermediate" | "final" | null;
+  outcome: CandidateCommitInput["outcome"] | null;
+  generation: number | null;
 }
 
 export interface StrategyRecord {
@@ -291,11 +296,28 @@ export class PluginLineageRepository {
   listHistory(experimentId: string, role: PluginRole): LineageEntry[] {
     this.verifyIntegrity(experimentId, role);
     const repository = this.repositoryPath(experimentId, role);
+    const baselineCommit = this.repositoryRow(experimentId, role)!.baseline_commit;
+    const results = this.database.prepare(`SELECT attempt_id, target_commit, outcome, generation FROM candidate_results
+      WHERE experiment_id = ? AND role = ?`).all(experimentId, role) as unknown as Array<{
+        attempt_id: string; target_commit: string; outcome: CandidateCommitInput["outcome"]; generation: number | null;
+      }>;
+    const resultByCommit = new Map(results.map((result) => [result.target_commit, result]));
     const lines = git(repository, ["log", "--format=%H%x09%s%x09%D", "--reverse"]).split("\n").filter(Boolean);
     return lines.map((line) => {
       const [commit = "", subject = "", decorations = ""] = line.split("\t");
       const tags = [...decorations.matchAll(/tag: ([^,)]+)/g)].map((match) => match[1]!);
-      return { commit, subject, tags };
+      if (commit === baselineCommit) {
+        return { commit, subject, tags, kind: "baseline", attemptId: null,
+          candidateStage: null, outcome: null, generation: null };
+      }
+      const attemptId = subject.startsWith("candidate: ") ? subject.slice("candidate: ".length) : null;
+      if (!attemptId || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(attemptId)) {
+        return this.tampered(experimentId, role, "候选提交主题缺少可信尝试标识");
+      }
+      const result = resultByCommit.get(commit);
+      return { commit, subject, tags, kind: "candidate", attemptId,
+        candidateStage: result ? "final" : "intermediate",
+        outcome: result?.outcome ?? null, generation: result?.generation ?? null };
     });
   }
 

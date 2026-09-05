@@ -117,6 +117,35 @@ describe("插件 Git 谱系与晋级标签", () => {
     database.close();
   });
 
+  it("谱系历史以可信元数据区分基线、中间修复候选与最终结果", async () => {
+    const { root, repository } = setup();
+    const baseline = await repository.initialize("exp-history", "generator", fixture);
+    const intermediate = await repository.createCandidate({
+      experimentId: "exp-history", role: "generator", sourceRoot: candidate(root, "repair-0"),
+      attemptId: "g0001-generator", hypothesis: "公开门禁修复",
+    });
+    const tie = await repository.createCandidate({
+      experimentId: "exp-history", role: "generator", sourceRoot: candidate(root, "repair-1"),
+      attemptId: "g0001-generator", hypothesis: "公开门禁修复",
+    });
+    repository.recordCandidateResult({ experimentId: "exp-history", role: "generator",
+      attemptId: "g0001-generator", commit: tie.commit, hypothesis: "公开门禁修复", resultSummary: "平局", outcome: "tie" });
+    const promoted = await repository.commitCandidate({ experimentId: "exp-history", role: "generator",
+      sourceRoot: candidate(root, "promoted"), attemptId: "g0002-generator", hypothesis: "晋级候选",
+      resultSummary: "晋级", outcome: "promoted", generation: 2 });
+    const failed = await repository.commitCandidate({ experimentId: "exp-history", role: "generator",
+      sourceRoot: candidate(root, "failed-final"), attemptId: "g0003-generator", hypothesis: "失败候选",
+      resultSummary: "失败", outcome: "failed" });
+
+    expect(repository.listHistory("exp-history", "generator")).toEqual([
+      expect.objectContaining({ commit: baseline, kind: "baseline", attemptId: null, candidateStage: null, outcome: null }),
+      expect.objectContaining({ commit: intermediate.commit, kind: "candidate", attemptId: "g0001-generator", candidateStage: "intermediate", outcome: null }),
+      expect.objectContaining({ commit: tie.commit, kind: "candidate", attemptId: "g0001-generator", candidateStage: "final", outcome: "tie" }),
+      expect.objectContaining({ commit: promoted.commit, kind: "candidate", attemptId: "g0002-generator", candidateStage: "final", outcome: "promoted", generation: 2 }),
+      expect.objectContaining({ commit: failed.commit, kind: "candidate", attemptId: "g0003-generator", candidateStage: "final", outcome: "failed" }),
+    ]);
+  });
+
   it("只从己方候选提交读取按 attemptId 命名的策略记录", async () => {
     const { root, repository } = setup();
     await repository.initialize("exp-strategy", "generator", fixture);
