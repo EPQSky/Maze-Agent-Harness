@@ -39,6 +39,7 @@ export function createLocalEvolutionAdapter(options: {
   pairedEvaluationRunner: PairedEvaluationRunner;
   matchImageDigest: string;
   resourcePolicyDigest: string;
+  evaluationCaseFactory?: typeof createFrozenEvaluationCases;
   startExhibition(input: {
     experimentId: string; seed: string; generatorCommit: string; solverCommit: string;
     generation?: number; exhibitionId?: string;
@@ -65,7 +66,7 @@ export function createLocalEvolutionAdapter(options: {
         imageDigest: options.matchImageDigest,
         resourcePolicyDigest: options.resourcePolicyDigest,
       };
-      const { publicCases, hiddenCases } = createFrozenEvaluationCases(
+      const { publicCases, hiddenCases } = (options.evaluationCaseFactory ?? createFrozenEvaluationCases)(
         options.runtime, input.experimentId, input.generation, input.role,
       );
       const feedback = assembleTrustedEvolutionFeedback({
@@ -77,7 +78,7 @@ export function createLocalEvolutionAdapter(options: {
         runtime: options.runtime,
         lineage: options.lineage,
       });
-      const allCases = [...publicCases, ...hiddenCases];
+      const allCases = [...publicCases, ...hiddenCases].sort((left, right) => left.id.localeCompare(right.id));
       try {
         const attempt = await runEvolutionAttempt({
           experimentId: input.experimentId,

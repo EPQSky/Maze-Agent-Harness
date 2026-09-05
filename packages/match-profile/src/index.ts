@@ -659,7 +659,8 @@ async function materializeVersionedProfile(harnessHome: string, role: MatchPlugi
   const sourceSnapshot = join(trustedHome, "snapshots", role);
   const expected = readFileSync(`${sourceSnapshot}.sha256`, "utf8").trim();
   if (hashDirectory(sourceSnapshot) !== expected) throw new Error(`冻结 Match Profile 快照摘要不匹配：${role}`);
-  await validatePluginPackage(packageRoot);
+  // 版本提交已经由私有 Git 快照绑定；执行阶段应校验完整历史，而不是把累积谱系误判为单次新增。
+  await validatePluginPackage(packageRoot, lineageIdentity(packageRoot));
   const home = mkdtempSync(join(tmpdir(), `maze-paired-${role}-`));
   try {
     chmodSync(home, 0o755);

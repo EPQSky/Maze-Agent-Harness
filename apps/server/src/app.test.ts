@@ -387,8 +387,11 @@ describe("实验工作台 API", () => {
       const roleCalls = pairCalls.filter((call) => call.role === role);
       expect(roleCalls.length).toBeGreaterThanOrEqual(2);
       expect(roleCalls[0]?.cases.map(({ id }) => id)).toEqual(Array.from({ length: 8 }, (_, index) => `public-${String(index + 1).padStart(2, "0")}`));
-      expect(roleCalls[1]?.cases.slice(0, 8)).toEqual(roleCalls[0]?.cases);
       expect(roleCalls[1]?.cases).toHaveLength(32);
+      expect(roleCalls[1]?.cases.map(({ id }) => id)).toEqual(
+        [...roleCalls[1]!.cases].map(({ id }) => id).sort((left, right) => left.localeCompare(right)),
+      );
+      expect(roleCalls[1]?.cases.filter(({ visibility }) => visibility === "public")).toEqual(roleCalls[0]?.cases);
       expect(roleCalls[0]).toMatchObject({
         candidate: { commit: expect.stringMatching(/^[0-9a-f]{40}$/), root: expect.stringContaining("/evaluation-candidate") },
         champion: { commit: expect.stringMatching(/^[0-9a-f]{40}$/), root: expect.stringContaining("/champion") },
