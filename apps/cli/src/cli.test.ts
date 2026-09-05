@@ -6,6 +6,8 @@ import { spawn, spawnSync } from "node:child_process";
 import type { Writable } from "node:stream";
 import { createHash } from "node:crypto";
 import { hashHarnessRuntimePayload } from "@maze-arena/dsh-integration";
+import { ExperimentRuntimeRepository } from "@maze-arena/control-plane";
+import { PluginLineageRepository } from "@maze-arena/lineage";
 import { describe, expect, it } from "vitest";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -456,6 +458,99 @@ function prepareBuiltImageFixture(prepareRuntime?: (fixture: Fixture) => void): 
 }
 
 describe("正式运行 CLI 黑盒边界", () => {
+  it("backup create/verify/restore 以真实 SQLite 与 Git 谱系完成隔离恢复，doctor 检查最近完整备份", async () => {
+    const fixture = prepareBuiltImageFixture();
+    const databasePath = join(fixture.root, "data/maze-arena/maze-arena.sqlite");
+    const lineageRoot = join(fixture.root, "data/maze-arena/lineages");
+    const lineage = new PluginLineageRepository(lineageRoot, databasePath);
+    const champions = { generator: "", solver: "" };
+    let promotedCommit = "";
+    let solverCommit = "";
+    try {
+      champions.generator = await lineage.initialize("exp-cli-backup", "generator", join(repositoryRoot, "packages/generator-plugin"));
+      champions.solver = await lineage.initialize("exp-cli-backup", "solver", join(repositoryRoot, "packages/solver-plugin"));
+      await lineage.initialize("validated-draft", "generator", join(repositoryRoot, "packages/generator-plugin"));
+      await lineage.initialize("validated-draft", "solver", join(repositoryRoot, "packages/solver-plugin"));
+      const candidateRoot = join(fixture.root, "cli-backup-candidate");
+      cpSync(join(repositoryRoot, "packages/generator-plugin"), candidateRoot, {
+        recursive: true,
+        filter: (source) => !source.includes("node_modules") && !source.includes("/dist"),
+      });
+      const candidateSource = join(candidateRoot, "src/index.ts");
+      writeFileSync(candidateSource, `${readFileSync(candidateSource, "utf8")}\n// CLI 真实晋级候选\n`);
+      const promoted = await lineage.commitCandidate({ experimentId: "exp-cli-backup", role: "generator",
+        sourceRoot: candidateRoot, attemptId: "g0001-generator", hypothesis: "CLI 备份晋级",
+        resultSummary: "通过", outcome: "promoted", generation: 1 });
+      promotedCommit = promoted.commit;
+      const solverRoot = join(fixture.root, "cli-backup-solver");
+      cpSync(join(repositoryRoot, "packages/solver-plugin"), solverRoot, {
+        recursive: true,
+        filter: (source) => !source.includes("node_modules") && !source.includes("/dist"),
+      });
+      const solverSource = join(solverRoot, "src/index.ts");
+      writeFileSync(solverSource, `${readFileSync(solverSource, "utf8")}\n// CLI 求解器平局候选\n`);
+      solverCommit = (await lineage.commitCandidate({ experimentId: "exp-cli-backup", role: "solver",
+        sourceRoot: solverRoot, attemptId: "g0001-solver", hypothesis: "CLI 备份平局",
+        resultSummary: "平局", outcome: "tie" })).commit;
+    } finally { lineage.close(); }
+    const runtime = new ExperimentRuntimeRepository(databasePath);
+    runtime.registerReady({ experimentId: "exp-cli-backup", champions, tokenLimit: 10_000,
+      compatibilityFingerprint: "cli-backup-v1" });
+    runtime.start("exp-cli-backup");
+    const generatorResult = { candidateCommit: promotedCommit, championBefore: champions.generator,
+      championAfter: promotedCommit, outcome: "promoted" as const,
+      promotionTag: "promotion/exp-cli-backup/generator/g0001", publicProgress: 1, hiddenProgress: 1, aggregate: {} };
+    const solverResult = { candidateCommit: solverCommit, championBefore: champions.solver,
+      championAfter: champions.solver, outcome: "tie" as const,
+      promotionTag: null, publicProgress: 1, hiddenProgress: 1, aggregate: {} };
+    runtime.saveRoleCheckpoint({ experimentId: "exp-cli-backup", generation: 1, role: "generator",
+      attemptId: "g0001-generator", result: generatorResult, tokens: 0, cost: 0 });
+    runtime.saveRoleCheckpoint({ experimentId: "exp-cli-backup", generation: 1, role: "solver",
+      attemptId: "g0001-solver", result: solverResult, tokens: 0, cost: 0 });
+    runtime.commitGeneration({ experimentId: "exp-cli-backup", generator: generatorResult, solver: solverResult,
+      checkpointKey: "generation-1" });
+    runtime.close();
+    executable(join(fixture.bin, "git"), `exec "${realGit}" "$@"`);
+
+    const created = run(fixture, ["backup", "create"]);
+    expect(created.status, created.stderr).toBe(0);
+    expect(created.stdout).toContain("备份未由应用加密");
+    const backupPath = created.stdout.match(/完整备份已创建：(.+)/)?.[1];
+    expect(backupPath).toBeTruthy();
+    const verified = run(fixture, ["backup", "verify", backupPath!]);
+    expect(verified.status, verified.stderr).toBe(0);
+    expect(verified.stdout).toContain("完整备份校验通过");
+
+    const outputSecret = "sk-ticket11-output-secret";
+    fixture.env.MAZE_API_KEY = outputSecret;
+    const restoreTarget = `${fixture.root}-${outputSecret}-isolated-restore`;
+    const restored = run(fixture, ["backup", "restore", backupPath!, "--target", restoreTarget]);
+    expect(restored.status, restored.stderr).toBe(0);
+    expect(restored.stdout).toContain("已恢复到隔离目录");
+    expect(restored.stdout).not.toContain(outputSecret);
+    expect(restored.stdout).toContain("[REDACTED]");
+    expect(existsSync(join(restoreTarget, "maze-arena.sqlite"))).toBe(true);
+    const restoredLineage = new PluginLineageRepository(join(restoreTarget, "lineages"), join(restoreTarget, "maze-arena.sqlite"));
+    expect(restoredLineage.verifyAllIntegrity().map(({ experimentId, role }) => `${experimentId}:${role}`).sort()).toEqual([
+      "exp-cli-backup:generator",
+      "exp-cli-backup:solver",
+      "validated-draft:generator",
+      "validated-draft:solver",
+    ]);
+    restoredLineage.close();
+
+    const doctor = run(fixture, ["doctor"]);
+    expect(doctor.status, doctor.stderr).toBe(0);
+    expect(doctor.stdout).toContain("检查通过：最近完整备份");
+    const singleSqlite = join(fixture.root, "single.sqlite");
+    writeFileSync(singleSqlite, readFileSync(join(backupPath!, "maze-arena.sqlite")));
+    const refused = run(fixture, ["backup", "restore", singleSqlite, "--target", `${fixture.root}-bad-restore`]);
+    expect(refused.status).toBe(1);
+    expect(refused.stderr).toContain("备份目录");
+    rmSync(restoreTarget, { recursive: true, force: true });
+    delete fixture.env.MAZE_API_KEY;
+  }, 30_000);
+
   it("退出码为零的畸形 Docker 与 DSH 版本输出不会进入管理错误", () => {
     const dockerFixture = createFixture();
     writeFileSync(join(dockerFixture.root, "docker-opaque-version"), "1\n");

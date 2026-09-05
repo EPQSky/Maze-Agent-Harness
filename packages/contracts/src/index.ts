@@ -341,6 +341,8 @@ export type ExperimentAuditEventType =
   | "runtime.started"
   | "runtime.paused"
   | "runtime.cancelled"
+  | "backup.created"
+  | "backup.failed"
   | "harness.activity"
   | "candidate.invalid"
   | "candidate.prepared"

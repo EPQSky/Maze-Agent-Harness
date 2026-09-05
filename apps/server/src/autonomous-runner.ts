@@ -33,12 +33,17 @@ export class AutonomousExperimentRunner {
     private readonly experiments: ExperimentRepository,
     private readonly audits: AuditRepository,
     private readonly adapter: AutonomousEvolutionAdapter,
+    private readonly backupTerminal: (experimentId: string) => void = () => undefined,
+    private readonly backupStart: (experimentId: string) => void = () => undefined,
   ) {}
 
   resumePersisted(): void {
     for (const snapshot of this.runtime.list()) {
       this.experiments.setStatus(snapshot.experimentId, experimentStatus(snapshot));
-      if (snapshot.state === "running") this.launch(snapshot.experimentId);
+      if (snapshot.state === "running") {
+        this.backupStart(snapshot.experimentId);
+        this.launch(snapshot.experimentId);
+      }
     }
   }
 
@@ -133,6 +138,7 @@ export class AutonomousExperimentRunner {
         if (signal.aborted) return;
         const failed = this.runtime.fail(experimentId, error instanceof Error ? error.message : "展示局创建失败");
         this.experiments.setStatus(experimentId, experimentStatus(failed));
+        this.backupTerminal(experimentId);
         return;
       }
       let committed: ExperimentRuntimeSnapshot | undefined;
@@ -145,6 +151,7 @@ export class AutonomousExperimentRunner {
           if (attempt === 2) {
             const failed = this.runtime.fail(experimentId, error instanceof Error ? error.message : "Arena 提交失败");
             this.experiments.setStatus(experimentId, experimentStatus(failed));
+            this.backupTerminal(experimentId);
             return;
           }
         }
@@ -158,7 +165,10 @@ export class AutonomousExperimentRunner {
         solverStart: results.solver.championBefore,
         solverChampion: results.solver.championAfter,
       });
-      if (committed.state !== "running") return;
+      if (committed.state !== "running") {
+        this.backupTerminal(experimentId);
+        return;
+      }
       await Promise.resolve();
     }
   }

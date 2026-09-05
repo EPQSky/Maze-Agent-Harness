@@ -18,7 +18,13 @@ const profile: ModelProfile = {
   providerLabel: "Fake", modelLabel: "Fake",
 };
 
-function setup(adapter: AutonomousEvolutionAdapter, tokenLimit = 20, costLimit?: number) {
+function setup(
+  adapter: AutonomousEvolutionAdapter,
+  tokenLimit = 20,
+  costLimit?: number,
+  backupTerminal?: (experimentId: string) => void,
+  backupStart?: (experimentId: string) => void,
+) {
   const root = mkdtempSync(join(tmpdir(), "maze-autonomous-runner-"));
   const databasePath = join(root, "arena.sqlite");
   const experiments = new ExperimentRepository(databasePath, join(root, "harness"));
@@ -28,7 +34,7 @@ function setup(adapter: AutonomousEvolutionAdapter, tokenLimit = 20, costLimit?:
   runtime.start(experiment.id);
   experiments.setStatus(experiment.id, "running");
   const audits = new AuditRepository(databasePath);
-  const runner = new AutonomousExperimentRunner(runtime, experiments, audits, adapter);
+  const runner = new AutonomousExperimentRunner(runtime, experiments, audits, adapter, backupTerminal, backupStart);
   resources.push(runner, audits, runtime, experiments);
   return { experiment, runtime, runner, experiments };
 }
@@ -189,10 +195,12 @@ describe("自治实验后台运行器", () => {
         signal.addEventListener("abort", () => reject(new Error("已取消")), { once: true });
       }),
     };
-    const { experiment, runner, experiments } = setup(adapter, 1_000);
+    const backupStart = vi.fn();
+    const { experiment, runner, experiments } = setup(adapter, 1_000, undefined, undefined, backupStart);
     experiments.setStatus(experiment.id, "draft");
     runner.resumePersisted();
     expect(experiments.find(experiment.id)?.status).toBe("running");
+    expect(backupStart).toHaveBeenCalledWith(experiment.id);
   });
 
   it("持续有晋级时运行到第 20 代自动完成", async () => {
@@ -206,6 +214,22 @@ describe("自治实验后台运行器", () => {
     runner.launch(experiment.id);
     const snapshot = await waitForState(runtime, experiment.id, "completed");
     expect(snapshot).toMatchObject({ generation: 20, stagnationCount: 0, champions: { generator: "generator-20" } });
+  });
+
+  it("进入 completed 终态后触发完整备份边界", async () => {
+    const adapter: AutonomousEvolutionAdapter = {
+      runRole: async ({ role, generation, frozenChampions }) => ({
+        result: result(role, frozenChampions[role], role === "generator" ? "promoted" : "tie", generation),
+        usage: { tokens: 0, cost: 0 },
+      }),
+    };
+    const backupTerminal = vi.fn();
+    const { experiment, runtime, runner } = setup(adapter, 1_000, undefined, backupTerminal);
+    runner.launch(experiment.id);
+    await waitForState(runtime, experiment.id, "completed");
+    await runner.close();
+    expect(backupTerminal).toHaveBeenCalledOnce();
+    expect(backupTerminal).toHaveBeenCalledWith(experiment.id);
   });
 
   it("可信成本达到可选上限后在完整代边界暂停", async () => {

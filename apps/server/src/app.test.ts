@@ -202,6 +202,36 @@ const abortableBlockingAdapter: AutonomousEvolutionAdapter = {
 };
 
 describe("实验工作台 API", () => {
+  it("实验启动前备份失败时不发布运行态，成功启动与取消终态各触发一次边界备份", async () => {
+    const calls: string[] = [];
+    let fail = true;
+    const adapter: AutonomousEvolutionAdapter = {
+      runRole: ({ signal }) => new Promise((_resolve, reject) => {
+        if (signal.aborted) { reject(new Error("已取消")); return; }
+        signal.addEventListener("abort", () => reject(new Error("已取消")), { once: true });
+      }),
+    };
+    const server = createArenaServer({
+      databasePath: ":memory:", harnessAdapter: new DeterministicFakeHarnessAdapter(), matchRunner: deterministicMatchRunner,
+      autonomousEvolutionAdapter: adapter,
+      backupManager: { create: (trigger) => { calls.push(trigger); if (fail) throw new Error("backup unavailable"); } },
+    });
+    servers.push(server);
+    const experiment = await createExperiment(server, "备份边界实验");
+    await validateAndConfirm(server, experiment.id);
+    let response = await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/start` });
+    expect(response.statusCode).toBe(409);
+    expect(response.json<DomainErrorResponse>().error.message).toContain("backup unavailable");
+    expect((await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json())
+      .toMatchObject({ state: "ready" });
+
+    fail = false;
+    response = await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/start` });
+    expect(response.statusCode).toBe(200);
+    response = await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/cancel` });
+    expect(response.statusCode).toBe(200);
+    expect(calls).toEqual(["experiment-start", "experiment-start", "experiment-terminal"]);
+  });
   it("持久关闭处理器合并交错信号风暴且仅在关闭成功后卸载", async () => {
     const signals = new EventEmitter();
     let closeCalls = 0;

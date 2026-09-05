@@ -26,6 +26,8 @@ import { request } from "node:http";
 import { Socket } from "node:net";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
+import { RuntimeBackupManager, sensitiveEnvironmentValues } from "@maze-arena/backup";
 import {
   createHarnessNetworkSeccompProgram,
   hashHarnessRuntimePayload,
@@ -51,6 +53,7 @@ interface RuntimePaths {
   processState: string;
   processLock: string;
   harnessRuntimes: string;
+  backups: string;
 }
 
 interface ProcessState {
@@ -218,6 +221,7 @@ function runtimePaths(environment: NodeJS.ProcessEnv): RuntimePaths {
     processState: join(runtime, "server.json"),
     processLock: join(runtime, "server.lock"),
     harnessRuntimes: join(dataRoot, "harness-runtimes"),
+    backups: join(dataRoot, "backups"),
   };
 }
 
@@ -1629,6 +1633,8 @@ function formalRuntimeEnvironment(
     ARENA_STARTUP_HANDSHAKE_FD: "3",
     ARENA_DATABASE_PATH: join(paths.dataRoot, "maze-arena.sqlite"),
     ARENA_MODEL_CATALOG_PATH: catalogPath,
+    ARENA_MODEL_CATALOG_RELEASE: basename(dirname(catalogPath)),
+    ARENA_HARNESS_COMMIT: manifest.harness.commit,
     ARENA_MATCH_IMAGE: manifest.matchProfile!.imageReference,
     ARENA_MATCH_TRUSTED_ROOT: join(paths.dataRoot, "harness"),
     ARENA_MATCH_PROTOCOL_PACKAGE: join(repositoryRoot, "packages/match-profile"),
@@ -1709,6 +1715,12 @@ async function doctor(environment: NodeJS.ProcessEnv, printDiagnostics = true): 
   validateMatchProfileImage(manifest);
   const catalog = validateModelCatalog(paths, manifest);
   const build = validateProductionBuild();
+  const backup = createBackupManager(paths, manifest, catalog.release, environment);
+  if (hasRegisteredLineages(join(paths.dataRoot, "maze-arena.sqlite"))) {
+    const latest = backup.latestComplete();
+    if (!latest) throw new CliError("正式运行数据存在，但最近完整备份缺失或校验失败");
+    if (printDiagnostics) process.stdout.write(`检查通过：最近完整备份 ${latest.manifest.backupId}\n`);
+  }
   if (printDiagnostics) {
     for (const diagnostic of diagnostics) process.stdout.write(`${diagnostic}\n`);
     process.stdout.write("检查通过：正式运行目录权限正确\n");
@@ -1719,6 +1731,90 @@ async function doctor(environment: NodeJS.ProcessEnv, printDiagnostics = true): 
     process.stdout.write("检查通过：Docker seccomp 与 cgroupns 安全能力可用\n");
   }
   return { manifest, catalog, build };
+}
+
+function createBackupManager(
+  paths: RuntimePaths,
+  manifest: InstallManifest,
+  modelCatalogRelease: string,
+  environment: NodeJS.ProcessEnv,
+): RuntimeBackupManager {
+  if (!manifest.matchProfile) throw new CliError("Match Profile 镜像尚未构建，请先运行 image build");
+  return new RuntimeBackupManager({
+    databasePath: join(paths.dataRoot, "maze-arena.sqlite"),
+    lineageRoot: join(paths.dataRoot, "lineages"),
+    backupsRoot: paths.backups,
+    runtimeIdentity: {
+      harnessCommit: manifest.harness.commit,
+      harnessVersion: manifest.harness.executable.version,
+      modelCatalogRelease,
+      imageDigest: manifest.matchProfile.imageReference,
+    },
+    sensitiveValues: sensitiveEnvironmentValues(environment),
+  });
+}
+
+function hasRegisteredLineages(databasePath: string): boolean {
+  if (!existsSync(databasePath)) return false;
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const table = database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lineage_repositories'").get();
+    if (!table) return false;
+    return Boolean(database.prepare("SELECT 1 FROM lineage_repositories LIMIT 1").get());
+  } finally { database.close(); }
+}
+
+function assertServerStopped(paths: RuntimePaths): void {
+  const state = readProcessState(paths);
+  if (state && requireKnownProcessStatus(state) === "running") {
+    throw new CliError("一致性备份创建或恢复要求 Maze Arena 服务已停止");
+  }
+}
+
+function parseBackupPath(args: string[], action: "verify" | "restore"): { backupPath: string; target?: string } {
+  if (action === "verify" && args.length === 1) return { backupPath: resolve(args[0]!) };
+  if (action === "restore" && args.length === 3 && args[1] === "--target") {
+    return { backupPath: resolve(args[0]!), target: args[2]! };
+  }
+  throw new CliError(action === "verify"
+    ? "用法：maze-arena backup verify <备份目录>"
+    : "用法：maze-arena backup restore <备份目录> --target <绝对隔离目录>");
+}
+
+function backupCommand(args: string[], environment: NodeJS.ProcessEnv): void {
+  const paths = runtimePaths(environment);
+  const manifest = readManifest(paths);
+  validateDirectoryPermissions(paths);
+  const catalog = validateModelCatalog(paths, manifest);
+  const manager = createBackupManager(paths, manifest, catalog.release, environment);
+  const [action, ...rest] = args;
+  if (action === "create" && rest.length === 0) {
+    assertServerStopped(paths);
+    const result = manager.create("manual");
+    process.stdout.write(`完整备份已创建：${redactBackupOutput(result.path, environment)}\n`);
+    for (const warning of result.rotationWarnings) process.stdout.write(`警告：${warning}\n`);
+    process.stdout.write("备份未由应用加密，请依赖操作系统保护磁盘与备份介质\n");
+    return;
+  }
+  if (action === "verify") {
+    const { backupPath } = parseBackupPath(rest, "verify");
+    const verified = manager.verify(backupPath);
+    process.stdout.write(`完整备份校验通过：${verified.backupId}\n`);
+    return;
+  }
+  if (action === "restore") {
+    assertServerStopped(paths);
+    const { backupPath, target } = parseBackupPath(rest, "restore");
+    const restored = manager.restore(backupPath, target!);
+    process.stdout.write(`完整备份已恢复到隔离目录：${redactBackupOutput(target!, environment)}\n备份身份：${restored.backupId}\n`);
+    return;
+  }
+  throw new CliError("用法：maze-arena backup <create|verify|restore> [参数]");
+}
+
+function redactBackupOutput(value: string, environment: NodeJS.ProcessEnv): string {
+  return sensitiveEnvironmentValues(environment).sort((left, right) => right.length - left.length)
+    .reduce((sanitized, secret) => secret.length >= 8 ? sanitized.split(secret).join("[REDACTED]") : sanitized, value);
 }
 
 async function start(environment: NodeJS.ProcessEnv): Promise<void> {
@@ -1865,7 +1961,7 @@ async function status(environment: NodeJS.ProcessEnv): Promise<void> {
 }
 
 function usage(): never {
-  throw new CliError("用法：maze-arena <install|image build|models sync|doctor|start|stop|status> [参数]");
+  throw new CliError("用法：maze-arena <install|image build|models sync|doctor|start|stop|status|backup> [参数]");
 }
 
 async function main(args: string[], environment: NodeJS.ProcessEnv): Promise<void> {
@@ -1879,6 +1975,13 @@ async function main(args: string[], environment: NodeJS.ProcessEnv): Promise<voi
   if (command === "models" && rest[0] === "sync" && rest.length === 1) return syncHarnessModels(environment);
   if (command === "doctor" && rest.length === 0) {
     await doctor(environment);
+    return;
+  }
+  if (command === "backup") {
+    if (locked) return backupCommand(rest, environment);
+    const code = await runWithRuntimeLock(args, paths, environment);
+    if (code === 75) throw new CliError("另一个运行管理命令正在执行");
+    if (code !== 0) process.exitCode = code;
     return;
   }
   if (command === "start" && rest.length === 0) {

@@ -70,9 +70,17 @@ export interface ArenaServerOptions {
   resourcePolicyDigest?: string;
   versionedMatchRunner?: VersionedMatchRunner;
   autonomousEvolutionAdapter?: AutonomousEvolutionAdapter;
+  backupManager?: { create(trigger: "experiment-start" | "experiment-terminal"): unknown };
 }
 
 type ShutdownSignal = "SIGTERM" | "SIGINT";
+
+class BackupBoundaryError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : "完整备份失败");
+    this.name = "BackupBoundaryError";
+  }
+}
 
 interface ShutdownSignalTarget {
   on(signal: ShutdownSignal, listener: () => void): unknown;
@@ -357,6 +365,23 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
       resourcePolicyDigest: options.resourcePolicyDigest ?? "unconfigured-resource-policy",
       startExhibition: startExhibitionMatch,
     }),
+    (experimentId) => {
+      if (options.backupManager) {
+        try {
+          options.backupManager.create("experiment-terminal");
+          audits.append(experimentId, "backup.created", { trigger: "experiment-terminal" });
+        } catch (error) {
+          audits.append(experimentId, "backup.failed", { trigger: "experiment-terminal" });
+          server.log.error({ err: error, experimentId }, "实验终态完整备份失败");
+        }
+      }
+    },
+    (experimentId) => {
+      if (options.backupManager) {
+        options.backupManager.create("experiment-start");
+        audits.append(experimentId, "backup.created", { trigger: "experiment-start", resumed: true });
+      }
+    },
   );
   autonomousRunner.resumePersisted();
 
@@ -381,6 +406,12 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
     startExhibition: ({ experimentId, seed, exhibitionId, generatorCommit, solverCommit }) => startExhibitionMatch({
       experimentId, seed, exhibitionId, generatorCommit, solverCommit,
     }),
+    backupBoundary: (trigger, experimentId) => {
+      if (options.backupManager) {
+        options.backupManager.create(trigger);
+        audits.append(experimentId, "backup.created", { trigger });
+      }
+    },
   });
 
   server.get<{ Reply: ExperimentListResponse }>("/api/experiments", async () => ({
@@ -456,6 +487,11 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
         if (!experiment) throw new ExperimentNotFoundError(request.params.id);
         revalidateStoredModelProfile(experiment.modelProfile);
         controlPlane.requireReady(request.params.id, options.compatibilityFingerprint ?? "maze-arena-v1");
+        if (options.backupManager) {
+          try { options.backupManager.create("experiment-start"); }
+          catch (error) { throw new BackupBoundaryError(error); }
+          audits.append(request.params.id, "backup.created", { trigger: "experiment-start", compatibilityRoute: true });
+        }
         const snapshot = runtime.start(request.params.id);
         experiments.setStatus(request.params.id, snapshot.state === "ready" ? "draft" : snapshot.state);
         autonomousRunner.launch(request.params.id);
@@ -476,6 +512,9 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
           return reply.code(409).send({
             error: { code: "INVALID_EXPERIMENT_STATE", message: error.message },
           });
+        }
+        if (error instanceof BackupBoundaryError) {
+          return reply.code(409).send({ error: { code: "INVALID_EXPERIMENT_STATE", message: error.message } });
         }
         throw error;
       }

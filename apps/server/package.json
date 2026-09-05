@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@fastify/websocket": "11.2.0",
+    "@maze-arena/backup": "workspace:*",
     "@maze-arena/contracts": "workspace:*",
     "@maze-arena/control-plane": "workspace:*",
     "@maze-arena/dsh-integration": "workspace:*",

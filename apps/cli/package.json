@@ -13,9 +13,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@maze-arena/backup": "workspace:*",
     "@maze-arena/dsh-integration": "workspace:*"
   },
   "devDependencies": {
+    "@maze-arena/control-plane": "workspace:*",
+    "@maze-arena/lineage": "workspace:*",
     "@types/node": "22.18.0",
     "typescript": "5.9.2",
     "vitest": "3.2.4"

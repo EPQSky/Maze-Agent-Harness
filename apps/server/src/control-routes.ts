@@ -33,6 +33,7 @@ interface ControlRouteOptions {
   startExhibition(input: {
     experimentId: string; seed: string; exhibitionId: string; generatorCommit: string; solverCommit: string;
   }): string;
+  backupBoundary(trigger: "experiment-start" | "experiment-terminal", experimentId: string): void;
 }
 
 function parseCostLimit(value: unknown, fallback: number | null): number | null {
@@ -196,6 +197,7 @@ export function registerControlRoutes(options: ControlRouteOptions): void {
           }
           if (path === "start" || path === "resume") {
             controlPlane.requireReady(request.params.id, options.compatibilityFingerprint);
+            options.backupBoundary("experiment-start", request.params.id);
           }
           let snapshot = action(request.params.id);
           const status = snapshot.state === "ready" ? "draft" : snapshot.state;
@@ -203,7 +205,10 @@ export function registerControlRoutes(options: ControlRouteOptions): void {
           audits.append(request.params.id, auditType);
           if (path === "start" || path === "resume") autonomousRunner.launch(request.params.id);
           if (path === "pause") snapshot = await autonomousRunner.pause(request.params.id);
-          if (path === "cancel") await autonomousRunner.cancel(request.params.id);
+          if (path === "cancel") {
+            await autonomousRunner.cancel(request.params.id);
+            options.backupBoundary("experiment-terminal", request.params.id);
+          }
           return snapshot;
         } catch (error) {
           return reply.code(409).send({ error: { code: "RUNTIME_STATE_INVALID", message: error instanceof Error ? error.message : "运行状态非法" } });
