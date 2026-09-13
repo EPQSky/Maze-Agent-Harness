@@ -4,17 +4,24 @@ import {
   renameSync, rmSync, writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { spawnSync } from "node:child_process";
+import { Worker } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
-import { PluginLineageRepository, withLineageMutationLock, type PluginRole, type RegisteredLineage } from "@maze-arena/lineage";
+import {
+  PluginLineageRepository,
+  withLineageMutationLock,
+  type LineageGitRunner,
+  type PluginRole,
+  type RegisteredLineage,
+} from "@maze-arena/lineage";
 
 export type BackupTrigger = "manual" | "experiment-start" | "experiment-terminal";
 
 export interface BackupRuntimeIdentity {
-  harnessCommit: string;
+  harnessPackage: string;
   harnessVersion: string;
   modelCatalogRelease: string;
+  modelReleaseSha256: string;
   imageDigest: string;
 }
 
@@ -43,12 +50,18 @@ export interface BackupManifest {
 }
 
 export interface BackupResult { path: string; manifest: BackupManifest; rotationWarnings: string[] }
+export interface SensitiveEnvironmentValueSet {
+  exactCredentialValues: string[];
+  heuristicValues: string[];
+}
 export interface BackupManagerOptions {
   databasePath: string;
   lineageRoot: string;
   backupsRoot: string;
   runtimeIdentity: BackupRuntimeIdentity;
-  sensitiveValues?: string[];
+  sensitiveValues?: SensitiveEnvironmentValueSet;
+  /** 仅允许收紧默认 Git 墙钟上限，便于在受控环境中更快关闭失败。 */
+  gitCommandTimeoutMs?: number;
   now?: () => Date;
   removeBackup?: (path: string) => void;
 }
@@ -90,13 +103,365 @@ function isCanonicalIsoDate(value: unknown): value is string {
   return Number.isFinite(date.getTime()) && date.toISOString() === value;
 }
 
-function runGit(repository: string, args: string[], maxBuffer = 64 * 1024 * 1024): string {
-  const result = spawnSync("git", ["-C", repository, ...args], {
-    encoding: "utf8", maxBuffer, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+const MAX_GIT_OBJECTS = 100_000;
+const MAX_TREE_ENTRIES = 500_000;
+const MAX_EXPANDED_PATHS = 100_000;
+const MAX_RAW_PATH_BYTES = 64 * 1024 * 1024;
+const MAX_SINGLE_GIT_OUTPUT_BYTES = 16 * 1024 * 1024;
+const MAX_TOTAL_GIT_OUTPUT_BYTES = 256 * 1024 * 1024;
+const MAX_TREE_DEPTH = 4_096;
+const MAX_GIT_SCAN_COMMANDS = 25_000;
+const MAX_SECRET_PATTERNS = 1_024;
+const MAX_SECRET_PATTERN_BYTES = 1024 * 1024;
+const MAX_BUNDLE_ADVERTISED_REFS = 100_000;
+const MAX_BUNDLE_ADVERTISED_OBJECTS = 100_000;
+const DEFAULT_GIT_COMMAND_TIMEOUT_MS = 30_000;
+const GIT_TERMINATION_GRACE_MS = 250;
+const GIT_SUPERVISOR_FALLBACK_MS = 2_000;
+
+const gitSupervisorControl = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 6));
+const gitSupervisorOutput = new Uint8Array(new SharedArrayBuffer(MAX_SINGLE_GIT_OUTPUT_BYTES));
+let gitSupervisor: Worker | undefined;
+
+const gitSupervisorSource = String.raw`
+const { spawn } = require("node:child_process");
+const { parentPort } = require("node:worker_threads");
+
+parentPort.on("message", (job) => {
+  const control = new Int32Array(job.control);
+  const output = new Uint8Array(job.output);
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  let failure = 0;
+  let completed = false;
+  let forceTimer;
+  let deadline;
+  let groupPoll;
+  let child;
+
+  const finish = (state, status = -1) => {
+    if (completed) return;
+    completed = true;
+    clearTimeout(deadline);
+    clearTimeout(forceTimer);
+    clearTimeout(groupPoll);
+    Atomics.store(control, 1, stdoutBytes);
+    Atomics.store(control, 2, stderrBytes);
+    Atomics.store(control, 3, status);
+    Atomics.store(control, 0, state);
+    Atomics.notify(control, 0);
+  };
+  const killGroup = (signal) => {
+    const pid = child?.pid;
+    if (!pid) return;
+    try { process.kill(-pid, signal); } catch (error) {
+      if (error?.code !== "ESRCH") failure = failure || 5;
+    }
+  };
+  const groupExists = () => {
+    const pid = child?.pid;
+    if (!pid) return false;
+    try { process.kill(-pid, 0); return true; }
+    catch (error) { return error?.code !== "ESRCH"; }
+  };
+  const terminate = (kind) => {
+    if (failure === 0) failure = kind;
+    killGroup("SIGTERM");
+    forceTimer ??= setTimeout(() => killGroup("SIGKILL"), job.graceMs);
+  };
+  const collect = (chunk, isStderr) => {
+    if (failure !== 0) return;
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    if (stdoutBytes + stderrBytes + bytes.byteLength > job.maxOutputBytes) {
+      terminate(4);
+      return;
+    }
+    if (isStderr) stderrBytes += bytes.byteLength;
+    else {
+      output.set(bytes, stdoutBytes);
+      stdoutBytes += bytes.byteLength;
+    }
+  };
+
+  try {
+    child = spawn("git", ["-C", job.repository, ...job.args], {
+      detached: true,
+      env: job.environment,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    Atomics.store(control, 4, child.pid ?? 0);
+    child.stdout.on("data", (chunk) => collect(chunk, false));
+    child.stderr.on("data", (chunk) => collect(chunk, true));
+    child.stdin.on("error", () => {});
+    child.on("error", () => {
+      failure = failure || 5;
+      if (!child.pid) finish(failure);
+      else terminate(failure);
+    });
+    child.on("close", (code, signal) => {
+      if (signal !== null) failure = failure || 3;
+      const finalState = () => failure !== 0 ? failure : code === 0 ? 1 : 2;
+      const confirmGroupExit = () => {
+        if (!groupExists()) { finish(finalState(), code ?? -1); return; }
+        failure = failure || 3;
+        killGroup("SIGKILL");
+        groupPoll = setTimeout(confirmGroupExit, 10);
+      };
+      confirmGroupExit();
+    });
+    deadline = setTimeout(() => terminate(3), job.timeoutMs);
+    child.stdin.end(job.input === undefined ? undefined : Buffer.from(job.input));
+  } catch {
+    finish(5);
+  }
+});
+`;
+
+interface SupervisedGitResult { output: Buffer; kind: "success" | "exit" | "timeout" | "output" | "spawn"; status: number }
+
+class GitCommandError extends BackupError {
+  constructor(readonly kind: SupervisedGitResult["kind"], message: string) { super(message); }
+}
+
+function supervisor(): Worker {
+  if (!gitSupervisor) {
+    gitSupervisor = new Worker(gitSupervisorSource, { eval: true });
+    gitSupervisor.unref();
+  }
+  return gitSupervisor;
+}
+
+function runSupervisedGit(
+  repository: string,
+  args: string[],
+  timeoutMs: number,
+  maxOutputBytes: number,
+  input?: Buffer | string,
+): SupervisedGitResult {
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1 || maxOutputBytes > MAX_SINGLE_GIT_OUTPUT_BYTES) {
+    throw new BackupError("单个 Git 命令输出资源上限无效");
+  }
+  gitSupervisorControl.fill(0);
+  supervisor().postMessage({
+    repository,
+    args,
+    timeoutMs,
+    maxOutputBytes,
+    graceMs: GIT_TERMINATION_GRACE_MS,
+    input,
+    environment: {
+      ...process.env,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_NO_REPLACE_OBJECTS: "1",
+    },
+    control: gitSupervisorControl.buffer,
+    output: gitSupervisorOutput.buffer,
   });
-  if (result.error) throw new BackupError(`无法执行 Git 备份操作：${result.error.message}`);
-  if (result.status !== 0) throw new BackupError(`Git 备份操作失败（退出码 ${result.status ?? "未知"}）`);
-  return result.stdout.trim();
+  const waited = Atomics.wait(
+    gitSupervisorControl,
+    0,
+    0,
+    timeoutMs + GIT_TERMINATION_GRACE_MS + GIT_SUPERVISOR_FALLBACK_MS,
+  );
+  if (waited === "timed-out") {
+    const pid = Atomics.load(gitSupervisorControl, 4);
+    if (pid > 0) try { process.kill(-pid, "SIGKILL"); } catch {}
+    void gitSupervisor?.terminate();
+    gitSupervisor = undefined;
+    throw new BackupError("Git 备份操作超过墙钟资源上限");
+  }
+  const states = ["spawn", "success", "exit", "timeout", "output", "spawn"] as const;
+  const state = Atomics.load(gitSupervisorControl, 0);
+  const kind = states[state] ?? "spawn";
+  const length = Atomics.load(gitSupervisorControl, 1);
+  return {
+    output: Buffer.from(gitSupervisorOutput.subarray(0, length)),
+    kind,
+    status: Atomics.load(gitSupervisorControl, 3),
+  };
+}
+
+function validatedGitCommandTimeout(value: number | undefined): number {
+  const timeout = value ?? DEFAULT_GIT_COMMAND_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > DEFAULT_GIT_COMMAND_TIMEOUT_MS) {
+    throw new BackupError("Git 命令墙钟资源上限无效");
+  }
+  return timeout;
+}
+
+function runGit(
+  repository: string,
+  args: string[],
+  timeout: number,
+  maxBuffer = MAX_SINGLE_GIT_OUTPUT_BYTES,
+  input?: Buffer | string,
+): string {
+  const result = runSupervisedGit(repository, args, timeout, maxBuffer, input);
+  if (result.kind === "output") throw new GitCommandError(result.kind, "单个 Git 命令输出超过安全处理上限");
+  if (result.kind === "timeout") throw new GitCommandError(result.kind, "Git 备份操作超过墙钟资源上限");
+  if (result.kind === "spawn") throw new GitCommandError(result.kind, "无法执行 Git 备份操作");
+  if (result.kind === "exit") throw new GitCommandError(result.kind, `Git 备份操作失败（退出码 ${result.status}）`);
+  return result.output.toString("utf8").trim();
+}
+
+function runGitBuffer(
+  repository: string,
+  args: string[],
+  timeout: number,
+  maxBuffer = MAX_SINGLE_GIT_OUTPUT_BYTES,
+  input?: Buffer | string,
+): Buffer {
+  const result = runSupervisedGit(repository, args, timeout, maxBuffer, input);
+  if (result.kind === "output") throw new GitCommandError(result.kind, "单个 Git 命令输出超过安全处理上限");
+  if (result.kind === "timeout") throw new GitCommandError(result.kind, "Git 备份操作超过墙钟资源上限");
+  if (result.kind === "spawn") throw new GitCommandError(result.kind, "无法执行 Git 备份操作");
+  if (result.kind === "exit") throw new GitCommandError(result.kind, `Git 备份操作失败（退出码 ${result.status}）`);
+  return result.output;
+}
+
+function supervisedLineageGitRunner(timeout: number): LineageGitRunner {
+  return {
+    run: (repository, args) => runGit(repository, args, timeout),
+    optional(repository, args) {
+      try { return runGit(repository, args, timeout); }
+      catch (error) {
+        if (error instanceof GitCommandError && error.kind === "exit") return undefined;
+        throw error;
+      }
+    },
+  };
+}
+
+interface GitObjectIdentity { objectId: string; type: "blob" | "commit" | "tag" | "tree" }
+
+interface TreeEntry { objectId: string; type: "blob" | "commit" | "tree"; name: Buffer }
+interface SecretMatcherNode { transitions: Map<number, number>; failure: number; terminal: boolean }
+
+const TREE_ENTRY_MODES: ReadonlyArray<readonly [Buffer, TreeEntry["type"]]> = [
+  [Buffer.from([0x31, 0x30, 0x30, 0x36, 0x34, 0x34]), "blob"],
+  [Buffer.from([0x31, 0x30, 0x30, 0x37, 0x35, 0x35]), "blob"],
+  [Buffer.from([0x31, 0x32, 0x30, 0x30, 0x30, 0x30]), "blob"],
+  [Buffer.from([0x34, 0x30, 0x30, 0x30, 0x30]), "tree"],
+  [Buffer.from([0x30, 0x34, 0x30, 0x30, 0x30, 0x30]), "tree"],
+  [Buffer.from([0x31, 0x36, 0x30, 0x30, 0x30, 0x30]), "commit"],
+];
+
+function assertTreeEntryTarget(
+  mode: Buffer,
+  objectId: string,
+  objectTypes: Map<string, GitObjectIdentity["type"]>,
+): TreeEntry["type"] {
+  const expectedType = TREE_ENTRY_MODES.find(([allowed]) => mode.equals(allowed))?.[1];
+  if (!expectedType) throw new BackupError("谱系 Git tree 条目包含未知 mode 或非 ASCII mode");
+  const actualType = objectTypes.get(objectId);
+  // Gitlink 允许指向本仓库未保存的 submodule commit；一旦对象存在，仍必须确为 commit。
+  if (expectedType === "commit" && actualType === undefined) return expectedType;
+  if (actualType === undefined) throw new BackupError("谱系 Git tree 条目引用缺失对象");
+  if (actualType !== expectedType) throw new BackupError("谱系 Git tree 条目目标对象类型不一致");
+  return expectedType;
+}
+
+function assertAcyclicTreeGraph(trees: Map<string, TreeEntry[]>): void {
+  const states = new Map<string, "visiting" | "visited">();
+  for (const root of trees.keys()) {
+    if (states.has(root)) continue;
+    const stack: Array<{ treeId: string; childOffset: number }> = [{ treeId: root, childOffset: 0 }];
+    states.set(root, "visiting");
+    while (stack.length > 0) {
+      const current = stack[stack.length - 1]!;
+      const entries = trees.get(current.treeId)!;
+      if (current.childOffset >= entries.length) {
+        states.set(current.treeId, "visited");
+        stack.pop();
+        continue;
+      }
+      const child = entries[current.childOffset++]!;
+      if (child.type !== "tree") continue;
+      const state = states.get(child.objectId);
+      if (state === "visiting") throw new BackupError("谱系 Git tree 图包含环");
+      if (state === "visited") continue;
+      if (!trees.has(child.objectId)) throw new BackupError("谱系 Git tree 图引用缺失对象");
+      states.set(child.objectId, "visiting");
+      stack.push({ treeId: child.objectId, childOffset: 0 });
+    }
+  }
+}
+
+function compareTreeEntries(left: TreeEntry, right: TreeEntry): number {
+  const shared = Math.min(left.name.length, right.name.length);
+  for (let index = 0; index < shared; index += 1) {
+    const difference = left.name[index]! - right.name[index]!;
+    if (difference !== 0) return difference;
+  }
+  const leftTerminator = left.name.length === shared ? (left.type === "tree" ? 0x2f : 0) : left.name[shared]!;
+  const rightTerminator = right.name.length === shared ? (right.type === "tree" ? 0x2f : 0) : right.name[shared]!;
+  return leftTerminator - rightTerminator;
+}
+
+function createSecretMatcher(secrets: Buffer[]): SecretMatcherNode[] {
+  if (secrets.length > MAX_SECRET_PATTERNS
+    || secrets.reduce((total, secret) => total + secret.byteLength, 0) > MAX_SECRET_PATTERN_BYTES) {
+    throw new BackupError("凭据模式数量或累计字节超过安全处理上限");
+  }
+  const nodes: SecretMatcherNode[] = [{ transitions: new Map(), failure: 0, terminal: false }];
+  for (const secret of secrets) {
+    let state = 0;
+    for (const byte of secret) {
+      let next = nodes[state]!.transitions.get(byte);
+      if (next === undefined) {
+        next = nodes.length;
+        nodes[state]!.transitions.set(byte, next);
+        nodes.push({ transitions: new Map(), failure: 0, terminal: false });
+      }
+      state = next;
+    }
+    nodes[state]!.terminal = true;
+  }
+  const queue: number[] = [];
+  for (const child of nodes[0]!.transitions.values()) queue.push(child);
+  for (let offset = 0; offset < queue.length; offset += 1) {
+    const current = queue[offset]!;
+    for (const [byte, child] of nodes[current]!.transitions) {
+      queue.push(child);
+      let failure = nodes[current]!.failure;
+      while (failure !== 0 && !nodes[failure]!.transitions.has(byte)) failure = nodes[failure]!.failure;
+      const fallback = nodes[failure]!.transitions.get(byte);
+      nodes[child]!.failure = fallback === undefined || fallback === child ? 0 : fallback;
+      nodes[child]!.terminal ||= nodes[nodes[child]!.failure]!.terminal;
+    }
+  }
+  return nodes;
+}
+
+function advanceSecretMatcher(nodes: SecretMatcherNode[], initial: number, bytes: Buffer): number {
+  let state = initial;
+  for (const byte of bytes) {
+    while (state !== 0 && !nodes[state]!.transitions.has(byte)) state = nodes[state]!.failure;
+    state = nodes[state]!.transitions.get(byte) ?? 0;
+    if (nodes[state]!.terminal) throw new BackupError("插件谱系路径包含 API Key，拒绝写入备份");
+  }
+  return state;
+}
+
+function allGitObjects(
+  repository: string,
+  read: (args: string[], maxBuffer: number) => Buffer,
+): { objects: GitObjectIdentity[]; outputBytes: number } {
+  const output = read([
+    "cat-file", "--batch-all-objects", "--unordered", "--batch-check=%(objectname) %(objecttype)",
+  ], MAX_SINGLE_GIT_OUTPUT_BYTES);
+  const lines = output.toString("ascii").trim().split("\n").filter(Boolean);
+  const objects = lines.map((line): GitObjectIdentity => {
+    const [objectId, type, extra] = line.split(" ");
+    if (!objectId || !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(objectId)
+      || !(type === "blob" || type === "commit" || type === "tag" || type === "tree") || extra !== undefined) {
+      throw new BackupError("谱系仓库对象清单格式无效");
+    }
+    return { objectId, type };
+  });
+  if (objects.length > MAX_GIT_OBJECTS) throw new BackupError("谱系 Git 对象数量超过安全处理上限");
+  return { objects: objects.sort((left, right) => left.objectId.localeCompare(right.objectId)), outputBytes: output.byteLength };
 }
 
 function assertPlainFile(path: string, label: string): void {
@@ -142,8 +507,10 @@ function artifact(root: string, path: string): BackupArtifact {
   return { path: local.split(sep).join("/"), bytes: content.byteLength, sha256: sha256(content) };
 }
 
-function normalizedSecrets(values: string[] | undefined): Buffer[] {
-  return [...new Set((values ?? []).filter((value) => value.length >= 8))].map((value) => Buffer.from(value));
+function normalizedSecrets(values: SensitiveEnvironmentValueSet | undefined): Buffer[] {
+  const exact = values?.exactCredentialValues.filter((value) => value.length > 0) ?? [];
+  const heuristic = values?.heuristicValues.filter((value) => value.length >= 8) ?? [];
+  return [...new Set([...exact, ...heuristic])].map((value) => Buffer.from(value));
 }
 
 function assertNoSensitiveBytes(path: string, secrets: Buffer[]): void {
@@ -152,40 +519,239 @@ function assertNoSensitiveBytes(path: string, secrets: Buffer[]): void {
   if (secrets.some((secret) => content.includes(secret))) throw new BackupError("运行数据包含 API Key，拒绝写入备份");
 }
 
-function assertRepositoryHasNoSecrets(repository: string, secrets: Buffer[]): void {
-  if (secrets.length === 0) return;
-  const objects = runGit(repository, ["rev-list", "--objects", "--all"]).split("\n").filter(Boolean)
-    .map((line) => line.split(" ", 1)[0]!).filter(Boolean);
-  for (const object of objects) {
-    const type = runGit(repository, ["cat-file", "-t", object]);
-    if (type === "tree") continue;
-    const result = spawnSync("git", ["-C", repository, "cat-file", type, object], {
-      encoding: null, maxBuffer: 64 * 1024 * 1024,
-      env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
-    });
-    if (result.error || result.status !== 0) throw new BackupError("无法检查谱系对象中的 API Key");
-    const content = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
-    if (secrets.some((secret) => content.includes(secret))) throw new BackupError("插件谱系包含 API Key，拒绝写入备份");
+function assertRepositoryHasNoSecrets(repository: string, secrets: Buffer[], timeout: number): void {
+  let scanCommands = 0;
+  const scanGitBuffer = (args: string[], maxBuffer = MAX_SINGLE_GIT_OUTPUT_BYTES): Buffer => {
+    scanCommands += 1;
+    if (scanCommands > MAX_GIT_SCAN_COMMANDS) throw new BackupError("谱系 Git 扫描命令数量超过安全处理上限");
+    return runGitBuffer(repository, args, timeout, maxBuffer);
+  };
+  const refNames = scanGitBuffer(["for-each-ref", "--format=%(refname)"]);
+  if (secrets.some((secret) => refNames.includes(secret))) {
+    throw new BackupError("插件谱系引用名称包含 API Key，拒绝写入备份");
+  }
+  const { objects, outputBytes: objectListBytes } = allGitObjects(repository, scanGitBuffer);
+  const objectTypes = new Map(objects.map(({ objectId, type }) => [objectId, type]));
+  const objectIdBytes = objects[0]?.objectId.length === 64 ? 32 : 20;
+  const trees = new Map<string, TreeEntry[]>();
+  const childTrees = new Set<string>();
+  const referencedRootTrees = new Set<string>();
+  let totalGitOutputBytes = refNames.byteLength + objectListBytes;
+  if (totalGitOutputBytes > MAX_TOTAL_GIT_OUTPUT_BYTES) throw new BackupError("谱系 Git 累计处理字节超过安全上限");
+  let totalTreeEntries = 0;
+  const accountOutput = (content: Buffer): void => {
+    if (content.byteLength > MAX_SINGLE_GIT_OUTPUT_BYTES) throw new BackupError("单个 Git 对象或 tree 输出超过安全处理上限");
+    totalGitOutputBytes += content.byteLength;
+    if (totalGitOutputBytes > MAX_TOTAL_GIT_OUTPUT_BYTES) throw new BackupError("谱系 Git 累计处理字节超过安全上限");
+  };
+  for (const { objectId, type } of objects) {
+    if (type === "tree") {
+      const entries = scanGitBuffer(["cat-file", "tree", objectId]);
+      accountOutput(entries);
+      const parsed: TreeEntry[] = [];
+      const rawNames = new Set<string>();
+      let offset = 0;
+      while (offset < entries.length) {
+        const modeEnd = entries.indexOf(0x20, offset);
+        const nameEnd = modeEnd < 0 ? -1 : entries.indexOf(0, modeEnd + 1);
+        const objectEnd = nameEnd < 0 ? -1 : nameEnd + 1 + objectIdBytes;
+        if (modeEnd <= offset || nameEnd <= modeEnd + 1 || objectEnd > entries.length) {
+          throw new BackupError("谱系 Git tree 对象格式无效");
+        }
+        const mode = entries.subarray(offset, modeEnd);
+        const rawName = entries.subarray(modeEnd + 1, nameEnd);
+        if (rawName.includes(0x2f)) throw new BackupError("谱系 Git tree 条目名称格式无效");
+        const entryObjectId = entries.subarray(nameEnd + 1, objectEnd).toString("hex");
+        const entryType = assertTreeEntryTarget(mode, entryObjectId, objectTypes);
+        const entry = { objectId: entryObjectId, type: entryType, name: Buffer.from(rawName) };
+        // 十六进制是原始名称字节的一一映射，避免非 UTF-8 名称发生字符串解码碰撞。
+        const rawNameKey = entry.name.toString("hex");
+        if (rawNames.has(rawNameKey)) {
+          throw new BackupError("谱系 Git tree 条目包含跨类型或同类型的重复原始名称");
+        }
+        rawNames.add(rawNameKey);
+        const previous = parsed.at(-1);
+        if (previous && compareTreeEntries(previous, entry) >= 0) {
+          throw new BackupError("谱系 Git tree 条目重复或未按 Git 规则排序");
+        }
+        parsed.push(entry);
+        if (entryType === "tree") childTrees.add(entryObjectId);
+        totalTreeEntries += 1;
+        if (totalTreeEntries > MAX_TREE_ENTRIES) throw new BackupError("谱系 Git tree 条目数量超过安全处理上限");
+        offset = objectEnd;
+      }
+      trees.set(objectId, parsed);
+      continue;
+    }
+    if (type === "blob" && secrets.length === 0) continue;
+    const content = scanGitBuffer(["cat-file", type, objectId]);
+    accountOutput(content);
+    if (secrets.some((secret) => content.includes(secret))) {
+      throw new BackupError("插件谱系包含 API Key，拒绝写入备份");
+    }
+    if (type === "commit") {
+      const end = content.indexOf(0x0a);
+      const header = content.subarray(0, end < 0 ? content.length : end).toString("ascii");
+      const match = /^tree ([0-9a-f]{40}(?:[0-9a-f]{24})?)$/.exec(header);
+      if (!match) throw new BackupError("谱系 Git commit 根 tree 格式无效");
+      referencedRootTrees.add(match[1]!);
+    } else if (type === "tag") {
+      const headersEnd = content.indexOf(Buffer.from("\n\n"));
+      const headers = content.subarray(0, headersEnd < 0 ? content.length : headersEnd).toString("ascii").split("\n");
+      const object = /^object ([0-9a-f]{40}(?:[0-9a-f]{24})?)$/.exec(headers[0] ?? "")?.[1];
+      if (headers[1] === "type tree" && object) referencedRootTrees.add(object);
+    }
+  }
+  for (const root of referencedRootTrees) {
+    if (objectTypes.get(root) !== "tree") throw new BackupError("谱系 Git 提交或标签引用的根 tree 缺失");
+  }
+  assertAcyclicTreeGraph(trees);
+  const roots = new Set(referencedRootTrees);
+  for (const tree of trees.keys()) if (!childTrees.has(tree)) roots.add(tree);
+  if (trees.size > 0 && roots.size === 0) throw new BackupError("谱系 Git tree 图缺少可验证根节点");
+
+  const matcher = createSecretMatcher(secrets);
+  const slash = Buffer.from("/");
+  const stack = [...roots].map((treeId) => ({ treeId, matcherState: 0, depth: 0 }));
+  let expandedPaths = 0;
+  let rawPathBytes = 0;
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    const entries = trees.get(current.treeId);
+    if (!entries) throw new BackupError("谱系 Git tree 图引用缺失对象");
+    for (const entry of entries) {
+      expandedPaths += 1;
+      if (expandedPaths > MAX_EXPANDED_PATHS) throw new BackupError("谱系 Git 展开路径数量超过安全处理上限");
+      const separatorBytes = current.depth === 0 ? 0 : 1;
+      rawPathBytes += separatorBytes + entry.name.byteLength;
+      if (rawPathBytes > MAX_RAW_PATH_BYTES) throw new BackupError("谱系 Git 累计原始路径字节超过安全处理上限");
+      let state = current.matcherState;
+      if (separatorBytes !== 0) state = advanceSecretMatcher(matcher, state, slash);
+      state = advanceSecretMatcher(matcher, state, entry.name);
+      if (entry.type === "tree") {
+        if (current.depth + 1 > MAX_TREE_DEPTH) throw new BackupError("谱系 Git tree 深度超过安全处理上限");
+        if (!trees.has(entry.objectId)) throw new BackupError("谱系 Git tree 图引用缺失对象");
+        stack.push({ treeId: entry.objectId, matcherState: state, depth: current.depth + 1 });
+      }
+    }
   }
 }
 
-function repositoryFingerprint(repository: string): { refsSha256: string; objectsSha256: string; refs: BackupRef[] } {
-  const refs = runGit(repository, ["for-each-ref", "--format=%(refname)%00%(objectname)", "refs/heads", "refs/tags"])
+function bundleHeads(
+  bundle: string,
+  repository: string,
+  secrets: Buffer[],
+  timeout: number,
+): { hasHead: boolean; hasRefs: boolean; objectIds: string[] } {
+  const output = runGitBuffer(repository, ["bundle", "list-heads", bundle], timeout, MAX_SINGLE_GIT_OUTPUT_BYTES);
+  const objectIds: string[] = [];
+  let advertisedRefs = 0;
+  let hasHead = false;
+  let hasRefs = false;
+  const records = output.subarray(0, output.length > 0 && output.at(-1) === 0x0a ? output.length - 1 : output.length)
+    .toString("binary").split("\n");
+  if (records.length === 1 && records[0] === "") throw new BackupError("谱系 Bundle 缺少 advertised refs");
+  for (const line of records) {
+    if (line.length === 0) throw new BackupError("谱系 Bundle advertised refs 格式无效");
+    const separator = line.indexOf(" ");
+    const objectId = separator > 0 ? line.slice(0, separator) : "";
+    const refName = separator > 0 ? Buffer.from(line.slice(separator + 1), "binary") : Buffer.alloc(0);
+    if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(objectId) || refName.length === 0) {
+      throw new BackupError("谱系 Bundle advertised refs 格式无效");
+    }
+    advertisedRefs += 1;
+    if (advertisedRefs > MAX_BUNDLE_ADVERTISED_REFS) {
+      throw new BackupError("谱系 Bundle advertised refs 数量超过安全处理上限");
+    }
+    if (secrets.some((secret) => refName.includes(secret))) {
+      throw new BackupError("谱系 Bundle 引用名称包含 API Key，拒绝写入备份");
+    }
+    if (refName.equals(Buffer.from("HEAD"))) hasHead = true;
+    else if (refName.subarray(0, 5).equals(Buffer.from("refs/"))) hasRefs = true;
+    else throw new BackupError("谱系 Bundle advertised ref 名称无效");
+    objectIds.push(objectId);
+  }
+  if (objectIds.length === 0) throw new BackupError("谱系 Bundle 缺少 advertised refs");
+  const uniqueObjectIds = [...new Set(objectIds)];
+  if (uniqueObjectIds.length > MAX_BUNDLE_ADVERTISED_OBJECTS) {
+    throw new BackupError("谱系 Bundle advertised 对象数量超过安全处理上限");
+  }
+  return { hasHead, hasRefs, objectIds: uniqueObjectIds };
+}
+
+function assertObjectsExist(repository: string, objectIds: string[], timeout: number, label: string): void {
+  const output = runGitBuffer(
+    repository,
+    ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+    timeout,
+    MAX_SINGLE_GIT_OUTPUT_BYTES,
+    `${objectIds.join("\n")}\n`,
+  );
+  const lines = output.toString("ascii").split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  if (lines.length !== objectIds.length) throw new BackupError(`${label}对象校验响应数量无效`);
+  for (let index = 0; index < objectIds.length; index += 1) {
+    const expected = objectIds[index]!;
+    const match = /^([0-9a-f]{40}(?:[0-9a-f]{24})?) (blob|commit|tag|tree)$/.exec(lines[index] ?? "");
+    if (!match || match[1] !== expected) throw new BackupError(`${label}对象缺失或校验响应无效`);
+  }
+}
+
+function assertRegisteredObjectDatabasesReadable(registered: RegisteredLineage[], timeout: number): void {
+  for (const lineage of registered) {
+    assertPlainDirectory(lineage.repositoryPath, "谱系仓库");
+    if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(lineage.baselineCommit)) {
+      throw new BackupError("谱系仓库登记的基线对象格式无效");
+    }
+    assertObjectsExist(lineage.repositoryPath, [lineage.baselineCommit], timeout, "谱系仓库基线");
+  }
+}
+
+function assertBundleHasNoSecrets(bundle: string, secrets: Buffer[], timeout: number): void {
+  const auditRepository = mkdtempSync(join(tmpdir(), "maze-bundle-audit-"));
+  try {
+    try {
+      runGit(auditRepository, ["init", "--quiet", "--bare"], timeout);
+      runGit(auditRepository, ["bundle", "verify", bundle], timeout);
+      const advertised = bundleHeads(bundle, auditRepository, secrets, timeout);
+      const refspecs = [
+        ...(advertised.hasRefs ? ["+refs/*:refs/maze-audit/advertised/*"] : []),
+        ...(advertised.hasHead ? ["+HEAD:refs/maze-audit/pseudo/head"] : []),
+      ];
+      runGit(auditRepository, ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", bundle, ...refspecs], timeout);
+      assertObjectsExist(auditRepository, advertised.objectIds, timeout, "谱系 Bundle advertised ");
+      assertRepositoryHasNoSecrets(auditRepository, secrets, timeout);
+      assertNoSensitiveBytes(bundle, secrets);
+    } catch (error) {
+      if (error instanceof BackupError && error.message.includes("API Key")) throw error;
+      assertNoSensitiveBytes(bundle, secrets);
+      throw error;
+    }
+  } finally {
+    rmSync(auditRepository, { recursive: true, force: true });
+  }
+}
+
+function repositoryFingerprint(repository: string, timeout: number): { refsSha256: string; objectsSha256: string; refs: BackupRef[] } {
+  const refs = runGit(repository, ["for-each-ref", "--format=%(refname)%00%(objectname)", "refs/heads", "refs/tags"], timeout)
     .split("\n").filter(Boolean).sort().map((line) => {
       const [name, objectId, extra] = line.split("\0");
       if (!name || !objectId || extra !== undefined) throw new BackupError("谱系仓库 refs 格式无效");
       return { name, objectId };
     });
-  const objects = runGit(repository, ["rev-list", "--objects", "--all"]).split("\n").filter(Boolean).sort().join("\n");
+  // schemaVersion 1 已发布清单使用这一序列化算法；秘密审计不得改变兼容性指纹。
+  const objects = runGit(repository, ["rev-list", "--objects", "--all"], timeout)
+    .split("\n").filter(Boolean).sort().join("\n");
   if (refs.length === 0 || !objects) throw new BackupError("谱系仓库缺少可恢复的 refs 或对象");
   return { refsSha256: sha256(`${refs.map(({ name, objectId }) => `${name}\0${objectId}`).join("\n")}\n`),
     objectsSha256: sha256(`${objects}\n`), refs };
 }
 
 function validateRuntimeIdentity(identity: BackupRuntimeIdentity): void {
-  if (!identity || !/^[0-9a-f]{40}$/.test(identity.harnessCommit)
+  if (!identity || identity.harnessPackage !== "@deepseek-ai/dsh"
     || !/^[A-Za-z0-9][A-Za-z0-9 ._+/-]{0,127}$/.test(identity.harnessVersion)
     || !/^[A-Za-z0-9][A-Za-z0-9._+/-]{0,127}$/.test(identity.modelCatalogRelease)
+    || !/^[0-9a-f]{64}$/.test(identity.modelReleaseSha256)
     || !/^sha256:[0-9a-f]{64}$/.test(identity.imageDigest)) {
     throw new BackupError("备份运行身份格式无效");
   }
@@ -194,7 +760,7 @@ function validateRuntimeIdentity(identity: BackupRuntimeIdentity): void {
 function assertRuntimeIdentityMatches(actual: BackupRuntimeIdentity, expected: BackupRuntimeIdentity): void {
   validateRuntimeIdentity(actual);
   validateRuntimeIdentity(expected);
-  for (const field of ["harnessCommit", "harnessVersion", "modelCatalogRelease", "imageDigest"] as const) {
+  for (const field of ["harnessPackage", "harnessVersion", "modelCatalogRelease", "modelReleaseSha256", "imageDigest"] as const) {
     if (actual[field] !== expected[field]) throw new BackupError(`备份运行身份与当前安装不一致：${field}`);
   }
 }
@@ -308,6 +874,7 @@ interface AuthorityRoleResult {
   outcome: "promoted" | "failed" | "tie";
   promotionTag: string | null;
   attemptId?: string;
+  candidateStatus?: "invalid" | "public-gate-failed" | "evaluated";
 }
 
 function parseJsonObject(value: string, label: string): Record<string, unknown> {
@@ -347,10 +914,32 @@ function validateAuthorityResult(
     throw new BackupError(`实验 ${experimentId} 第 ${generation} 代 ${role} 冠军链字段无效`);
   }
   if (result.championBefore !== championBefore) throw new BackupError(`实验 ${experimentId} 第 ${generation} 代 ${role} 冠军链断裂`);
+  const attemptId = checkpointAttemptId ?? result.attemptId;
+  if (checkpointAttemptId !== undefined && result.attemptId !== undefined
+    && result.attemptId !== checkpointAttemptId) {
+    throw new BackupError(`实验 ${experimentId} 第 ${generation} 代 ${role} 检查点尝试身份冲突`);
+  }
+  // Harness 未提交候选时只会留下角色结果检查点，不会创建 candidate_results。
+  // 该终态既可能出现在已提交的失败代次，也可能出现在下一代尚未提交的检查点；
+  // 两种情况都必须保持冠军不变且没有候选或晋级授权，不能把合法失败误判为备份损坏。
+  if (result.candidateStatus === "invalid") {
+    if (!attemptId || result.candidateCommit !== championBefore
+      || result.championAfter !== championBefore || result.outcome !== "failed"
+      || result.promotionTag !== null) {
+      throw new BackupError(`实验 ${experimentId} 第 ${generation} 代 ${role} 未提交候选结果非法`);
+    }
+    const matchingInvalid = candidates.filter((candidate) => candidate.attempt_id === attemptId);
+    if (matchingInvalid.length !== 0) {
+      throw new BackupError(`实验 ${experimentId} 第 ${generation} 代 ${role} 未提交候选却存在候选授权`);
+    }
+    if (promotions.has(authorityKey(experimentId, role, generation))) {
+      throw new BackupError(`实验 ${experimentId} 第 ${generation} 代 ${role} 未提交候选却存在晋级授权`);
+    }
+    return championBefore;
+  }
   if (!lineage.contains(experimentId, role, result.candidateCommit!)) {
     throw new BackupError(`实验 ${experimentId} 第 ${generation} 代 ${role} 候选不属于恢复谱系`);
   }
-  const attemptId = checkpointAttemptId ?? result.attemptId;
   const matching = candidates.filter((candidate) => candidate.target_commit === result.candidateCommit
     && (attemptId === undefined || candidate.attempt_id === attemptId));
   if (matching.length !== 1) throw new BackupError(`实验 ${experimentId} 第 ${generation} 代 ${role} 候选授权不唯一`);
@@ -395,10 +984,19 @@ function validateChampionAuthority(database: DatabaseSync, lineage: PluginLineag
   const authorizedCandidates = new Set<string>();
   const runtimeIds = new Set(runtimeRows.map((row) => row.experiment_id));
   const lineageIds = new Set(repositories.map((repository) => repository.experiment_id));
-  const dormantFactRows = database.prepare(`SELECT experiment_id, 'generation' AS kind FROM generation_records
-    UNION ALL SELECT experiment_id, 'checkpoint' AS kind FROM generation_role_checkpoints
-    UNION ALL SELECT experiment_id, 'candidate' AS kind FROM candidate_results
-    UNION ALL SELECT experiment_id, 'promotion' AS kind FROM promotion_tags`).all() as Array<{
+  const tableRows = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>;
+  const tableNames = new Set(tableRows.map(({ name }) => name));
+  const factSources = [
+    ["generation_records", "generation"], ["generation_role_checkpoints", "checkpoint"],
+    ["generation_role_model_calls", "model-call-budget"],
+    ["generation_role_provider_attempts", "provider-attempt-budget"],
+    ["generation_role_provider_usage_items", "provider-usage-item"],
+    ["generation_role_provider_model_call_receipts", "provider-model-call-receipt"],
+    ["generation_role_tool_calls", "tool-call-budget"], ["candidate_results", "candidate"],
+    ["promotion_tags", "promotion"],
+  ].filter(([table]) => tableNames.has(table!));
+  const dormantFactRows = database.prepare(factSources.map(([table, kind]) =>
+    `SELECT experiment_id, '${kind}' AS kind FROM ${table}`).join(" UNION ALL ")).all() as Array<{
       experiment_id: string; kind: string;
     }>;
   for (const fact of dormantFactRows) {
@@ -480,31 +1078,56 @@ function validateChampionAuthority(database: DatabaseSync, lineage: PluginLineag
   }
 }
 
-function materializeForIntegrity(backupPath: string, manifest: BackupManifest, target: string): void {
+function assertNoUnpublishedProviderUsageSchema(database: DatabaseSync): void {
+  const rows = database.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'
+    AND name IN ('generation_role_provider_attempt_receipts', 'generation_role_provider_usage_batches')
+    ORDER BY name`).all() as Array<{ name: string }>;
+  if (rows.length > 0) {
+    throw new BackupError(`检测到未发布的 Repair66 Provider usage 中间表：${rows.map(({ name }) => name).join(", ")}`);
+  }
+}
+
+function materializeForIntegrity(
+  backupPath: string,
+  manifest: BackupManifest,
+  target: string,
+  secrets: Buffer[],
+  timeout: number,
+): void {
   mkdirSync(target, { recursive: true, mode: 0o700 });
   chmodSync(target, 0o700);
   const databaseTarget = join(target, databaseName);
   writeFileSync(databaseTarget, readFileSync(join(backupPath, databaseName)), { mode: 0o600, flag: "wx" });
   const database = new DatabaseSync(databaseTarget);
   try {
+    assertNoUnpublishedProviderUsageSchema(database);
     database.exec("BEGIN IMMEDIATE");
     const update = database.prepare("UPDATE lineage_repositories SET repository_path = ? WHERE experiment_id = ? AND role = ?");
     for (const repository of manifest.repositories) {
       const destination = join(target, "lineages", safeSegment(repository.experimentId), repository.role);
       mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
       const bundle = join(backupPath, repository.bundlePath);
-      const clone = spawnSync("git", ["clone", "--quiet", "--no-hardlinks", bundle, destination], {
-        encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
-      });
-      if (clone.error || clone.status !== 0) throw new BackupError("谱系 Bundle 无法恢复");
-      runGit(destination, ["remote", "remove", "origin"]);
-      for (const ref of repository.refs) {
-        try { runGit(destination, ["update-ref", ref.name, ref.objectId]); }
-        catch { throw new BackupError(`谱系 Bundle 标签或 refs 与备份清单冲突：${ref.name}`); }
+      assertBundleHasNoSecrets(bundle, secrets, timeout);
+      try {
+        runGit(dirname(destination), ["clone", "--quiet", "--no-hardlinks", bundle, destination], timeout);
+      } catch (error) {
+        assertNoSensitiveBytes(bundle, secrets);
+        if (error instanceof BackupError && error.message.includes("资源上限")) throw error;
+        throw new BackupError("谱系 Bundle 无法恢复");
       }
-      runGit(destination, ["config", "user.name", "Maze Arena Orchestrator"]);
-      runGit(destination, ["config", "user.email", "arena@localhost"]);
-      const fingerprint = repositoryFingerprint(destination);
+      assertRepositoryHasNoSecrets(destination, secrets, timeout);
+      runGit(destination, ["remote", "remove", "origin"], timeout);
+      for (const ref of repository.refs) {
+        try { runGit(destination, ["update-ref", ref.name, ref.objectId], timeout); }
+        catch (error) {
+          if (error instanceof BackupError && error.message.includes("资源上限")) throw error;
+          throw new BackupError(`谱系 Bundle 标签或 refs 与备份清单冲突：${ref.name}`);
+        }
+      }
+      assertRepositoryHasNoSecrets(destination, secrets, timeout);
+      runGit(destination, ["config", "user.name", "Maze Arena Orchestrator"], timeout);
+      runGit(destination, ["config", "user.email", "arena@localhost"], timeout);
+      const fingerprint = repositoryFingerprint(destination, timeout);
       if (canonicalJson(fingerprint.refs) !== canonicalJson(repository.refs)
         || fingerprint.refsSha256 !== repository.refsSha256 || fingerprint.objectsSha256 !== repository.objectsSha256) {
         throw new BackupError("谱系 Bundle 的 refs 或对象集合发生漂移");
@@ -518,7 +1141,11 @@ function materializeForIntegrity(backupPath: string, manifest: BackupManifest, t
     throw error;
   } finally { database.close(); }
   verifySqlite(databaseTarget);
-  const lineage = new PluginLineageRepository(join(target, "lineages"), databaseTarget);
+  const lineage = new PluginLineageRepository(
+    join(target, "lineages"),
+    databaseTarget,
+    supervisedLineageGitRunner(timeout),
+  );
   try {
     const restored = lineage.verifyAllIntegrity();
     if (restored.length !== manifest.repositories.length) throw new BackupError("恢复谱系数量与备份清单冲突");
@@ -530,11 +1157,24 @@ function materializeForIntegrity(backupPath: string, manifest: BackupManifest, t
 }
 
 export class RuntimeBackupManager {
-  constructor(private readonly options: BackupManagerOptions) {}
+  private readonly gitCommandTimeoutMs: number;
+
+  constructor(private readonly options: BackupManagerOptions) {
+    this.gitCommandTimeoutMs = validatedGitCommandTimeout(options.gitCommandTimeoutMs);
+  }
+
+  assertSourceDatabaseSchemaSupported(): void {
+    if (!existsSync(this.options.databasePath)) return;
+    assertPlainFile(this.options.databasePath, "正式 SQLite");
+    const database = new DatabaseSync(this.options.databasePath, { readOnly: true });
+    try { assertNoUnpublishedProviderUsageSchema(database); }
+    finally { database.close(); }
+  }
 
   create(trigger: BackupTrigger): BackupResult {
     const { databasePath, lineageRoot, backupsRoot } = this.options;
     assertPlainFile(databasePath, "正式 SQLite");
+    this.assertSourceDatabaseSchemaSupported();
     mkdirSync(backupsRoot, { recursive: true, mode: 0o700 });
     chmodSync(backupsRoot, 0o700);
     const staging = mkdtempSync(join(backupsRoot, ".creating-"));
@@ -542,9 +1182,17 @@ export class RuntimeBackupManager {
     try {
       return withLineageMutationLock(lineageRoot, () => {
         validateRuntimeIdentity(this.options.runtimeIdentity);
-        const lineage = new PluginLineageRepository(lineageRoot, databasePath);
+        const lineage = new PluginLineageRepository(
+          lineageRoot,
+          databasePath,
+          supervisedLineageGitRunner(this.gitCommandTimeoutMs),
+        );
         let registered: RegisteredLineage[];
-        try { registered = lineage.verifyAllIntegrity(); } finally { lineage.close(); }
+        try {
+          registered = lineage.registeredLineages();
+          assertRegisteredObjectDatabasesReadable(registered, this.gitCommandTimeoutMs);
+          registered = lineage.verifyAllIntegrity();
+        } finally { lineage.close(); }
         assertCompleteRolePairs(registered);
         const databaseTarget = join(staging, databaseName);
         copyDatabaseSnapshot(databasePath, databaseTarget);
@@ -557,11 +1205,12 @@ export class RuntimeBackupManager {
           const local = join("repositories", safeSegment(source.experimentId), `${source.role}.bundle`);
           const destination = join(staging, local);
           mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-          const before = repositoryFingerprint(source.repositoryPath);
-          assertRepositoryHasNoSecrets(source.repositoryPath, secrets);
-          runGit(source.repositoryPath, ["bundle", "create", destination, "--all"]);
+          const before = repositoryFingerprint(source.repositoryPath, this.gitCommandTimeoutMs);
+          assertRepositoryHasNoSecrets(source.repositoryPath, secrets, this.gitCommandTimeoutMs);
+          runGit(source.repositoryPath, ["bundle", "create", destination, "--all"], this.gitCommandTimeoutMs);
           chmodSync(destination, 0o600);
-          const after = repositoryFingerprint(source.repositoryPath);
+          assertBundleHasNoSecrets(destination, secrets, this.gitCommandTimeoutMs);
+          const after = repositoryFingerprint(source.repositoryPath, this.gitCommandTimeoutMs);
           if (canonicalJson(before) !== canonicalJson(after)) throw new BackupError("谱系仓库在一致性备份期间发生变化");
           assertNoSensitiveBytes(destination, secrets);
           repositories.push({ experimentId: source.experimentId, role: source.role, sourcePath: source.repositoryPath,
@@ -597,8 +1246,17 @@ export class RuntimeBackupManager {
     const manifest = validateBackupDirectory(path);
     assertRuntimeIdentityMatches(manifest.runtimeIdentity, this.options.runtimeIdentity);
     assertCompleteRolePairs(manifest.repositories);
+    const secrets = normalizedSecrets(this.options.sensitiveValues);
+    const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+    if (secrets.some((secret) => manifestBytes.includes(secret))) {
+      throw new BackupError("备份运行身份或路径包含 API Key，拒绝验证");
+    }
     const verification = mkdtempSync(join(tmpdir(), "maze-backup-verify-"));
-    try { materializeForIntegrity(path, manifest, verification); }
+    try {
+      materializeForIntegrity(path, manifest, verification, secrets, this.gitCommandTimeoutMs);
+      for (const entry of manifest.artifacts) assertNoSensitiveBytes(join(path, entry.path), secrets);
+      assertNoSensitiveBytes(join(verification, databaseName), secrets);
+    }
     finally { rmSync(verification, { recursive: true, force: true }); }
     return manifest;
   }
@@ -613,7 +1271,7 @@ export class RuntimeBackupManager {
     const manifest = this.verify(path);
     mkdirSync(dirname(resolve(target)), { recursive: true, mode: 0o700 });
     try {
-      materializeForIntegrity(path, manifest, target);
+      materializeForIntegrity(path, manifest, target, normalizedSecrets(this.options.sensitiveValues), this.gitCommandTimeoutMs);
       return manifest;
     } catch (error) {
       if (existsSync(target)) rmSync(target, { recursive: true, force: true });
@@ -648,7 +1306,23 @@ export class RuntimeBackupManager {
   }
 }
 
-export function sensitiveEnvironmentValues(environment: NodeJS.ProcessEnv): string[] {
-  return Object.entries(environment).filter(([name, value]) => value && /(api.?key|authorization|credential|password|secret|token)/i.test(name))
-    .map(([, value]) => value!);
+export function sensitiveEnvironmentValues(
+  environment: NodeJS.ProcessEnv,
+  credentialNames: readonly string[] = [],
+): SensitiveEnvironmentValueSet {
+  const exactNames = new Set(credentialNames);
+  const exactCredentialValues = [...new Set(Object.entries(environment)
+    .filter(([name, value]) => value !== undefined && exactNames.has(name))
+    .map(([, value]) => value!))];
+  const heuristicValues = [...new Set(Object.entries(environment)
+    .filter(([name, value]) => value !== undefined && /(api.?key|authorization|credential|password|secret|token)/i.test(name))
+    .map(([, value]) => value!))];
+  return { exactCredentialValues, heuristicValues };
+}
+
+export function redactionSensitiveValues(values: SensitiveEnvironmentValueSet): string[] {
+  return [...new Set([
+    ...values.exactCredentialValues.filter((value) => value.length > 0),
+    ...values.heuristicValues.filter((value) => value.length >= 8),
+  ])];
 }

@@ -86,6 +86,9 @@ export interface EvolutionAttemptResult {
   candidate?: CandidateCommit;
 }
 
+const MODEL_CALL_BUDGET_EXHAUSTED_CODE = "MODEL_CALL_BUDGET_EXHAUSTED";
+const MODEL_CALL_BUDGET_EXHAUSTED_DIAGNOSTIC = "剩余模型调用额度不足以继续候选修复";
+
 const EXCLUDED_SESSION_DIRECTORIES = new Set([
   ".git", "node_modules", "dist", "cache", ".cache", ".next", ".turbo", ".vite", "coverage", ".pnpm-store",
 ]);
@@ -139,10 +142,10 @@ export async function runEvolutionAttempt(options: {
   assertNoPrivateEvolutionData(options.input);
   assertSafeWorkspaceTree(options.championRoot, EXCLUDED_SESSION_DIRECTORIES);
   const lineageBaseline = collectLineageBaseline(options.championRoot);
-  const home = join(options.isolatedRoot, options.attemptId, "harness-home");
+  const attemptRoot = join(options.isolatedRoot, options.attemptId);
   const workspace = join(options.isolatedRoot, options.attemptId, "workspace");
-  rmSync(join(options.isolatedRoot, options.attemptId), { recursive: true, force: true });
-  mkdirSync(home, { recursive: true, mode: 0o700 });
+  rmSync(attemptRoot, { recursive: true, force: true });
+  mkdirSync(attemptRoot, { recursive: true, mode: 0o700 });
   cpSync(options.championRoot, workspace, {
     recursive: true,
     dereference: false,
@@ -150,15 +153,20 @@ export async function runEvolutionAttempt(options: {
       .filter(Boolean).every((segment) => !EXCLUDED_SESSION_DIRECTORIES.has(segment)),
   });
   chmodSync(workspace, 0o700);
-  const session = options.createSession({ home, workspace });
   let response: EvolutionSessionResponse | undefined;
   let trustedCandidateIdentity: string | undefined;
   let diagnostics: string[] = [];
   let repairs = 0;
-  try {
-    for (let repairAttempt = 0; repairAttempt <= 3; repairAttempt += 1) {
-      options.beginRepairAttempt?.(repairAttempt);
-      response = await session.run({
+  let provisionalStrategyPlan: string | undefined;
+  for (let repairAttempt = 0; repairAttempt <= 3; repairAttempt += 1) {
+    options.beginRepairAttempt?.(repairAttempt);
+    const home = join(attemptRoot, `harness-home-r${repairAttempt}`);
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    // 每次修复都重建并关闭 Harness 会话；只有候选工作区跨修复保留状态。
+    const session = options.createSession({ home, workspace });
+    let nextResponse: EvolutionSessionResponse;
+    try {
+      nextResponse = await session.run({
         role: options.role,
         home,
         workspace,
@@ -167,81 +175,127 @@ export async function runEvolutionAttempt(options: {
         repairAttempt,
         diagnostics,
       });
-      // 模型命令返回后重新检查实际文件类型，禁止利用链接或特殊文件绕过公开门禁。
-      assertSafeWorkspaceTree(workspace);
-      if (!response.submitted) return {
-        status: "invalid-candidate", repairs, hiddenEvaluationCount: 0, promoted: false, diagnostics: ["Harness 未提交候选"],
-      };
-      assertCandidateScope(options.championRoot, workspace);
-      let gate: PublicGateResult;
-      let prepared = false;
-      let preparedIdentity: string | undefined;
-      try {
-        ensureStrategyPlan(workspace, options.attemptId, response.strategyPlan);
-        assertCandidateStrategyRecord(workspace, lineageBaseline, options.attemptId, response.strategyPlan);
-        preparedIdentity = await options.prepareCandidate(workspace, {
-          attemptId: options.attemptId,
-          strategyPlan: response.strategyPlan,
-        });
-        trustedCandidateIdentity = preparedIdentity;
-        const candidate = await options.lineage.createCandidate({
-          experimentId: options.experimentId, role: options.role, sourceRoot: workspace,
-          attemptId: options.attemptId, hypothesis: response.hypothesis, lineageBaseline,
-        });
-        await options.candidatePrepared?.(candidate);
-        gate = await options.publicGate(workspace);
-        await options.verifyCandidate(workspace, preparedIdentity);
-        prepared = true;
-      } catch (error) {
-        gate = { passed: false, diagnostics: [error instanceof Error ? error.message : "候选可信重建失败"] };
+    } catch (error) {
+      // 公开门禁已经失败时，剩余模型额度可能不足以完成下一次 read/edit/JSON 修复。
+      // 这是当前候选的验证终止，不是提供方或运行时基础设施故障；保留此前门禁诊断并停止继续外呼。
+      if (isModelCallBudgetExhausted(error)) {
+        const exhaustedDiagnostics = diagnostics.includes(MODEL_CALL_BUDGET_EXHAUSTED_DIAGNOSTIC)
+          ? diagnostics
+          : [...diagnostics, MODEL_CALL_BUDGET_EXHAUSTED_DIAGNOSTIC];
+        return {
+          status: "invalid-candidate",
+          repairs,
+          hiddenEvaluationCount: 0,
+          promoted: false,
+          diagnostics: exhaustedDiagnostics.length > 0
+            ? exhaustedDiagnostics
+            : [MODEL_CALL_BUDGET_EXHAUSTED_DIAGNOSTIC],
+        };
       }
-      if (gate.passed) break;
-      diagnostics = [...gate.diagnostics];
-      if (repairAttempt === 3) {
-        if (!prepared) return { status: "invalid-candidate", repairs, hiddenEvaluationCount: 0, promoted: false, diagnostics };
-        const preparedCandidate = await options.lineage.createCandidate({
-          experimentId: options.experimentId, role: options.role, sourceRoot: workspace, attemptId: options.attemptId,
-          hypothesis: response.hypothesis, lineageBaseline,
-        });
-        const candidate = options.lineage.recordCandidateResult({
-          experimentId: options.experimentId, role: options.role, commit: preparedCandidate.commit, attemptId: options.attemptId,
-          hypothesis: response.hypothesis, resultSummary: diagnostics.join("; "), outcome: "failed",
-        });
-        return { status: "public-gate-failed", repairs, hiddenEvaluationCount: 0, promoted: false, diagnostics, candidate };
-      }
-      repairs += 1;
+      throw error;
+    } finally {
+      await session.close();
     }
-    if (!response || !trustedCandidateIdentity) return {
-      status: "invalid-candidate", repairs, hiddenEvaluationCount: 0, promoted: false, diagnostics,
+    response = nextResponse;
+    // 模型命令返回后重新检查实际文件类型，禁止利用链接或特殊文件绕过公开门禁。
+    assertSafeWorkspaceTree(workspace);
+    if (!response.submitted) return {
+      status: "invalid-candidate", repairs, hiddenEvaluationCount: 0, promoted: false, diagnostics: ["Harness 未提交候选"],
     };
-    const hidden = await options.hiddenEvaluate(workspace);
-    await options.verifyCandidate(workspace, trustedCandidateIdentity);
-    const preparedCandidate = await options.lineage.createCandidate({
-      experimentId: options.experimentId, role: options.role, sourceRoot: workspace, attemptId: options.attemptId,
-      hypothesis: response.hypothesis, lineageBaseline,
-    });
-    const candidate = options.lineage.recordCandidateResult({
-      experimentId: options.experimentId, role: options.role, commit: preparedCandidate.commit, attemptId: options.attemptId,
-      hypothesis: response.hypothesis, resultSummary: hidden.resultSummary,
-      outcome: hidden.outcome ?? (hidden.promote ? "promoted" : "failed"), generation: hidden.promote ? options.generation : undefined,
-    });
-    return { status: "evaluated", repairs, hiddenEvaluationCount: 1, promoted: hidden.promote, diagnostics: [], candidate };
-  } finally {
-    await session.close();
+    assertCandidateScope(options.championRoot, workspace);
+    let gate: PublicGateResult;
+    let prepared = false;
+    let preparedIdentity: string | undefined;
+    try {
+      provisionalStrategyPlan = ensureStrategyPlan(
+        workspace, lineageBaseline, options.attemptId, response.strategyPlan, provisionalStrategyPlan,
+      );
+      assertCandidateStrategyRecord(workspace, lineageBaseline, options.attemptId, response.strategyPlan);
+      preparedIdentity = await options.prepareCandidate(workspace, {
+        attemptId: options.attemptId,
+        strategyPlan: response.strategyPlan,
+      });
+      trustedCandidateIdentity = preparedIdentity;
+      const candidate = await options.lineage.createCandidate({
+        experimentId: options.experimentId, role: options.role, sourceRoot: workspace,
+        attemptId: options.attemptId, hypothesis: response.hypothesis, lineageBaseline,
+      });
+      await options.candidatePrepared?.(candidate);
+      gate = await options.publicGate(workspace);
+      await options.verifyCandidate(workspace, preparedIdentity);
+      prepared = true;
+    } catch (error) {
+      gate = { passed: false, diagnostics: [error instanceof Error ? error.message : "候选可信重建失败"] };
+    }
+    if (gate.passed) break;
+    diagnostics = [...gate.diagnostics];
+    if (repairAttempt === 3) {
+      if (!prepared) return { status: "invalid-candidate", repairs, hiddenEvaluationCount: 0, promoted: false, diagnostics };
+      const preparedCandidate = await options.lineage.createCandidate({
+        experimentId: options.experimentId, role: options.role, sourceRoot: workspace, attemptId: options.attemptId,
+        hypothesis: response.hypothesis, lineageBaseline,
+      });
+      const candidate = options.lineage.recordCandidateResult({
+        experimentId: options.experimentId, role: options.role, commit: preparedCandidate.commit, attemptId: options.attemptId,
+        hypothesis: response.hypothesis, resultSummary: diagnostics.join("; "), outcome: "failed",
+      });
+      return { status: "public-gate-failed", repairs, hiddenEvaluationCount: 0, promoted: false, diagnostics, candidate };
+    }
+    repairs += 1;
   }
+  if (!response || !trustedCandidateIdentity) return {
+    status: "invalid-candidate", repairs, hiddenEvaluationCount: 0, promoted: false, diagnostics,
+  };
+  const hidden = await options.hiddenEvaluate(workspace);
+  await options.verifyCandidate(workspace, trustedCandidateIdentity);
+  const preparedCandidate = await options.lineage.createCandidate({
+    experimentId: options.experimentId, role: options.role, sourceRoot: workspace, attemptId: options.attemptId,
+    hypothesis: response.hypothesis, lineageBaseline,
+  });
+  const candidate = options.lineage.recordCandidateResult({
+    experimentId: options.experimentId, role: options.role, commit: preparedCandidate.commit, attemptId: options.attemptId,
+    hypothesis: response.hypothesis, resultSummary: hidden.resultSummary,
+    outcome: hidden.outcome ?? (hidden.promote ? "promoted" : "failed"), generation: hidden.promote ? options.generation : undefined,
+  });
+  return { status: "evaluated", repairs, hiddenEvaluationCount: 1, promoted: hidden.promote, diagnostics: [], candidate };
 }
 
-function ensureStrategyPlan(workspace: string, attemptId: string, content: string): void {
+function isModelCallBudgetExhausted(error: unknown): boolean {
+  return typeof error === "object" && error !== null
+    && (error as { code?: unknown }).code === MODEL_CALL_BUDGET_EXHAUSTED_CODE;
+}
+
+function ensureStrategyPlan(
+  workspace: string,
+  lineageBaseline: Readonly<Record<string, string>>,
+  attemptId: string,
+  content: string,
+  previousContent?: string,
+): string {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(attemptId)) throw new Error("候选尝试标识非法");
   if (Buffer.byteLength(content, "utf8") > 64 * 1024) throw new Error("策略计划超过 64 KiB 冻结上限");
   const directory = join(workspace, "lineage");
   mkdirSync(directory, { recursive: true });
   const target = join(directory, `${attemptId}.md`);
+  const targetPath = `lineage/${attemptId}.md`;
   if (existsSync(target)) {
-    if (readFileSync(target, "utf8") !== content) throw new Error("候选策略记录与 Harness 响应不一致");
-    return;
+    const existing = readFileSync(target, "utf8");
+    if (existing === content) return content;
+    if (targetPath in lineageBaseline) throw new Error(`候选修改或删除了既有策略记录：${targetPath}`);
+    // 新尝试的临时记录不可信，始终由结构化响应覆盖，确保进入可信重建的
+    // 文件内容与响应一致；后续修复只允许更新上一轮由编排器确认的记录，
+    // 不能掩盖模型对它的额外篡改。
+    if (previousContent !== undefined && existing !== previousContent) {
+      throw new Error("候选策略记录与 Harness 响应不一致");
+    }
+    writeFileSync(target, content, "utf8");
+    return content;
+  }
+  if (previousContent !== undefined && !(targetPath in lineageBaseline)) {
+    throw new Error(`候选删除了临时策略记录：${targetPath}`);
   }
   writeFileSync(target, content, "utf8");
+  return content;
 }
 
 function assertCandidateStrategyRecord(

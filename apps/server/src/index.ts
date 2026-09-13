@@ -1,5 +1,6 @@
 import { dirname, join, resolve } from "node:path";
 import { Socket } from "node:net";
+import { spawnSync } from "node:child_process";
 import { createArenaServer, installPersistentShutdownHandlers } from "./app.js";
 import { createProductionHarnessAdapter } from "./production-harness.js";
 import {
@@ -12,7 +13,13 @@ import {
 } from "@maze-arena/match-profile";
 import { isSensitiveProviderOptionName } from "@maze-arena/contracts";
 import type { FastifyRequest } from "fastify";
-import { RuntimeBackupManager, sensitiveEnvironmentValues } from "@maze-arena/backup";
+import {
+  redactionSensitiveValues,
+  RuntimeBackupManager,
+  sensitiveEnvironmentValues,
+  type SensitiveEnvironmentValueSet,
+} from "@maze-arena/backup";
+import { credentialEnvironmentNameFromReference, hashHarnessRuntimePayload } from "@maze-arena/dsh-integration";
 
 interface StartupIdentity {
   schemaVersion: 1;
@@ -20,6 +27,8 @@ interface StartupIdentity {
   pid: number;
   port: number;
 }
+
+let runtimeSensitiveValues: SensitiveEnvironmentValueSet = sensitiveEnvironmentValues(process.env);
 
 function readStartupCommit(channel: Socket, identity: StartupIdentity, timeout = 10_000): Promise<void> {
   return new Promise((resolveCommit, reject) => {
@@ -108,14 +117,19 @@ function writeStartupFrame(channel: Socket, value: object): Promise<void> {
 
 function sanitizedMessage(error: unknown): string {
   let message = error instanceof Error ? error.message : String(error);
-  for (const [name, value] of Object.entries(process.env)) {
-    if (value && /(api.?key|authorization|credential|password|secret|token)/i.test(name)) {
-      message = message.split(value).join("[REDACTED]");
-    }
-  }
+  for (const value of redactionSensitiveValues(runtimeSensitiveValues)) message = message.split(value).join("[REDACTED]");
   return message
     .replace(/\b(?:sk|key|token|secret|password)[-_][A-Za-z0-9._-]{8,}\b/gi, "[REDACTED]")
     .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [REDACTED]");
+}
+
+function credentialNamesFromReferences(references: readonly string[]): string[] {
+  return references.map((reference) => {
+    try { return credentialEnvironmentNameFromReference(reference); }
+    catch (error) {
+      throw new Error(`生产模型目录${error instanceof Error ? error.message : "包含非法凭据引用"}`);
+    }
+  });
 }
 
 function sanitizedRequestUrl(url: string): string {
@@ -156,6 +170,8 @@ async function main(): Promise<void> {
     ? undefined
     : Number(process.env.ARENA_STARTUP_HANDSHAKE_FD);
   const harnessAdapter = createProductionHarnessAdapter(process.env);
+  const credentialNames = credentialNamesFromReferences(harnessAdapter.listModels().credentialRefs);
+  runtimeSensitiveValues = sensitiveEnvironmentValues(process.env, credentialNames);
   const matchImage = process.env.ARENA_MATCH_IMAGE;
   const trustedRoot = process.env.ARENA_MATCH_TRUSTED_ROOT;
   const protocolBundle = process.env.ARENA_MATCH_PROTOCOL_PACKAGE;
@@ -166,13 +182,20 @@ async function main(): Promise<void> {
   const harnessRuntimeRoot = process.env.DSH_HARNESS_RUNTIME_ROOT;
   const harnessRuntimePayloadSha256 = process.env.DSH_HARNESS_RUNTIME_SHA256;
   const harnessVersion = process.env.DSH_HARNESS_VERSION;
-  const harnessCommit = process.env.ARENA_HARNESS_COMMIT;
+  const harnessPackage = process.env.ARENA_HARNESS_PACKAGE;
+  const harnessPackageVersion = process.env.ARENA_HARNESS_PACKAGE_VERSION;
   const modelCatalogRelease = process.env.ARENA_MODEL_CATALOG_RELEASE;
+  const modelReleaseSha256 = process.env.ARENA_MODEL_RELEASE_SHA256;
+  const evolutionExecutionKind = process.env.DSH_EVOLUTION_EXECUTION_KIND ?? "real-provider";
   if (!Number.isSafeInteger(port) || (port !== 0 && (port < 1_024 || port > 65_535))) throw new Error("生产监听端口无效");
+  if (evolutionExecutionKind !== "real-provider" && evolutionExecutionKind !== "deterministic-fixture") {
+    throw new Error("生产自治执行证据等级无效");
+  }
   if (startupHandshakeFd !== undefined && startupHandshakeFd !== 3) throw new Error("生产启动握手描述符无效");
   if (port === 0 && startupHandshakeFd === undefined) throw new Error("自动监听端口需要生产启动握手描述符");
-  if (!matchImage || !trustedRoot || !protocolBundle || !generatorPlugin || !solverPlugin || !harnessVersion || !harnessCommit
-    || !modelCatalogRelease || !webRoot
+  if (!matchImage || !trustedRoot || !protocolBundle || !generatorPlugin || !solverPlugin || !harnessVersion
+    || harnessPackage !== "@deepseek-ai/dsh" || !harnessPackageVersion
+    || !modelCatalogRelease || !modelReleaseSha256 || modelCatalogRelease !== modelReleaseSha256 || !webRoot
     || !harnessRuntimeRoot || !harnessRuntimePayloadSha256) {
     throw new Error("生产启动必须配置摘要锁定的 Match Profile 镜像、隔离 Harness home、三个 bundle 包路径与 Web 构建目录");
   }
@@ -182,14 +205,15 @@ async function main(): Promise<void> {
     lineageRoot: join(dataRoot, "lineages"),
     backupsRoot: join(dataRoot, "backups"),
     runtimeIdentity: {
-      harnessCommit,
-      harnessVersion,
+      harnessPackage,
+      harnessVersion: harnessPackageVersion,
       modelCatalogRelease,
+      modelReleaseSha256,
       imageDigest: matchImage,
     },
-    sensitiveValues: sensitiveEnvironmentValues(process.env),
+    sensitiveValues: runtimeSensitiveValues,
   });
-  await new HarnessMatchProfileInstaller({
+  const harnessInstaller = new HarnessMatchProfileInstaller({
     executable: dshExecutable,
     runtimeRoot: harnessRuntimeRoot,
     runtimePayloadSha256: harnessRuntimePayloadSha256,
@@ -197,7 +221,8 @@ async function main(): Promise<void> {
     home: trustedRoot,
     protocolBundle,
     roleBundles: { generator: generatorPlugin, solver: solverPlugin },
-  }).prepare();
+  });
+  await harnessInstaller.prepare();
   const matchRunner = new NativePluginMatchRunner(new DockerMatchProfileCommandFactory(matchImage, trustedRoot));
   const versionedMatchRunner = new DockerPairedEvaluationRunner(matchImage, trustedRoot);
   let startupCommitted = startupHandshakeFd === undefined;
@@ -214,6 +239,34 @@ async function main(): Promise<void> {
     webRoot,
     startupCommitted: () => startupCommitted,
     backupManager,
+    canaryPreflight: {
+      executionKind: evolutionExecutionKind,
+      serverDoctor: async () => {
+        await harnessInstaller.prepare();
+        if (hashHarnessRuntimePayload(harnessRuntimeRoot) !== harnessRuntimePayloadSha256) {
+          throw new Error("Server doctor 检测到 Harness runtime 载荷身份漂移");
+        }
+        await harnessAdapter.listModels();
+        verifyDockerRuntimeIdentity(matchImage);
+        const latest = backupManager.latestComplete();
+        if (!latest) throw new Error("Server doctor 未找到已校验的最近完整备份");
+        const expectedIdentity = {
+          harnessPackage,
+          harnessVersion: harnessPackageVersion,
+          modelCatalogRelease,
+          modelReleaseSha256,
+          imageDigest: matchImage,
+        };
+        if (JSON.stringify(latest.manifest.runtimeIdentity) !== JSON.stringify(expectedIdentity)) {
+          throw new Error("Server doctor 检测到最近完整备份与当前运行身份不一致");
+        }
+        return {
+          checkedAt: new Date().toISOString(),
+          runtimeIdentity: { ...expectedIdentity, harnessRuntimePayloadSha256 },
+          completeBackup: { backupId: latest.manifest.backupId, createdAt: latest.manifest.createdAt },
+        };
+      },
+    },
     logger: {
       serializers: {
         req: (request: FastifyRequest) => ({
@@ -262,6 +315,25 @@ async function main(): Promise<void> {
     } finally {
       startupChannel.destroy();
     }
+  }
+}
+
+function verifyDockerRuntimeIdentity(image: string): void {
+  const inspect = spawnSync("docker", ["image", "inspect", image, "--format", "{{.Id}}"], {
+    encoding: "utf8", timeout: 30_000, env: { PATH: process.env.PATH },
+  });
+  if (inspect.error || inspect.status !== 0 || inspect.stdout.trim() !== image) {
+    throw new Error("Server doctor 检测到 Match Profile 镜像缺失或身份漂移");
+  }
+  const security = spawnSync("docker", ["info", "--format", "{{json .SecurityOptions}}"], {
+    encoding: "utf8", timeout: 30_000, env: { PATH: process.env.PATH },
+  });
+  if (security.error || security.status !== 0) throw new Error("Server doctor 无法验证 Docker 安全能力");
+  let options: unknown;
+  try { options = JSON.parse(security.stdout); } catch { throw new Error("Server doctor 收到无效 Docker 安全能力"); }
+  if (!Array.isArray(options) || !options.some((entry) => typeof entry === "string" && entry.startsWith("name=seccomp"))
+    || !options.some((entry) => typeof entry === "string" && entry.startsWith("name=cgroupns"))) {
+    throw new Error("Server doctor 检测到 Docker 缺少 seccomp 或 cgroupns");
   }
 }
 

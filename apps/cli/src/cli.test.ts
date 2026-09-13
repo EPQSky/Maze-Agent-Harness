@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import type { Writable } from "node:stream";
 import { createHash } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { hashHarnessRuntimePayload } from "@maze-arena/dsh-integration";
 import { ExperimentRuntimeRepository } from "@maze-arena/control-plane";
 import { PluginLineageRepository } from "@maze-arena/lineage";
@@ -13,7 +14,7 @@ import { describe, expect, it } from "vitest";
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = resolve(packageRoot, "../..");
 const cliPath = join(packageRoot, "dist/cli.js");
-const harnessCommit = "0123456789abcdef0123456789abcdef01234567";
+const dshVersion = "0.1.2-rc.1";
 const imageId = `sha256:${"b".repeat(64)}`;
 const baseImage = `node@sha256:${"a".repeat(64)}`;
 const imagePackageDirectories = ["contracts", "engine", "match-profile", "generator-plugin", "solver-plugin"] as const;
@@ -25,7 +26,6 @@ interface Fixture {
   root: string;
   home: string;
   bin: string;
-  harness: string;
   dsh: string;
   nodePrelude: string;
   env: NodeJS.ProcessEnv;
@@ -36,6 +36,13 @@ function executable(path: string, body: string): void {
   chmodSync(path, 0o700);
 }
 
+function restoreDirectoryModes(source: string, target: string): void {
+  chmodSync(target, statSync(source).mode & 0o777);
+  for (const entry of readdirSync(source, { withFileTypes: true })) {
+    if (entry.isDirectory()) restoreDirectoryModes(join(source, entry.name), join(target, entry.name));
+  }
+}
+
 function git(cwd: string, args: string[]): string {
   if (!realGit) throw new Error("测试环境缺少真实 Git");
   const result = spawnSync(realGit, args, { cwd, encoding: "utf8" });
@@ -43,40 +50,14 @@ function git(cwd: string, args: string[]): string {
   return result.stdout.trim();
 }
 
-function initializeHarnessRepository(fixture: Fixture): string {
-  executable(join(fixture.bin, "git"), `exec "${realGit}" "$@"`);
-  git(fixture.harness, ["init", "--quiet"]);
-  git(fixture.harness, ["config", "user.name", "Maze Test"]);
-  git(fixture.harness, ["config", "user.email", "maze@example.invalid"]);
-  writeFileSync(join(fixture.harness, "README.md"), "locked harness\n");
-  writeFileSync(join(fixture.harness, ".gitignore"), "ignored.log\n");
-  git(fixture.harness, ["add", "."]);
-  git(fixture.harness, ["commit", "--quiet", "-m", "fixture"]);
-  return git(fixture.harness, ["rev-parse", "HEAD"]);
-}
-
-function initializeRuntimeHarnessRepository(fixture: Fixture): { fixture: Fixture; commit: string } {
-  writeFileSync(join(fixture.harness, "package.json"), `${JSON.stringify({
-    name: "@deepseek/harness",
-    version: "2026.9.1",
-    private: true,
-    bin: { dsh: "dist/dsh" },
-    dependencies: { "runtime-dependency": "1.0.0" },
-  }, null, 2)}\n`);
-  writeFileSync(join(fixture.harness, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
-  return { fixture, commit: initializeHarnessRepository(fixture) };
-}
-
-function createFixture(overrides: Partial<Record<"node" | "pnpm" | "git" | "docker" | "dsh", string>> = {}): Fixture {
+function createFixture(overrides: Partial<Record<"node" | "npm" | "pnpm" | "git" | "docker" | "dsh", string>> = {}): Fixture {
   const root = mkdtempSync(join(tmpdir(), "maze-cli-"));
   const home = join(root, "home");
   const bin = join(root, "bin");
-  const harness = join(root, "deepseek-harness");
   const nodePrelude = join(root, "node-version.cjs");
-  const modelExport = join(root, "data/maze-arena/harness/model-export.json");
+  const modelExport = join(root, "data/maze-arena/harness/settings.yaml");
   mkdirSync(home);
   mkdirSync(bin);
-  mkdirSync(harness);
   mkdirSync(dirname(modelExport), { recursive: true, mode: 0o700 });
   const projectBackup = join(root, "project-dist-backup");
   mkdirSync(projectBackup);
@@ -85,24 +66,30 @@ function createFixture(overrides: Partial<Record<"node" | "pnpm" | "git" | "dock
   }
   writeFileSync(nodePrelude, 'Object.defineProperty(process, "version", { value: "v22.12.0" });\n');
   writeFileSync(modelExport, `${JSON.stringify({
-    schemaVersion: 1,
-    harnessVersion: "dsh 2026.09.1",
-    credentialRefs: ["dsh-credential://vendor-a", "dsh-credential://vendor-b"],
-    providers: [
-      { id: "vendor-a", label: "Vendor A", models: [{ id: "compact", label: "Compact", capabilities: {
-        reasoningEfforts: [], temperature: { minimum: 0, maximum: 2 }, topP: { minimum: 0, maximum: 1 },
-        maxContextTokens: 8_000, maxOutputTokens: 2_000, maxTotalTokens: 10_000, providerOptions: {},
-      } }] },
-      { id: "vendor-b", label: "Vendor B", models: [{ id: "reasoner", label: "Reasoner", capabilities: {
-        reasoningEfforts: ["low", "medium", "high"], maxContextTokens: 16_000, maxOutputTokens: 4_000,
-        maxTotalTokens: 20_000, providerOptions: { thinkingBudget: { type: "number", minimum: 1_000, maximum: 8_000 } },
-      } }] },
-    ],
+    "llm-pi-ai": { providers: {
+      "vendor-a": { displayName: "Vendor A", apiKeyEnv: "VENDOR_A_API_KEY",
+        baseURL: "https://vendor-a.example/v1", api: "openai-completions",
+        models: [{ id: "compact", name: "Compact", contextWindow: 8_000, maxTokens: 2_000 }] },
+      "vendor-b": { displayName: "Vendor B", apiKeyEnv: "VENDOR_B_API_KEY",
+        baseURL: "https://vendor-b.example/v1", api: "openai-completions",
+        models: [{ id: "reasoner", name: "Reasoner", contextWindow: 16_000, maxTokens: 4_000,
+          reasoningEfforts: { off: "off", low: "low", high: "high", max: "max" } }] },
+    } },
+    "maze-arena-cost-policy": { id: "pi-ai-configured-cost-v1", multipliers: {
+      "vendor-a/compact": 1, "vendor-b/reasoner": 2,
+    } },
   }, null, 2)}\n`);
 
   executable(join(bin, "node"), overrides.node ?? 'printf "v22.12.0\\n"');
   executable(join(bin, "pnpm"), overrides.pnpm ?? `
+if [ -n "\${DSH_HOME:-}" ]; then
+  printf '%s\\n' "$0" > "\${DSH_HOME}/frozen-pnpm-executable"
+else
+  printf '%s\\n' "$0" >> "${join(root, "pnpm-executables")}"
+fi
 if [ "\${1:-}" = "--version" ]; then printf "10.15.0\\n"; exit 0; fi
+printf '%s\\n' "$*" >> "${join(root, "pnpm-invocations")}"
+printf '%s\\n' "\${npm_config_store_dir:-}" > "${join(root, "pnpm-store-dir")}"
 directory=""; previous=""; last=""
 for argument in "$@"; do
   if [ "$previous" = "--dir" ]; then directory="$argument"; fi
@@ -116,20 +103,54 @@ case " $* " in
       /bin/cp -R "${join(root, "project-dist-backup")}/$package/." "${join(repositoryRoot, "packages")}/$package/dist/"
     done
     ;;
-  *" build ")
-    /bin/mkdir -p "$directory/dist"
-    /bin/cp "${join(bin, "dsh")}" "$directory/dist/dsh"
-    ;;
-  *" deploy "*)
-    /bin/mkdir -p "$last/dist" "$last/node_modules/runtime-dependency"
-    /bin/cp "$directory/package.json" "$last/package.json"
-    /bin/cp "$directory/dist/dsh" "$last/dist/dsh"
-    if [ ! -f "${join(root, "pnpm-skip-dependency")}" ]; then
-      printf '{"name":"runtime-dependency","version":"1.0.0"}\\n' > "$last/node_modules/runtime-dependency/package.json"
+  *" exec tsx scripts/release/pack.ts --family "*)
+    family=""; output=""; previous=""
+    for argument in "$@"; do
+      if [ "$previous" = "--family" ]; then family="$argument"; fi
+      if [ "$previous" = "--out" ]; then output="$argument"; fi
+      previous="$argument"
+    done
+    /bin/mkdir -p "$output"
+    if [ "$family" = "vendor" ]; then
+      : > "$output/deepseek-ai-cordis-plugin-group-4.0.0.tgz"
+    else
+      : > "$output/deepseek-ai-dsh-runtime-0.1.2-rc.1.tgz"
+      : > "$output/deepseek-ai-dsh-0.1.2-rc.1.tgz"
     fi
     ;;
+  *" build ")
+    /bin/mkdir -p "$directory/apps/dsh/lib"
+    /bin/cp "${join(bin, "dsh")}" "$directory/apps/dsh/lib/bin.js"
+    ;;
 esac`);
-  executable(join(bin, "git"), overrides.git ?? `if [ "\${1:-}" = "--version" ]; then printf "git version 2.45.0\\n"; elif [ "\${3:-}" = "status" ]; then :; else printf "${harnessCommit}\\n"; fi`);
+  executable(join(bin, "npm"), overrides.npm ?? `
+prefix=""; previous=""
+for argument in "$@"; do
+  if [ "$previous" = "--prefix" ]; then prefix="$argument"; fi
+  previous="$argument"
+done
+[ -n "$prefix" ] || { printf "missing npm prefix\\n" >&2; exit 1; }
+/bin/mkdir -p "$prefix/node_modules/@deepseek-ai/dsh/lib" "$prefix/node_modules/@deepseek-ai/dsh-runtime" "$prefix/node_modules/@deepseek-ai/dsh-sdk-protocol" "$prefix/node_modules/pnpm/bin" "$prefix/node_modules/.bin"
+/bin/cp "${join(bin, "dsh")}" "$prefix/node_modules/@deepseek-ai/dsh/lib/bin.js"
+/bin/cp "${join(bin, "plugin-install.py")}" "$prefix/node_modules/@deepseek-ai/dsh/lib/plugin-install.py"
+/bin/cp "${join(bin, "pnpm")}" "$prefix/node_modules/pnpm/bin/pnpm.cjs"
+/bin/ln -s ../pnpm/bin/pnpm.cjs "$prefix/node_modules/.bin/pnpm"
+printf 'A\\n' > "$prefix/link-target-a"
+printf 'B\\n' > "$prefix/link-target-b"
+/bin/ln -s link-target-a "$prefix/runtime-link"
+installed_version="0.1.2-rc.1"
+if [ -f "${join(root, "npm-wrong-version")}" ]; then installed_version="0.1.2-rc.2"; fi
+printf '%s\\n' '{"name":"@deepseek-ai/dsh-runtime","version":"0.1.2-rc.1"}' > "$prefix/node_modules/@deepseek-ai/dsh-runtime/package.json"
+printf '%s\\n' '{"name":"@deepseek-ai/dsh-sdk-protocol","version":"0.1.2-rc.1"}' > "$prefix/node_modules/@deepseek-ai/dsh-sdk-protocol/package.json"
+printf '%s\\n' '{"name":"pnpm","version":"10.15.0","bin":{"pnpm":"bin/pnpm.cjs"}}' > "$prefix/node_modules/pnpm/package.json"
+printf '{"name":"@deepseek-ai/dsh","version":"%s","bin":{"dsh":"lib/bin.js"},"dependencies":{"@deepseek-ai/dsh-runtime":"0.1.2-rc.1","@deepseek-ai/cordis-plugin-group":"4.0.0"}}\\n' "$installed_version" > "$prefix/node_modules/@deepseek-ai/dsh/package.json"
+if [ ! -f "${join(root, "pnpm-skip-dependency")}" ]; then
+  /bin/mkdir -p "$prefix/node_modules/@deepseek-ai/cordis-plugin-group"
+  printf '%s\\n' '{"name":"@deepseek-ai/cordis-plugin-group","version":"4.0.0"}' > "$prefix/node_modules/@deepseek-ai/cordis-plugin-group/package.json"
+fi
+printf '%s\\n' "$*" > "${join(root, "npm-install-args")}"
+`);
+  executable(join(bin, "git"), overrides.git ?? 'if [ "${1:-}" = "--version" ]; then printf "git version 2.45.0\\n"; else printf "unexpected git invocation\\n" >&2; exit 1; fi');
   const dockerState = join(root, "docker-state");
   writeFileSync(`${dockerState}.image-id`, `${imageId}\n`);
   writeFileSync(`${dockerState}.security`, '["name=seccomp,profile=builtin","name=cgroupns"]\n');
@@ -153,14 +174,16 @@ case "\${1:-}" in
     ;;
   build)
     iidfile=""
-    harness_commit=""; dsh_sha=""; project_sha=""
+    harness_package=""; harness_version=""; harness_runtime_sha=""; dsh_sha=""; project_sha=""
     context=""
     while [ "$#" -gt 0 ]; do
       if [ "$1" = "--iidfile" ]; then iidfile="$2"; shift 2; continue; fi
       if [ "$1" = "--label" ]; then
         key=\${2%%=*}; value=\${2#*=}
         case "$key" in
-          org.maze-arena.harness-commit) harness_commit="$value" ;;
+          org.maze-arena.harness-package) harness_package="$value" ;;
+          org.maze-arena.harness-version) harness_version="$value" ;;
+          org.maze-arena.harness-runtime-sha256) harness_runtime_sha="$value" ;;
           org.maze-arena.dsh-sha256) dsh_sha="$value" ;;
           org.maze-arena.project-artifact-sha256) project_sha="$value" ;;
         esac
@@ -168,13 +191,13 @@ case "\${1:-}" in
       fi
       context="$1"; shift
     done
-    [ -f "$context/harness-runtime/package.json" ] || { printf "missing harness runtime\\n" >&2; exit 1; }
-    [ -f "$context/harness-runtime/node_modules/runtime-dependency/package.json" ] || { printf "missing runtime dependency\\n" >&2; exit 1; }
+    [ -f "$context/harness-runtime/node_modules/@deepseek-ai/dsh/package.json" ] || { printf "missing harness runtime\\n" >&2; exit 1; }
+    [ -f "$context/harness-runtime/node_modules/@deepseek-ai/cordis-plugin-group/package.json" ] || { printf "missing vendor runtime dependency\\n" >&2; exit 1; }
     found_runtime=""; found_link=""
     while IFS= read -r line; do
       case "$line" in
         "COPY harness-runtime /opt/deepseek-harness") found_runtime=1 ;;
-        *"ln -s /opt/deepseek-harness/dist/dsh /usr/local/bin/dsh"*) found_link=1 ;;
+        *"ln -s /opt/deepseek-harness/node_modules/@deepseek-ai/dsh/lib/bin.js /usr/local/bin/dsh"*) found_link=1 ;;
       esac
     done < "$context/Dockerfile"
     [ -n "$found_runtime" ] && [ -n "$found_link" ] || { printf "invalid Dockerfile runtime payload\\n" >&2; exit 1; }
@@ -186,7 +209,7 @@ case "\${1:-}" in
       printf "orphan solver artifact copied into image context\\n" >&2; exit 1
     fi
     while IFS= read -r line; do printf '%s\\n' "$line"; done < "${dockerState}.image-id" > "$iidfile"
-    printf '{"org.maze-arena.harness-commit":"%s","org.maze-arena.dsh-sha256":"%s","org.maze-arena.project-artifact-sha256":"%s"}\\n' "$harness_commit" "$dsh_sha" "$project_sha" > "${dockerState}.labels"
+    printf '{"org.maze-arena.harness-package":"%s","org.maze-arena.harness-version":"%s","org.maze-arena.harness-runtime-sha256":"%s","org.maze-arena.dsh-sha256":"%s","org.maze-arena.project-artifact-sha256":"%s"}\\n' "$harness_package" "$harness_version" "$harness_runtime_sha" "$dsh_sha" "$project_sha" > "${dockerState}.labels"
     ;;
   image)
     if [ -f "${dockerState}.missing" ]; then printf "no such image\\n" >&2; exit 1; fi
@@ -199,19 +222,69 @@ case "\${1:-}" in
     ;;
   run)
     arguments=" $* "
-    role=""
+    role=""; smoke_source=""; container_name=""; previous=""
+    for argument in "$@"; do
+      case "$argument" in
+        --mount=type=bind,src=*,dst=/arena-source,readonly)
+          smoke_source=\${argument#--mount=type=bind,src=}; smoke_source=\${smoke_source%%,dst=*} ;;
+      esac
+      if [ "$previous" = "--name" ]; then container_name="$argument"; fi
+      previous="$argument"
+    done
     case "$arguments" in *" --env=MAZE_MATCH_ROLE=generator "*) role=generator ;; esac
     case "$arguments" in *" --env=MAZE_MATCH_ROLE=solver "*) role=solver ;; esac
     [ -n "$role" ] || { printf "missing smoke role\\n" >&2; exit 1; }
-    for required in "--network=none" "--read-only" "--cap-drop=ALL" "--env=DSH_HOME=/arena"; do
+    for required in "--interactive" "--network=none" "--read-only" "--cap-drop=ALL" "--env=DSH_HOME=/arena" "--env=MAZE_MATCH_PROFILE_SOURCE=/arena-source" "--tmpfs=/arena:rw,noexec,nosuid,size=32m,mode=0700,uid=65532,gid=65532"; do
       case "$arguments" in *" $required "*) ;; *) printf "missing smoke argument %s\\n" "$required" >&2; exit 1 ;; esac
     done
-    case "$arguments" in *" --mount=type=bind,src="*",dst=/arena,readonly "*) ;; *) printf "missing smoke profile mount\\n" >&2; exit 1 ;; esac
-    case "$arguments" in *" dsh --profile maze-match-$role ") ;; *) printf "missing smoke profile command\\n" >&2; exit 1 ;; esac
+    case "$arguments" in *" --mount=type=bind,src="*",dst=/arena-source,readonly "*) ;; *) printf "missing smoke profile mount\\n" >&2; exit 1 ;; esac
+    /bin/grep -q '"patchReload": "startup"' "$smoke_source/profiles/maze-match-$role/package.json" || { printf "missing startup patch reload\\n" >&2; exit 1; }
+    case "$arguments" in *" node /opt/maze-arena/packages/match-profile/dist/container-launcher.js dsh --profile maze-match-$role ") ;; *) printf "missing smoke profile command\\n" >&2; exit 1 ;; esac
     if [ -f "${dockerState}.handshake-fail" ]; then printf "profile load failed\\n" >&2; exit 1; fi
     if [ "$role" = "solver" ] && [ -f "${dockerState}.solver-handshake-fail" ]; then printf "solver profile load failed\\n" >&2; exit 1; fi
-    printf '%s\\n' "$role" >> "${dockerState}.handshake-roles"
     printf '{"type":"match-profile.ready","protocolVersion":1,"role":"%s"}\\n' "$role"
+    if [ -f "${dockerState}.post-ready-fail" ]; then printf "hmr failed\\n" >&2; exit 42; fi
+    IFS= read -r request || { printf "missing smoke request\\n" >&2; exit 1; }
+    if [ "$role" = "generator" ]; then
+      case "$request" in *'"requestId":"image-smoke-generator"'*'"type":"generator.start"'*) ;; *) printf "invalid generator smoke request\\n" >&2; exit 1 ;; esac
+      printf '{"protocolVersion":1,"requestId":"image-smoke-generator","sequence":1,"role":"generator","payload":{"type":"generator.carve","from":{"x":0,"y":0},"to":{"x":1,"y":0}}}\\n'
+    else
+      case "$request" in *'"requestId":"image-smoke-solver"'*'"type":"solver.start"'*) ;; *) printf "invalid solver smoke request\\n" >&2; exit 1 ;; esac
+      printf '{"protocolVersion":1,"requestId":"image-smoke-solver","sequence":1,"role":"solver","payload":{"type":"solver.ready"}}\\n'
+    fi
+    if IFS= read -r extra; then printf "unexpected extra smoke request\\n" >&2; exit 1; fi
+    printf '%s\\n' "$role" >> "${dockerState}.handshake-roles"
+    if [ -f "${dockerState}.natural-smoke-exit-zero" ] || [ -f "${dockerState}.kill-not-running" ]; then exit 0; fi
+    while [ ! -f "${dockerState}.term-$container_name" ]; do /bin/sleep 0.05; done
+    if [ -f "${dockerState}.smoke-exit-zero" ]; then exit 0; fi
+    exit 143
+    ;;
+  kill)
+    printf 'kill\\n' >> "${dockerState}.cleanup-calls"
+    container_name="\${3:-}"
+    [ -n "$container_name" ] || { printf "missing container name\\n" >&2; exit 1; }
+    if [ -f "${dockerState}.natural-smoke-exit-zero" ]; then printf 'Error response from daemon: No such container: %s\\n' "$container_name" >&2; exit 1; fi
+    if [ -f "${dockerState}.kill-not-running" ]; then printf 'Error response from daemon: cannot kill container: %s: container is not running\\n' "$container_name" >&2; exit 1; fi
+    if [ -f "${dockerState}.kill-fail" ]; then printf 'kill denied\\n' >&2; exit 1; fi
+    if [ ! -f "${dockerState}.ignore-smoke-sigterm" ]; then printf 'TERM\\n' > "${dockerState}.term-$container_name"; fi
+    exit 0
+    ;;
+  rm)
+    printf 'rm\\n' >> "${dockerState}.cleanup-calls"
+    if [ -f "${dockerState}.rm-fail" ]; then printf 'permission denied\\n' >&2; exit 1; fi
+    exit 0
+    ;;
+  inspect)
+    printf 'inspect\\n' >> "${dockerState}.cleanup-calls"
+    if [ -f "${dockerState}.inspect-daemon-fail" ]; then printf 'cannot connect to daemon\\n' >&2; exit 1; fi
+    if [ -f "${dockerState}.inspect-reappear" ]; then
+      if [ ! -f "${dockerState}.inspect-once" ]; then
+        printf '1\\n' > "${dockerState}.inspect-once"
+      elif [ ! -f "${dockerState}.inspect-reappeared" ]; then
+        printf '1\\n' > "${dockerState}.inspect-reappeared"; exit 0
+      fi
+    fi
+    printf 'no such object\\n' >&2; exit 1
     ;;
   *) printf "unexpected docker command\\n" >&2; exit 1 ;;
 esac`);
@@ -223,6 +296,8 @@ home, profile, *artifacts = sys.argv[1:]
 profile_root = os.path.join(home, "profiles", profile)
 dependencies = {}
 bundles = []
+lock_dependencies = {}
+lock_packages = {}
 shutil.rmtree(os.path.join(profile_root, "node_modules"), ignore_errors=True)
 for artifact in artifacts:
     with open(os.path.join(artifact, "package.json"), encoding="utf8") as stream:
@@ -230,24 +305,39 @@ for artifact in artifacts:
     name = manifest["name"]
     dependencies[name] = "file:" + artifact
     bundles.append(name)
+    reference = "file:" + os.path.relpath(artifact, profile_root)
+    key = name + "@" + reference
+    lock_dependencies[name] = {"specifier": "file:" + artifact, "version": reference}
+    lock_packages[key] = {"resolution": {"directory": reference[5:], "type": "directory"}}
+    store = os.path.join(profile_root, "node_modules", ".pnpm", name.replace("/", "+") + "@file+fixture", "node_modules", *name.split("/"))
+    os.makedirs(os.path.dirname(store), exist_ok=True)
+    shutil.copytree(artifact, store)
     target = os.path.join(profile_root, "node_modules", *name.split("/"))
     os.makedirs(os.path.dirname(target), exist_ok=True)
-    os.symlink(artifact, target, target_is_directory=True)
+    os.symlink(os.path.relpath(store, os.path.dirname(target)), target, target_is_directory=True)
 with open(os.path.join(profile_root, "package.json"), "w", encoding="utf8") as stream:
     json.dump({
         "name": "dsh-profile-" + profile,
         "private": True,
         "dependencies": dependencies,
-        "dsh": {"profile": {"bundles": bundles}},
+        "dsh": {"profile": {"bundles": bundles, "patchReload": "startup"}},
+    }, stream, indent=2)
+    stream.write("\\n")
+with open(os.path.join(profile_root, "pnpm-lock.yaml"), "w", encoding="utf8") as stream:
+    json.dump({
+        "lockfileVersion": "9.0",
+        "importers": {".": {"dependencies": lock_dependencies}},
+        "packages": lock_packages,
+        "snapshots": {key: {} for key in lock_packages},
     }, stream, indent=2)
     stream.write("\\n")
 `);
   executable(dsh, overrides.dsh ?? `
 if [ "\${1:-}" = "--version" ]; then
-  if [ -f "${join(root, "dsh-opaque-version")}" ]; then printf "opaque-dsh-b29e84da\\n"; else printf "dsh 2026.09.1\\n"; fi
+  if [ -f "${join(root, "dsh-opaque-version")}" ]; then printf "opaque-dsh-b29e84da\\n"; else printf "0.1.2-rc.1\\n"; fi
   exit 0
 fi
-if [ "\${1:-}" = "models" ] && [ "\${2:-}" = "export" ]; then
+if [ "\${1:-}" = "--profile" ] && [ "\${2:-}" = "sdk" ] && [ "\${3:-}" = "--dump-default-config" ]; then
   while IFS= read -r line; do printf '%s\\n' "$line"; done < "${modelExport}";
   exit 0
 fi
@@ -255,6 +345,7 @@ if [ -f "\${DSH_HOME}/plugin-fail" ] && [ "\${1:-}" = "plugin" ]; then
   printf "opaque-c7d19a42\\n" >&2; exit 7
 fi
 if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "--profile" ] && [ "\${4:-}" = "add" ]; then
+  [ "$(pnpm --version)" = "10.15.0" ] || { printf "frozen pnpm unavailable\\n" >&2; exit 41; }
   profile="$3"; shift 4
   artifacts=""
   for argument in "$@"; do
@@ -268,7 +359,6 @@ printf "unexpected dsh command\\n" >&2; exit 1`);
     root,
     home,
     bin,
-    harness,
     dsh,
     nodePrelude,
     env: {
@@ -424,16 +514,13 @@ function waitForProcessExit(pid: number, timeout = 2_000): boolean {
 }
 
 function install(fixture: Fixture) {
-  return installAtCommit(fixture, harnessCommit);
+  return installVersion(fixture, dshVersion);
 }
 
-function installAtCommit(fixture: Fixture, commit: string) {
+function installVersion(fixture: Fixture, version: string) {
   return run(fixture, [
     "install",
-    "--harness-source", fixture.harness,
-    "--harness-commit", commit,
-    "--dsh-executable", fixture.dsh,
-    "--dsh-version", "dsh 2026.09.1",
+    "--dsh-version", version,
   ]);
 }
 
@@ -446,10 +533,9 @@ function syncModels(fixture: Fixture) {
 }
 
 function prepareBuiltImageFixture(prepareRuntime?: (fixture: Fixture) => void): Fixture {
-  const initialized = initializeRuntimeHarnessRepository(createFixture());
-  const { fixture, commit } = initialized;
+  const fixture = createFixture();
   prepareRuntime?.(fixture);
-  expect(installAtCommit(fixture, commit).status).toBe(0);
+  expect(install(fixture).status).toBe(0);
   const result = buildImage(fixture);
   expect(result.status, result.stderr).toBe(0);
   const sync = syncModels(fixture);
@@ -457,7 +543,102 @@ function prepareBuiltImageFixture(prepareRuntime?: (fixture: Fixture) => void): 
   return fixture;
 }
 
+function replaceFrozenCredentialReference(fixture: Fixture, name: string): void {
+  const modelsRoot = join(fixture.root, "data/maze-arena/models");
+  const current = join(modelsRoot, "current");
+  const release = realpathSync(current);
+  const catalog = JSON.parse(readFileSync(join(release, "catalog.json"), "utf8"));
+  const runtime = JSON.parse(readFileSync(join(release, "model-export.json"), "utf8"));
+  const settings = JSON.parse(readFileSync(join(release, "settings.yaml"), "utf8"));
+  catalog.credentialRefs[0] = `dsh-credential://${name}`;
+  runtime.credentialRefs[0] = `dsh-credential://${name}`;
+  runtime.runtimeProviders[0].credentialRef = `dsh-credential://${name}`;
+  settings["llm-pi-ai"].providers["vendor-a"].apiKeyEnv = name;
+  const serialized = [catalog, runtime, settings].map((value) => `${JSON.stringify(value, null, 2)}\n`);
+  const digest = createHash("sha256").update(serialized[0]!).update("\0").update(serialized[1]!)
+    .update("\0").update(serialized[2]!).digest("hex");
+  const forged = join(modelsRoot, "releases", digest);
+  mkdirSync(forged, { mode: 0o700 });
+  const files: Array<[string, string]> = [
+    ["catalog.json", serialized[0]!],
+    ["model-export.json", serialized[1]!],
+    ["settings.yaml", serialized[2]!],
+  ];
+  for (const [file, contents] of files) writeFileSync(join(forged, file), contents, { mode: 0o400 });
+  chmodSync(forged, 0o500);
+  rmSync(current);
+  symlinkSync(forged, current);
+}
+
 describe("正式运行 CLI 黑盒边界", () => {
+  it("仓库根 pnpm arena 将首个用户参数原样交给 CLI", () => {
+    const root = mkdtempSync(join(tmpdir(), "maze-root-arena-"));
+    const result = spawnSync("pnpm", ["arena", "status"], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        COREPACK_HOME: process.env.COREPACK_HOME ?? join(process.env.HOME!, ".cache", "node", "corepack"),
+        HOME: join(root, "home"),
+        XDG_CONFIG_HOME: join(root, "config"),
+        XDG_DATA_HOME: join(root, "data"),
+        XDG_STATE_HOME: join(root, "state"),
+      },
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("state/maze-arena/run/server.lock");
+    expect(result.stdout).toContain("node dist/cli.js status");
+    expect(`${result.stdout}${result.stderr}`).not.toContain("node dist/cli.js -- status");
+  });
+
+  it("正式金丝雀拒绝确定性夹具且不尝试降级运行", () => {
+    const fixture = createFixture();
+    fixture.env.DSH_EVOLUTION_EXECUTION_KIND = "deterministic-fixture";
+    const result = run(fixture, ["canary", "run"]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("只允许 executionKind=real-provider");
+    expect(existsSync(join(fixture.root, "data/maze-arena/canary-reports"))).toBe(false);
+  });
+
+  it("正式金丝雀在连接 Server 前关闭失败地限制预算边界", () => {
+    const fixture = createFixture();
+    const common = [
+      "canary", "run", "--name", "预算边界", "--provider", "vendor-a", "--model", "compact",
+      "--credential-ref", "dsh-credential://VENDOR_A_API_KEY", "--context-tokens", "2000", "--output-tokens", "500",
+    ];
+    for (const [tokenLimit, costLimit] of [["20000", "0.5"], ["640000", "5"]] as const) {
+      const accepted = run(fixture, [...common, "--token-limit", tokenLimit, "--cost-limit", costLimit]);
+      expect(accepted.status).toBe(1);
+      expect(accepted.stderr).toContain("请先完成 install、image build、models sync、backup create 与 start");
+      expect(accepted.stderr).not.toContain("令牌上限不得超过");
+      expect(accepted.stderr).not.toContain("成本上限不得超过");
+    }
+    let result = run(fixture, [...common, "--token-limit", "640001", "--cost-limit", "0.5"]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("令牌上限不得超过 640000");
+    result = run(fixture, [...common, "--token-limit", "640000", "--cost-limit", "5.01"]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("成本上限不得超过 5");
+    result = run(fixture, [
+      ...common.slice(0, -4), "--context-tokens", "256000", "--output-tokens", "64001",
+      "--token-limit", "640000", "--cost-limit", "5",
+    ]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("必须至少覆盖 Generator 与 Solver 两个会话");
+  });
+
+  it("正式金丝雀对未安装环境给出完整前置命令且不降级", () => {
+    const fixture = createFixture();
+    const result = run(fixture, [
+      "canary", "run", "--name", "未配置环境", "--provider", "vendor-a", "--model", "compact",
+      "--credential-ref", "dsh-credential://VENDOR_A_API_KEY", "--context-tokens", "2000", "--output-tokens", "500",
+      "--token-limit", "5000", "--cost-limit", "0.5",
+    ]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("请先完成 install、image build、models sync、backup create 与 start");
+    expect(result.stderr).not.toContain("fixture");
+  });
+
   it("backup create/verify/restore 以真实 SQLite 与 Git 谱系完成隔离恢复，doctor 检查最近完整备份", async () => {
     const fixture = prepareBuiltImageFixture();
     const databasePath = join(fixture.root, "data/maze-arena/maze-arena.sqlite");
@@ -564,7 +745,7 @@ describe("正式运行 CLI 黑盒边界", () => {
     });
     result = install(dshFixture);
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("dsh 版本不匹配：期望 dsh 2026.09.1");
+    expect(result.stderr).toContain("dsh --version 与 npm 包版本不一致：期望 0.1.2-rc.1");
     expect(result.stderr).not.toContain("opaque-dsh-b29e84da");
   });
 
@@ -580,15 +761,18 @@ describe("正式运行 CLI 黑盒边界", () => {
     const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
     expect(catalog).toMatchObject({
       schemaVersion: 1,
-      harnessVersion: "dsh 2026.09.1",
-      credentialRefs: ["dsh-credential://vendor-a", "dsh-credential://vendor-b"],
+      harnessVersion: "0.1.2-rc.1",
+      credentialRefs: ["dsh-credential://VENDOR_A_API_KEY", "dsh-credential://VENDOR_B_API_KEY"],
       providers: [{ id: "vendor-a" }, { id: "vendor-b" }],
     });
     expect(statSync(dirname(catalogPath)).mode & 0o777).toBe(0o500);
     expect(statSync(catalogPath).mode & 0o777).toBe(0o400);
-    const exportPath = join(fixture.root, "data/maze-arena/harness/model-export.json");
+    const runtimeExportPath = join(dirname(catalogPath), "model-export.json");
+    expect(statSync(runtimeExportPath).mode & 0o777).toBe(0o400);
+    expect(JSON.parse(readFileSync(runtimeExportPath, "utf8")).runtimeProviders).toHaveLength(2);
+    const exportPath = join(fixture.root, "data/maze-arena/harness/settings.yaml");
     const replacement = JSON.parse(readFileSync(exportPath, "utf8"));
-    replacement.providers[0].label = "Vendor A Updated";
+    replacement["llm-pi-ai"].providers["vendor-a"].displayName = "Vendor A Updated";
     writeFileSync(exportPath, `${JSON.stringify(replacement)}\n`);
     expect(syncModels(fixture).status).toBe(0);
     expect(JSON.parse(readFileSync(catalogPath, "utf8")).providers[0].label).toBe("Vendor A Updated");
@@ -602,10 +786,10 @@ describe("正式运行 CLI 黑盒边界", () => {
     const socketPath = join(fixture.root, "model-export.sock");
     const socketMarker = join(fixture.root, "model-export-connected");
     const daemonIdentity = `maze-model-export-daemon-${fixture.root}`;
-    const exportPath = join(fixture.root, "data/maze-arena/harness/model-export.json");
+    const exportPath = join(fixture.root, "data/maze-arena/harness/settings.yaml");
     executable(fixture.dsh, `
-if [ "\${1:-}" = "--version" ]; then printf "dsh 2026.09.1\\n"; exit 0; fi
-if [ "\${1:-}" = "models" ] && [ "\${2:-}" = "export" ]; then
+if [ "\${1:-}" = "--version" ]; then printf "0.1.2-rc.1\\n"; exit 0; fi
+if [ "\${1:-}" = "--profile" ] && [ "\${2:-}" = "sdk" ] && [ "\${3:-}" = "--dump-default-config" ]; then
   runtime_attack="\${0%/*}/runtime-write-must-fail"
   printf escaped > ${JSON.stringify(externalMarker)} 2>/dev/null || :
   printf escaped > "$runtime_attack" 2>/dev/null || :
@@ -657,13 +841,15 @@ printf "unexpected dsh command\\n" >&2; exit 1`);
     const result = syncModels(fixture);
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("Harness runtime 冻结载荷身份已漂移");
+    expect(result.stderr).toContain("Harness 私有 runtime 载荷已漂移");
     expect(existsSync(join(fixture.root, "data/maze-arena/models/current"))).toBe(false);
   });
 
   it.each([
     ["release 权限变为 0700", (release: string) => chmodSync(release, 0o700)],
     ["catalog 权限变为 0600", (release: string) => chmodSync(join(release, "catalog.json"), 0o600)],
+    ["runtime 导出权限变为 0600", (release: string) => chmodSync(join(release, "model-export.json"), 0o600)],
+    ["Harness settings 权限变为 0600", (release: string) => chmodSync(join(release, "settings.yaml"), 0o600)],
   ] as const)("models sync 拒绝复用%s并保持旧 current", (_label, mutate) => {
     const fixture = createFixture();
     expect(install(fixture).status).toBe(0);
@@ -706,18 +892,18 @@ printf "unexpected dsh command\\n" >&2; exit 1`);
   });
 
   it.each([
-    ["schema 版本", (value: any) => { value.schemaVersion = 2; }, /schemaVersion/],
-    ["Harness 版本", (value: any) => { value.harnessVersion = "dsh 2026.08.9"; }, /版本不匹配/],
-    ["未知字段", (value: any) => { value.providers[0].models[0].capabilities.extra = true; }, /未知字段/],
-    ["非法能力", (value: any) => { value.providers[0].models[0].capabilities.maxTotalTokens = 1; }, /模型能力无效/],
-    ["非法凭据引用", (value: any) => { value.credentialRefs = ["plain-secret"]; }, /credentialRefs 无效/],
+    ["成本策略身份", (value: any) => { value["maze-arena-cost-policy"].id = "floating"; }, /模型导出失败/],
+    ["成本倍率", (value: any) => { value["maze-arena-cost-policy"].multipliers["vendor-a/compact"] = 0; }, /模型导出失败/],
+    ["模型结构", (value: any) => { value["llm-pi-ai"].providers["vendor-a"].models = []; }, /模型导出失败/],
+    ["非法能力", (value: any) => { value["llm-pi-ai"].providers["vendor-a"].models[0].contextWindow = 0; }, /模型导出失败/],
+    ["非法凭据引用", (value: any) => { value["llm-pi-ai"].providers["vendor-a"].apiKeyEnv = "vendor-a"; }, /模型导出失败/],
   ])("models sync 拒绝%s并保留旧目录", (_label, mutate, expected) => {
     const fixture = createFixture();
     expect(install(fixture).status).toBe(0);
     expect(syncModels(fixture).status).toBe(0);
     const catalogPath = join(fixture.root, "data/maze-arena/models/current/catalog.json");
     const before = readFileSync(catalogPath, "utf8");
-    const exportPath = join(fixture.root, "data/maze-arena/harness/model-export.json");
+    const exportPath = join(fixture.root, "data/maze-arena/harness/settings.yaml");
     const invalid = JSON.parse(readFileSync(exportPath, "utf8"));
     mutate(invalid);
     writeFileSync(exportPath, `${JSON.stringify(invalid)}\n`);
@@ -732,7 +918,7 @@ printf "unexpected dsh command\\n" >&2; exit 1`);
   it("失败时不把 Harness 原始秘密写入目录或命令输出", () => {
     const secret = "sk-live-ticket03-never-persist";
     const fixture = createFixture({ dsh: `
-if [ "\${1:-}" = "--version" ]; then printf "dsh 2026.09.1\\n"; exit 0; fi
+if [ "\${1:-}" = "--version" ]; then printf "0.1.2-rc.1\\n"; exit 0; fi
 printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
     expect(install(fixture).status).toBe(0);
 
@@ -755,9 +941,9 @@ printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
     expect(syncModels(fixture).status).toBe(0);
     const catalogPath = join(fixture.root, "data/maze-arena/models/current/catalog.json");
     const before = readFileSync(catalogPath, "utf8");
-    const exportPath = join(fixture.root, "data/maze-arena/harness/model-export.json");
+    const exportPath = join(fixture.root, "data/maze-arena/harness/settings.yaml");
     const invalid = JSON.parse(readFileSync(exportPath, "utf8"));
-    invalid.providers[0].label = `Vendor ${secret}`;
+    invalid["llm-pi-ai"].providers["vendor-a"].displayName = `Vendor ${secret}`;
     writeFileSync(exportPath, `${JSON.stringify(invalid)}\n`);
 
     const result = syncModels(fixture);
@@ -778,9 +964,9 @@ printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
     expect(syncModels(fixture).status).toBe(0);
     const catalogPath = join(fixture.root, "data/maze-arena/models/current/catalog.json");
     const before = readFileSync(catalogPath, "utf8");
-    const exportPath = join(fixture.root, "data/maze-arena/harness/model-export.json");
+    const exportPath = join(fixture.root, "data/maze-arena/harness/settings.yaml");
     const invalid = JSON.parse(readFileSync(exportPath, "utf8"));
-    invalid.providers[0].models[0].capabilities.providerOptions.apiKey = { type: "string" };
+    invalid["llm-pi-ai"].providers["vendor-a"].apiKey = "secret-capability";
     writeFileSync(exportPath, `${JSON.stringify(invalid)}\n`);
 
     const result = syncModels(fixture);
@@ -806,6 +992,9 @@ printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
     }
 
     const manifestPath = join(configRoot, "install-manifest.json");
+    const environmentPath = join(configRoot, "env");
+    expect(statSync(environmentPath).mode & 0o777).toBe(0o600);
+    expect(readFileSync(environmentPath, "utf8")).toContain("NAME=value");
     const text = readFileSync(manifestPath, "utf8");
     expect(statSync(manifestPath).mode & 0o777).toBe(0o600);
     expect(text).not.toMatch(/api.?key|secret|credential/i);
@@ -813,13 +1002,11 @@ printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
     expect(manifest).toMatchObject({
       schemaVersion: 1,
       harness: {
-        sourceDirectory: fixture.harness,
-        commit: harnessCommit,
+        packageName: "@deepseek-ai/dsh",
+        packageVersion: dshVersion,
         executable: {
-          sourcePath: fixture.dsh,
-          sourceRuntimeRoot: fixture.bin,
           payloadSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
-          version: "dsh 2026.09.1",
+          version: dshVersion,
           sha256: createHash("sha256").update(readFileSync(fixture.dsh)).digest("hex"),
         },
       },
@@ -827,9 +1014,243 @@ printf "provider rejected %s\\n" "${secret}" >&2; exit 7` });
     });
     expect(manifest.harness.executable.runtimeRoot)
       .toBe(join(dataRoot, "harness-runtimes", manifest.harness.executable.payloadSha256));
-    expect(manifest.harness.executable.path).toBe(join(manifest.harness.executable.runtimeRoot, "dsh"));
+    expect(manifest.harness.executable.path)
+      .toBe(join(manifest.harness.executable.runtimeRoot, "node_modules/@deepseek-ai/dsh/lib/bin.js"));
+    expect(statSync(join(manifest.harness.executable.runtimeRoot, "maze-arena/credential-environment-policy.js")).mode & 0o777)
+      .toBe(0o400);
+    expect(realpathSync(join(manifest.harness.executable.runtimeRoot, "node_modules/.bin/pnpm")))
+      .toBe(join(manifest.harness.executable.runtimeRoot, "node_modules/pnpm/bin/pnpm.cjs"));
+    expect(readFileSync(join(fixture.root, "npm-install-args"), "utf8")).toContain("pnpm@10.15.0");
     expect(resolve(dataRoot).startsWith(resolve(packageRoot))).toBe(false);
+    writeFileSync(environmentPath, "VENDOR_A_API_KEY=preserved-value\n", { mode: 0o600 });
     expect(install(fixture).status).toBe(0);
+    expect(readFileSync(environmentPath, "utf8")).toBe("VENDOR_A_API_KEY=preserved-value\n");
+  });
+
+  it("start 从用户 env 加载已登记凭据且显式进程环境优先，全链路不持久化秘密", () => {
+    const fixture = prepareBuiltImageFixture();
+    const environmentPath = join(fixture.root, "config/maze-arena/env");
+    const fileSecret = "opaque-file-secret-a91f";
+    const shadowedSecret = "opaque-shadowed-secret-b82e";
+    const processSecret = "opaque-process-secret-c73d";
+    writeFileSync(environmentPath, [
+      "# 自定义 provider 凭据",
+      `VENDOR_A_API_KEY=${fileSecret}`,
+      `VENDOR_B_API_KEY=${shadowedSecret}`,
+      "",
+    ].join("\n"), { mode: 0o600 });
+    chmodSync(environmentPath, 0o600);
+    fixture.env.VENDOR_B_API_KEY = processSecret;
+    fixture.env.MAZE_ARENA_PORT = "0";
+    try {
+      const result = run(fixture, ["start"]);
+      expect(result.status, result.stderr).toBe(0);
+      const statePath = join(fixture.root, "state/maze-arena/run/server.json");
+      const state = JSON.parse(readFileSync(statePath, "utf8"));
+      const environ = readFileSync(`/proc/${state.pid}/environ`, "utf8").split("\0");
+      expect(environ).toContain(`VENDOR_A_API_KEY=${fileSecret}`);
+      expect(environ).toContain(`VENDOR_B_API_KEY=${processSecret}`);
+      expect(environ).not.toContain(`VENDOR_B_API_KEY=${shadowedSecret}`);
+      const persisted = [
+        result.stdout,
+        result.stderr,
+        readFileSync(statePath, "utf8"),
+        readFileSync(state.logPath, "utf8"),
+        readFileSync(`/proc/${state.pid}/cmdline`, "utf8"),
+      ].join("\n");
+      for (const secret of [fileSecret, shadowedSecret, processSecret]) expect(persisted).not.toContain(secret);
+    } finally {
+      cleanupFixtureServer(fixture);
+    }
+  }, 30_000);
+
+  it("CUSTOM_CRED 只按冻结目录登记也能净化日志且不进入状态、数据库、Git 或备份", async () => {
+    const fixture = prepareBuiltImageFixture();
+    const settingsPath = join(fixture.root, "data/maze-arena/harness/settings.yaml");
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    settings["llm-pi-ai"].providers["vendor-a"].apiKeyEnv = "CUSTOM_CRED";
+    writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+    const synced = syncModels(fixture);
+    expect(synced.status, synced.stderr).toBe(0);
+
+    const secret = "s3cr3t";
+    const environmentPath = join(fixture.root, "config/maze-arena/env");
+    writeFileSync(environmentPath, `CUSTOM_CRED=${secret}\n`, { mode: 0o600 });
+    fixture.env.MAZE_ARENA_PORT = "0";
+    let state: { pid: number; port: number; logPath: string; databasePath: string } | undefined;
+    let startResult: ReturnType<typeof run> | undefined;
+    try {
+      startResult = run(fixture, ["start"]);
+      expect(startResult.status, startResult.stderr).toBe(0);
+      const statePath = join(fixture.root, "state/maze-arena/run/server.json");
+      const runningState = JSON.parse(readFileSync(statePath, "utf8")) as NonNullable<typeof state>;
+      state = runningState;
+      const request = spawnSync(process.execPath, ["-e", `fetch("http://127.0.0.1:${runningState.port}/api/health?note=${secret}")
+        .then(response => process.exit(response.status === 200 ? 0 : 1)).catch(() => process.exit(1));`]);
+      expect(request.status).toBe(0);
+      expect(readFileSync(`/proc/${runningState.pid}/cmdline`, "utf8")).not.toContain(secret);
+      expect(readFileSync(statePath, "utf8")).not.toContain(secret);
+    } finally {
+      cleanupFixtureServer(fixture);
+    }
+
+    expect(state).toBeDefined();
+    const log = readFileSync(state!.logPath, "utf8");
+    expect(log).toContain("[REDACTED]");
+    expect(log).not.toContain(secret);
+    const lineage = new PluginLineageRepository(
+      join(fixture.root, "data/maze-arena/lineages"),
+      state!.databasePath,
+    );
+    try {
+      await lineage.initialize("custom-credential-scan", "generator", join(repositoryRoot, "packages/generator-plugin"));
+      await lineage.initialize("custom-credential-scan", "solver", join(repositoryRoot, "packages/solver-plugin"));
+    } finally { lineage.close(); }
+    executable(join(fixture.bin, "git"), `exec "${realGit}" "$@"`);
+    const backup = run(fixture, ["backup", "create"]);
+    expect(backup.status, backup.stderr).toBe(0);
+    const persisted = [
+      startResult?.stdout ?? "",
+      startResult?.stderr ?? "",
+      backup.stdout,
+      backup.stderr,
+      ...readdirSync(join(fixture.root, "data/maze-arena"), { recursive: true })
+        .map((entry) => join(fixture.root, "data/maze-arena", String(entry)))
+        .filter((path) => existsSync(path) && statSync(path).isFile())
+        .map((path) => readFileSync(path)),
+      ...readdirSync(join(fixture.root, "state/maze-arena"), { recursive: true })
+        .map((entry) => join(fixture.root, "state/maze-arena", String(entry)))
+        .filter((path) => existsSync(path) && statSync(path).isFile())
+        .map((path) => readFileSync(path)),
+    ];
+    for (const value of persisted) expect(Buffer.from(value).includes(Buffer.from(secret))).toBe(false);
+  }, 30_000);
+
+  it("env 文件中的 NODE_OPTIONS 无法在 flock 二次 Node 启动前注入代码", () => {
+    const fixture = prepareBuiltImageFixture();
+    const environmentPath = join(fixture.root, "config/maze-arena/env");
+    const attackModule = join(fixture.root, "node-options-attack.cjs");
+    const marker = join(fixture.root, "node-options-executed");
+    writeFileSync(attackModule, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "executed")\n`);
+    writeFileSync(environmentPath, `NODE_OPTIONS=--require=${attackModule}\n`, { mode: 0o600 });
+
+    const result = run(fixture, ["start"]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("禁止把进程或运行控制变量登记为凭据");
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("start 拒绝冻结模型目录未登记的 env 名称", () => {
+    const fixture = prepareBuiltImageFixture();
+    const environmentPath = join(fixture.root, "config/maze-arena/env");
+    writeFileSync(environmentPath, "CUSTOM_CRED=opaque-unregistered-value\n", { mode: 0o600 });
+
+    const result = run(fixture, ["start"]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("冻结模型目录未登记的名称：CUSTOM_CRED");
+    expect(result.stderr).not.toContain("opaque-unregistered-value");
+  });
+
+  it.each([
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG", "LC_ALL", "TZ", "NODE_OPTIONS", "NODE_PATH", "LD_PRELOAD",
+    "BASH_ENV", "ENV", "PATH", "HOME", "ARENA_ATTACK", "DSH_ATTACK", "OPENSSL_MODULES",
+    "UV_THREADPOOL_SIZE", "NPM_TOKEN", "YARN_ENABLE_SCRIPTS", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
+  ])(
+    "models sync 拒绝把运行控制名 %s 登记成凭据",
+    (name) => {
+      const fixture = createFixture();
+      expect(install(fixture).status).toBe(0);
+      const settingsPath = join(fixture.root, "data/maze-arena/harness/settings.yaml");
+      const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+      settings["llm-pi-ai"].providers["vendor-a"].apiKeyEnv = name;
+      writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+
+      const result = syncModels(fixture);
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Harness 模型导出失败");
+      expect(existsSync(join(fixture.root, "data/maze-arena/models/current"))).toBe(false);
+    },
+  );
+
+  it.each([
+    "OPENSSL_MODULES", "UV_THREADPOOL_SIZE", "NPM_TOKEN", "YARN_ENABLE_SCRIPTS", "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+  ])("start 防御性拒绝内容与摘要均自洽但登记 %s 的恶意冻结目录", (name) => {
+    const fixture = prepareBuiltImageFixture();
+    replaceFrozenCredentialReference(fixture, name);
+    writeFileSync(join(fixture.root, "config/maze-arena/env"), `${name}=opaque-forged-value\n`, { mode: 0o600 });
+
+    const result = run(fixture, ["start"]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/credentialRefs 无效|凭据环境变量名|运行控制变量/);
+    expect(existsSync(join(fixture.root, "state/maze-arena/run/server.json"))).toBe(false);
+  });
+
+  it.each([
+    ["宽松权限", (path: string) => chmodSync(path, 0o640), "权限必须为 0600"],
+    ["符号链接", (path: string) => {
+      const target = `${path}.target`;
+      writeFileSync(target, "VENDOR_A_API_KEY=hidden\n", { mode: 0o600 });
+      rmSync(path);
+      symlinkSync(target, path);
+    }, "不得为符号链接"],
+    ["export 语法", (path: string) => writeFileSync(path, "export VENDOR_A_API_KEY=opaque-invalid-export\n", { mode: 0o600 }), "第 1 行格式无效"],
+    ["命令替换", (path: string) => writeFileSync(path, "VENDOR_A_API_KEY=$(opaque-invalid-command)\n", { mode: 0o600 }), "第 1 行格式无效"],
+    ["重复名称", (path: string) => writeFileSync(path, "VENDOR_A_API_KEY=first\nVENDOR_A_API_KEY=opaque-invalid-duplicate\n", { mode: 0o600 }), "第 2 行格式无效"],
+  ] as const)("start 拒绝凭据 env 的%s且错误不回显值", (_name, mutate, expected) => {
+    const fixture = prepareBuiltImageFixture();
+    const configRoot = join(fixture.root, "config/maze-arena");
+    const environmentPath = join(configRoot, "env");
+    mkdirSync(configRoot, { recursive: true, mode: 0o700 });
+    writeFileSync(environmentPath, "VENDOR_A_API_KEY=baseline\n", { mode: 0o600 });
+    mutate(environmentPath);
+
+    const result = run(fixture, ["start"]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(expected);
+    expect(result.stderr).not.toContain("opaque-invalid");
+  });
+
+  it("start 拒绝不属于当前用户的凭据 env", () => {
+    const fixture = prepareBuiltImageFixture();
+    const configRoot = join(fixture.root, "config/maze-arena");
+    const environmentPath = join(configRoot, "env");
+    mkdirSync(configRoot, { recursive: true, mode: 0o700 });
+    writeFileSync(environmentPath, "VENDOR_A_API_KEY=opaque-owner-secret\n", { mode: 0o600 });
+    const prelude = readFileSync(fixture.nodePrelude, "utf8");
+    writeFileSync(fixture.nodePrelude, `${prelude}\nconst actualUid=process.getuid();Object.defineProperty(process,"getuid",{value:()=>actualUid+1});\n`);
+
+    const result = run(fixture, ["start"]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("必须由当前用户拥有");
+    expect(result.stderr).not.toContain("opaque-owner-secret");
+  });
+
+  it("canary 自动加载用户 env，并在缺失或空凭据时于联网前关闭失败", () => {
+    const fixture = prepareBuiltImageFixture();
+    const configRoot = join(fixture.root, "config/maze-arena");
+    const environmentPath = join(configRoot, "env");
+    mkdirSync(configRoot, { recursive: true, mode: 0o700 });
+    const args = [
+      "canary", "run", "--name", "env preflight", "--provider", "vendor-a", "--model", "compact",
+      "--credential-ref", "dsh-credential://VENDOR_A_API_KEY", "--context-tokens", "2000", "--output-tokens", "500",
+      "--token-limit", "5000", "--cost-limit", "0.5",
+    ];
+    writeFileSync(environmentPath, "VENDOR_A_API_KEY=\n", { mode: 0o600 });
+    let result = run(fixture, args);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("VENDOR_A_API_KEY 未配置");
+    writeFileSync(environmentPath, "VENDOR_A_API_KEY=opaque-canary-secret\n", { mode: 0o600 });
+    result = run(fixture, args);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("已经由正式 start 启动且健康");
+    expect(`${result.stdout}${result.stderr}`).not.toContain("opaque-canary-secret");
   });
 
   it("install 的恶意 dsh 版本探测无法写正式路径、连接 Unix socket 或遗留派生进程", async () => {
@@ -860,7 +1281,7 @@ const finish = () => {
   if (finished) return;
   finished = true;
   socket.destroy();
-  process.stdout.write("dsh 2026.09.1\\n");
+  process.stdout.write("0.1.2-rc.1\\n");
 };
 socket.once("connect", finish);
 socket.once("error", finish);
@@ -904,9 +1325,25 @@ socket.setTimeout(200, finish);
     expect(result.stdout).toContain("检查通过：Node.js v22.12.0");
     expect(result.stdout).toContain("检查通过：Docker daemon 27.1.0");
     expect(result.stdout).toMatch(/检查通过：bubblewrap \d+\.\d+\.\d+ 文件系统隔离可用/);
-    expect(result.stdout).toContain("检查通过：Harness Unix socket 系统调用已隔离且 TCP 回环可用");
+    expect(result.stdout).toContain("检查通过：Harness Unix socket 外部连接已隔离且 TCP 回环可用");
     expect(result.stdout).toContain("检查通过：DeepSeek Harness 身份未漂移");
     expect(result.stdout).toContain(`检查通过：Match Profile 镜像 ${imageId}`);
+  });
+
+  it.each([
+    "generation_role_provider_attempt_receipts",
+    "generation_role_provider_usage_batches",
+  ])("doctor 拒绝正式数据库中的未发布 Repair66 中间表：%s", (table) => {
+    const fixture = prepareBuiltImageFixture();
+    const databasePath = join(fixture.root, "data/maze-arena/maze-arena.sqlite");
+    const database = new DatabaseSync(databasePath);
+    database.exec(`CREATE TABLE ${table} (marker TEXT)`);
+    database.close();
+
+    const result = run(fixture, ["doctor"]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("未发布的 Repair66 Provider usage 中间表");
   });
 
   it("start、status 与 stop 管理回环生产服务，并处理幂等、陈旧 PID、异常退出和秘密净化", async () => {
@@ -924,6 +1361,8 @@ socket.setTimeout(200, finish);
     expect(port).toBeLessThanOrEqual(65_535);
     expect(result.stdout).toContain(`http://127.0.0.1:${port}`);
     expect(result.stdout).not.toContain("sk-test-secret-value-123456");
+    expect(readFileSync(join(fixture.root, "data/maze-arena/harness/frozen-pnpm-executable"), "utf8").trim())
+      .toBe(join(firstState.harnessRuntimeRoot, "node_modules/.bin/pnpm"));
 
     result = run(fixture, ["start"]);
     expect(result.status, result.stderr).toBe(0);
@@ -934,7 +1373,7 @@ socket.setTimeout(200, finish);
     expect(result.stdout).toContain("进程：运行中");
     expect(result.stdout).toContain("HTTP：健康");
     expect(result.stdout).toContain(`数据库：${join(fixture.root, "data/maze-arena/maze-arena.sqlite")}`);
-    expect(result.stdout).toContain(`Harness：dsh 2026.09.1 @ ${git(fixture.harness, ["rev-parse", "HEAD"])}`);
+    expect(result.stdout).toContain("Harness：@deepseek-ai/dsh@0.1.2-rc.1");
     expect(result.stdout).toContain(`镜像摘要：${imageId}`);
 
     const web = spawnSync(process.execPath, ["-e", `fetch("http://127.0.0.1:${port}/").then(async r => {
@@ -998,7 +1437,7 @@ socket.setTimeout(200, finish);
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain("进程：已停止");
     expect(result.stdout).toContain(`数据库：${join(fixture.root, "data/maze-arena/maze-arena.sqlite")}`);
-    expect(result.stdout).toContain(`Harness：dsh 2026.09.1 @ ${git(fixture.harness, ["rev-parse", "HEAD"])}`);
+    expect(result.stdout).toContain("Harness：@deepseek-ai/dsh@0.1.2-rc.1");
     expect(result.stdout).toContain("模型目录版本：");
     expect(result.stdout).toContain(`镜像摘要：${imageId}`);
 
@@ -1007,7 +1446,7 @@ socket.setTimeout(200, finish);
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain("进程：已停止");
     expect(result.stdout).toContain(`数据库：${join(fixture.root, "data/maze-arena/maze-arena.sqlite")}`);
-    expect(result.stdout).toContain(`Harness：dsh 2026.09.1 @ ${git(fixture.harness, ["rev-parse", "HEAD"])}`);
+    expect(result.stdout).toContain("Harness：@deepseek-ai/dsh@0.1.2-rc.1");
     expect(result.stdout).toContain("模型目录版本：");
     expect(result.stdout).toContain(`镜像摘要：${imageId}`);
     expect(existsSync(processStatePath)).toBe(false);
@@ -1042,12 +1481,43 @@ socket.setTimeout(200, finish);
       writeFileSync(join(fixture.bin, "late-live-dependency.js"), "export const value = 'B';\n");
 
       expect(state.harnessRuntimeRoot).not.toBe(fixture.bin);
+      expect(state.modelReleaseRoot).not.toBe(dirname(realpathSync(join(fixture.root, "data/maze-arena/models/current/catalog.json"))));
       expect(readFileSync(state.harnessExecutablePath, "utf8")).toBe(frozenCommand);
       expect(existsSync(join(state.harnessRuntimeRoot, "late-live-dependency.js"))).toBe(false);
       expect(hashHarnessRuntimePayload(state.harnessRuntimeRoot)).toBe(state.harnessRuntimePayloadSha256);
+      const originalSettings = join(fixture.root, "data/maze-arena/models/current/settings.yaml");
+      chmodSync(originalSettings, 0o600);
+      writeFileSync(originalSettings, "{}\n");
       const status = run(fixture, ["status"]);
       expect(status.status, status.stderr).toBe(0);
       expect(status.stdout).toContain("HTTP：健康");
+    } finally {
+      cleanupFixtureServer(fixture);
+    }
+  }, 30_000);
+
+  it.each([
+    ["catalog 内容", (state: any) => {
+      chmodSync(state.modelReleaseRoot, 0o700);
+      chmodSync(state.modelCatalogPath, 0o600);
+      writeFileSync(state.modelCatalogPath, "{}\n");
+    }],
+    ["export 权限", (state: any) => chmodSync(state.modelExportPath, 0o600)],
+    ["settings 内容", (state: any) => {
+      chmodSync(state.modelReleaseRoot, 0o700);
+      chmodSync(state.modelSettingsPath, 0o600);
+      writeFileSync(state.modelSettingsPath, "{}\n");
+    }],
+  ] as const)("实例模型发布 %s 漂移时 status 关闭失败", (_label, mutate) => {
+    const fixture = prepareBuiltImageFixture();
+    fixture.env.MAZE_ARENA_PORT = "0";
+    try {
+      expect(run(fixture, ["start"]).status).toBe(0);
+      const state = JSON.parse(readFileSync(join(fixture.root, "state/maze-arena/run/server.json"), "utf8"));
+      mutate(state);
+      const result = run(fixture, ["status"]);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toMatch(/模型发布.*漂移/);
     } finally {
       cleanupFixtureServer(fixture);
     }
@@ -1063,11 +1533,7 @@ socket.setTimeout(200, finish);
     }],
     ["权限", "status", (state: any) => chmodSync(state.harnessExecutablePath, 0o777)],
   ] as const)("幂等 %s 漂移时 start/status 对冻结实例身份关闭失败", (_label, command, mutate) => {
-    const fixture = prepareBuiltImageFixture((prepared) => {
-      writeFileSync(join(prepared.bin, "link-target-a"), "A\n");
-      writeFileSync(join(prepared.bin, "link-target-b"), "B\n");
-      symlinkSync("link-target-a", join(prepared.bin, "runtime-link"));
-    });
+    const fixture = prepareBuiltImageFixture();
     fixture.env.MAZE_ARENA_PORT = "0";
     try {
       expect(run(fixture, ["start"]).status).toBe(0);
@@ -1139,6 +1605,10 @@ moduleBuiltin.syncBuiltinESMExports();
     expect(run(fixture, ["stop"]).status).toBe(0);
     const manifest = JSON.parse(readFileSync(join(fixture.root, "config/maze-arena/install-manifest.json"), "utf8"));
     cpSync(manifest.harness.executable.runtimeRoot, state.harnessRuntimeRoot, { recursive: true, verbatimSymlinks: true });
+    restoreDirectoryModes(manifest.harness.executable.runtimeRoot, state.harnessRuntimeRoot);
+    const modelRelease = realpathSync(join(fixture.root, "data/maze-arena/models/current"));
+    cpSync(modelRelease, state.modelReleaseRoot, { recursive: true, verbatimSymlinks: true });
+    restoreDirectoryModes(modelRelease, state.modelReleaseRoot);
 
     const streaming = spawn(process.execPath, ["-e", `
       const http = require("node:http");
@@ -1677,9 +2147,9 @@ setInterval(() => {}, 1000);
     expect(recovered.stdout).toContain("进程：已停止");
   }, 30_000);
 
-  it("从锁定 Harness 与当前构建产物构建镜像并保存 Docker 实际摘要", () => {
-    const { fixture, commit } = initializeRuntimeHarnessRepository(createFixture());
-    expect(installAtCommit(fixture, commit).status).toBe(0);
+  it("从冻结 npm Harness runtime 与当前构建产物构建镜像并保存 Docker 实际摘要", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
 
     const result = buildImage(fixture);
     expect(result.status, result.stderr).toBe(0);
@@ -1688,7 +2158,9 @@ setInterval(() => {}, 1000);
     expect(manifest.matchProfile).toMatchObject({
       imageId,
       imageReference: imageId,
-      harnessCommit: commit,
+      harnessPackage: "@deepseek-ai/dsh",
+      harnessPackageVersion: dshVersion,
+      harnessRuntimePayloadSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
       dshExecutableSha256: createHash("sha256").update(readFileSync(fixture.dsh)).digest("hex"),
       resourcePolicy: {
         network: "none",
@@ -1701,9 +2173,21 @@ setInterval(() => {}, 1000);
     expect(readFileSync(join(fixture.root, "docker-state.handshake-roles"), "utf8")).toBe("generator\nsolver\n");
   });
 
+  it("镜像构建只复用冻结 runtime，不再次调用 npm 或 Harness 源码构建", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    const npmBefore = readFileSync(join(fixture.root, "npm-install-args"), "utf8");
+
+    const result = buildImage(fixture);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(readFileSync(join(fixture.root, "npm-install-args"), "utf8")).toBe(npmBefore);
+    expect(readFileSync(join(fixture.root, "pnpm-invocations"), "utf8")).not.toContain("scripts/release/pack.ts");
+  });
+
   it("Generator 源码已变化且 dist 陈旧时仍在哈希和复制前显式重建全部镜像包", () => {
-    const { fixture, commit } = initializeRuntimeHarnessRepository(createFixture());
-    expect(installAtCommit(fixture, commit).status).toBe(0);
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
     writeFileSync(join(fixture.root, "generator-source-changed"), "new source\n");
     writeFileSync(join(fixture.root, "generator-stale-dist"), "old artifact\n");
 
@@ -1721,8 +2205,8 @@ setInterval(() => {}, 1000);
 
   it("清理 Generator dist 孤儿文件后再构建、哈希并复制镜像产物", () => {
     const orphan = join(repositoryRoot, "packages/generator-plugin/dist/orphan.js");
-    const { fixture, commit } = initializeRuntimeHarnessRepository(createFixture());
-    expect(installAtCommit(fixture, commit).status).toBe(0);
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
     writeFileSync(orphan, "stale orphan artifact\n");
     writeFileSync(join(fixture.root, "reject-generator-orphan"), "1\n");
     try {
@@ -1736,8 +2220,8 @@ setInterval(() => {}, 1000);
 
   it("清理 Solver dist 孤儿文件后再构建、哈希并复制镜像产物", () => {
     const orphan = join(repositoryRoot, "packages/solver-plugin/dist/orphan.js");
-    const { fixture, commit } = initializeRuntimeHarnessRepository(createFixture());
-    expect(installAtCommit(fixture, commit).status).toBe(0);
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
     writeFileSync(orphan, "stale solver artifact\n");
     writeFileSync(join(fixture.root, "reject-solver-orphan"), "1\n");
     try {
@@ -1749,41 +2233,157 @@ setInterval(() => {}, 1000);
     }
   });
 
-  it("Harness 生产部署缺少运行依赖时拒绝构建镜像", () => {
-    const { fixture, commit } = initializeRuntimeHarnessRepository(createFixture());
-    expect(installAtCommit(fixture, commit).status).toBe(0);
-    writeFileSync(join(fixture.root, "pnpm-skip-dependency"), "1\n");
+  it("npm 返回的实际包版本不符时拒绝发布安装清单", () => {
+    const fixture = createFixture();
+    writeFileSync(join(fixture.root, "npm-wrong-version"), "1\n");
 
-    const result = buildImage(fixture);
+    const result = install(fixture);
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("生产部署缺少运行依赖");
+    expect(result.stderr).toContain("npm 安装的 DSH 包版本漂移");
+    expect(existsSync(join(fixture.root, "config/maze-arena/install-manifest.json"))).toBe(false);
   });
 
   it("镜像内最小 Match Profile 无法完成 ready 握手时拒绝记录摘要", () => {
-    const { fixture, commit } = initializeRuntimeHarnessRepository(createFixture());
-    expect(installAtCommit(fixture, commit).status).toBe(0);
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
     writeFileSync(join(fixture.root, "docker-state.handshake-fail"), "1\n");
 
     const result = buildImage(fixture);
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("docker 检查失败（退出码 1）");
+    expect(result.stderr).toContain("generator Match Profile smoke 异常退出");
     expect(result.stderr).not.toContain("profile load failed");
     const manifest = JSON.parse(readFileSync(join(fixture.root, "config/maze-arena/install-manifest.json"), "utf8"));
     expect(manifest.matchProfile).toBeUndefined();
   });
 
   it("镜像内 Solver Match Profile 无法完成 ready 握手时拒绝记录摘要", () => {
-    const { fixture, commit } = initializeRuntimeHarnessRepository(createFixture());
-    expect(installAtCommit(fixture, commit).status).toBe(0);
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
     writeFileSync(join(fixture.root, "docker-state.solver-handshake-fail"), "1\n");
 
     const result = buildImage(fixture);
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("docker 检查失败（退出码 1）");
+    expect(result.stderr).toContain("solver Match Profile smoke 异常退出");
     expect(result.stderr).not.toContain("solver profile load failed");
     expect(readFileSync(join(fixture.root, "docker-state.handshake-roles"), "utf8")).toBe("generator\n");
     const manifest = JSON.parse(readFileSync(join(fixture.root, "config/maze-arena/install-manifest.json"), "utf8"));
     expect(manifest.matchProfile).toBeUndefined();
+  });
+
+  it("镜像 smoke 在 ready 后发生 HMR 式异常退出时拒绝记录摘要", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    writeFileSync(join(fixture.root, "docker-state.post-ready-fail"), "1\n");
+
+    const result = buildImage(fixture);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("generator Match Profile smoke 异常退出");
+    const manifest = JSON.parse(readFileSync(join(fixture.root, "config/maze-arena/install-manifest.json"), "utf8"));
+    expect(manifest.matchProfile).toBeUndefined();
+  });
+
+  it("镜像 smoke 完成响应后对长驻 DSH 发起受控 SIGTERM 关闭", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+
+    const result = buildImage(fixture);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(readFileSync(join(fixture.root, "docker-state.handshake-roles"), "utf8")).toBe("generator\nsolver\n");
+  });
+
+  it("镜像 smoke 接受真实 launcher 与官方 DSH 优雅关闭的 exit 0", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    writeFileSync(join(fixture.root, "docker-state.smoke-exit-zero"), "1\n");
+
+    const result = buildImage(fixture);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(readFileSync(join(fixture.root, "docker-state.handshake-roles"), "utf8")).toBe("generator\nsolver\n");
+  });
+
+  it("镜像 smoke 接受响应后容器自然 exit 0 且 SIGTERM 竞态返回容器不存在", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    writeFileSync(join(fixture.root, "docker-state.natural-smoke-exit-zero"), "1\n");
+
+    const result = buildImage(fixture);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(readFileSync(join(fixture.root, "docker-state.handshake-roles"), "utf8")).toBe("generator\nsolver\n");
+  });
+
+  it("镜像 smoke 接受响应后容器已退出且 SIGTERM 竞态返回未运行", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    writeFileSync(join(fixture.root, "docker-state.kill-not-running"), "1\n");
+
+    const result = buildImage(fixture);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(readFileSync(join(fixture.root, "docker-state.handshake-roles"), "utf8")).toBe("generator\nsolver\n");
+  });
+
+  it("镜像 smoke 拒绝未能发送到容器的 SIGTERM", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    writeFileSync(join(fixture.root, "docker-state.kill-fail"), "1\n");
+
+    const result = buildImage(fixture);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("generator Match Profile smoke 无法向容器发送 SIGTERM");
+  });
+
+  it("镜像 smoke 长驻 DSH 忽略 SIGTERM 时强制结束并清理容器", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    writeFileSync(join(fixture.root, "docker-state.ignore-smoke-sigterm"), "1\n");
+
+    const result = buildImage(fixture);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("generator Match Profile smoke 受控关闭超时");
+    expect(readFileSync(join(fixture.root, "docker-state.cleanup-calls"), "utf8")).toBe("kill\nrm\ninspect\ninspect\n");
+    const manifest = JSON.parse(readFileSync(join(fixture.root, "config/maze-arena/install-manifest.json"), "utf8"));
+    expect(manifest.matchProfile).toBeUndefined();
+  }, 30_000);
+
+  it("镜像 smoke 对 rm -f 权限故障关闭失败", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    writeFileSync(join(fixture.root, "docker-state.rm-fail"), "1\n");
+
+    const result = buildImage(fixture);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("generator Match Profile smoke 容器强制清理失败");
+  });
+
+  it("镜像 smoke 不把 inspect daemon 故障当作容器不存在", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    writeFileSync(join(fixture.root, "docker-state.inspect-daemon-fail"), "1\n");
+
+    const result = buildImage(fixture);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("generator Match Profile smoke 容器清理未确认");
+  });
+
+  it("镜像 smoke 容器短暂消失后重现时再次删除并双重确认", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    writeFileSync(join(fixture.root, "docker-state.inspect-reappear"), "1\n");
+
+    const result = buildImage(fixture);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(readFileSync(join(fixture.root, "docker-state.cleanup-calls"), "utf8")).toContain(
+      "kill\nrm\ninspect\ninspect\nrm\ninspect\ninspect\n",
+    );
   });
 
   it.each(["latest", "maze-arena/match-profile:1.0.0", "sha256:abcd"])(
@@ -1809,8 +2409,8 @@ setInterval(() => {}, 1000);
   });
 
   it("允许 registry 端口与无 tag 路径组成的摘要基础镜像引用", () => {
-    const { fixture, commit } = initializeRuntimeHarnessRepository(createFixture());
-    expect(installAtCommit(fixture, commit).status).toBe(0);
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
     const reference = `localhost:5000/runtime/node@sha256:${"a".repeat(64)}`;
     expect(buildImage(fixture, reference).status).toBe(0);
   });
@@ -1849,13 +2449,13 @@ setInterval(() => {}, 1000);
     const fixture = prepareBuiltImageFixture();
     const manifestPath = join(fixture.root, "config/maze-arena/install-manifest.json");
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-    manifest.matchProfile.harnessCommit = "f".repeat(40);
+    manifest.matchProfile.harnessPackageVersion = "0.1.2-rc.2";
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
     let result = run(fixture, ["doctor"]);
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("构建身份与当前安装清单不一致");
 
-    manifest.matchProfile.harnessCommit = manifest.harness.commit;
+    manifest.matchProfile.harnessPackageVersion = manifest.harness.packageVersion;
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
     writeFileSync(join(fixture.root, "docker-state.security"), '["name=cgroupns"]\n');
     result = run(fixture, ["doctor"]);
@@ -1900,55 +2500,88 @@ setInterval(() => {}, 1000);
     expect(result.stderr).not.toMatch(/download|clone|upgrade|installing/i);
   });
 
-  it("doctor 对 Harness 提交、可执行文件和精确版本漂移均关闭失败", () => {
+  it("doctor 对冻结 npm 包、入口和完整 runtime 漂移均关闭失败", () => {
     const fixture = createFixture();
     expect(install(fixture).status).toBe(0);
-
-    executable(join(fixture.bin, "git"), 'if [ "${1:-}" = "--version" ]; then printf "git version 2.45.0\\n"; else printf "ffffffffffffffffffffffffffffffffffffffff\\n"; fi');
-    let result = run(fixture, ["doctor"]);
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain("Harness 源码提交漂移");
-
-    executable(join(fixture.bin, "git"), `if [ "\${1:-}" = "--version" ]; then printf "git version 2.45.0\\n"; elif [ "\${3:-}" = "status" ]; then :; else printf "${harnessCommit}\\n"; fi`);
-    executable(fixture.dsh, 'printf "dsh 2026.09.2\\n"');
-    result = run(fixture, ["doctor"]);
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain("dsh 可执行文件内容漂移");
-
     const manifestPath = join(fixture.root, "config/maze-arena/install-manifest.json");
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-    manifest.harness.executable.sha256 = createHash("sha256").update(readFileSync(fixture.dsh)).digest("hex");
-    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
-    result = run(fixture, ["doctor"]);
+    const packagePath = join(manifest.harness.executable.runtimeRoot, "node_modules/@deepseek-ai/dsh/package.json");
+    const packageManifest = JSON.parse(readFileSync(packagePath, "utf8"));
+    packageManifest.version = "0.1.2-rc.2";
+    writeFileSync(packagePath, `${JSON.stringify(packageManifest)}\n`);
+    const result = run(fixture, ["doctor"]);
     expect(result.status).toBe(1);
-    expect(result.stderr).toMatch(/dsh 版本漂移|Harness runtime 冻结载荷身份已漂移/);
+    expect(result.stderr).toMatch(/npm 包身份|runtime 载荷/);
   });
 
-  it("doctor 拒绝把源码身份目录冒充独立的 Harness 运行载荷根", () => {
+  it("doctor 对冻结 pnpm 精确版本漂移关闭失败", () => {
+    const fixture = createFixture();
+    expect(install(fixture).status).toBe(0);
+    const manifestPath = join(fixture.root, "config/maze-arena/install-manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const packagePath = join(manifest.harness.executable.runtimeRoot, "node_modules/pnpm/package.json");
+    const packageManifest = JSON.parse(readFileSync(packagePath, "utf8"));
+    packageManifest.version = "10.15.1";
+    writeFileSync(packagePath, `${JSON.stringify(packageManifest)}\n`);
+
+    const result = run(fixture, ["doctor"]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("冻结 pnpm 包身份不一致，要求 pnpm@10.15.0");
+  });
+
+  it("doctor 拒绝把 Arena 私有目录之外的路径冒充冻结 runtime", () => {
     const fixture = prepareBuiltImageFixture();
     const manifestPath = join(fixture.root, "config/maze-arena/install-manifest.json");
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-    expect(manifest.harness.executable.sourceRuntimeRoot).toBe(fixture.bin);
     expect(manifest.harness.executable.runtimeRoot)
       .toBe(join(fixture.root, "data/maze-arena/harness-runtimes", manifest.harness.executable.payloadSha256));
-    expect(manifest.harness.executable.runtimeRoot).not.toBe(manifest.harness.sourceDirectory);
-    manifest.harness.executable.runtimeRoot = manifest.harness.sourceDirectory;
+    manifest.harness.executable.runtimeRoot = fixture.bin;
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
 
     const result = run(fixture, ["doctor"]);
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("Harness runtime root 漂移");
+    expect(result.stderr).toMatch(/DSH npm package.json|Harness 私有 runtime/);
   });
 
   it("doctor 拒绝安装后漂移的 Harness 运行依赖载荷", () => {
     const fixture = prepareBuiltImageFixture();
-    writeFileSync(join(fixture.bin, "late-runtime-dependency.js"), "export const changed = true;\n");
+    const manifest = JSON.parse(readFileSync(join(fixture.root, "config/maze-arena/install-manifest.json"), "utf8"));
+    writeFileSync(join(manifest.harness.executable.runtimeRoot, "late-runtime-dependency.js"), "export const changed = true;\n");
 
     const result = run(fixture, ["doctor"]);
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toMatch(/Harness runtime (?:来源载荷内容漂移|冻结载荷身份已漂移)/);
+    expect(result.stderr).toMatch(/Harness 私有 runtime 载荷已漂移/);
+  });
+
+  it.each([
+    ["权限漂移", (release: string) => chmodSync(join(release, "settings.yaml"), 0o600)],
+    ["内容漂移", (release: string) => {
+      const path = join(release, "settings.yaml");
+      chmodSync(path, 0o600);
+      writeFileSync(path, `${readFileSync(path, "utf8")}\n`);
+      chmodSync(path, 0o400);
+    }],
+    ["符号链接替换", (release: string) => {
+      const path = join(release, "settings.yaml");
+      const replacement = join(dirname(dirname(release)), "external-settings.yaml");
+      writeFileSync(replacement, readFileSync(path, "utf8"), { mode: 0o400 });
+      chmodSync(release, 0o700);
+      rmSync(path);
+      symlinkSync(replacement, path, "file");
+      chmodSync(release, 0o500);
+    }],
+  ] as const)("doctor 对不可变 Harness settings 的%s关闭失败", (_label, mutate) => {
+    const fixture = prepareBuiltImageFixture();
+    const release = realpathSync(join(fixture.root, "data/maze-arena/models/current"));
+    mutate(release);
+
+    const result = run(fixture, ["doctor"]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Harness 模型目录无效");
   });
 
   it("doctor 拒绝权限过宽的敏感目录", () => {
@@ -1969,13 +2602,7 @@ setInterval(() => {}, 1000);
       const result = run({
         ...fixture,
         env: { ...fixture.env, [name]: relativeRoot },
-      }, [
-        "install",
-        "--harness-source", fixture.harness,
-        "--harness-commit", harnessCommit,
-        "--dsh-executable", fixture.dsh,
-        "--dsh-version", "dsh 2026.09.1",
-      ]);
+      }, ["install", "--dsh-version", dshVersion]);
 
       expect(result.status).toBe(1);
       expect(result.stderr).toContain(`${name} 必须是绝对路径`);
@@ -1995,13 +2622,7 @@ setInterval(() => {}, 1000);
         XDG_DATA_HOME: undefined,
         XDG_STATE_HOME: undefined,
       },
-    }, [
-      "install",
-      "--harness-source", fixture.harness,
-      "--harness-commit", harnessCommit,
-      "--dsh-executable", fixture.dsh,
-      "--dsh-version", "dsh 2026.09.1",
-    ]);
+    }, ["install", "--dsh-version", dshVersion]);
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("HOME 必须是绝对路径");
@@ -2016,13 +2637,7 @@ setInterval(() => {}, 1000);
       const result = run({
         ...fixture,
         env: { ...fixture.env, [name]: repositoryRoot },
-      }, [
-        "install",
-        "--harness-source", fixture.harness,
-        "--harness-commit", harnessCommit,
-        "--dsh-executable", fixture.dsh,
-        "--dsh-version", "dsh 2026.09.1",
-      ]);
+      }, ["install", "--dsh-version", dshVersion]);
 
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("目录不得位于 Maze Arena 源码仓库内");
@@ -2038,54 +2653,29 @@ setInterval(() => {}, 1000);
     const result = run({
       ...fixture,
       env: { ...fixture.env, XDG_DATA_HOME: sourceLink },
-    }, [
-      "install",
-      "--harness-source", fixture.harness,
-      "--harness-commit", harnessCommit,
-      "--dsh-executable", fixture.dsh,
-      "--dsh-version", "dsh 2026.09.1",
-    ]);
+    }, ["install", "--dsh-version", dshVersion]);
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("数据目录不得位于 Maze Arena 源码仓库内");
     expect(existsSync(forbiddenRoot)).toBe(false);
   });
 
-  it.each([
-    ["tracked unstaged", (fixture: Fixture) => writeFileSync(join(fixture.harness, "README.md"), "changed\n")],
-    ["staged", (fixture: Fixture) => {
-      writeFileSync(join(fixture.harness, "README.md"), "staged\n");
-      git(fixture.harness, ["add", "README.md"]);
-    }],
-    ["untracked", (fixture: Fixture) => writeFileSync(join(fixture.harness, "untracked.txt"), "new\n")],
-  ] as const)("工作树存在 %s 变化时拒绝 install", (_kind, makeDirty) => {
+  it.each(["latest", "next", "^0.1.2", "~0.1.2", ">=0.1.2", "file:../dsh", "git+https://example.invalid/dsh.git", "https://example.invalid/dsh.tgz"])(
+    "install 拒绝非精确 npm 版本 %s，且不调用 npm",
+    (version) => {
     const fixture = createFixture();
-    const commit = initializeHarnessRepository(fixture);
-    makeDirty(fixture);
-
-    const result = installAtCommit(fixture, commit);
+    const result = installVersion(fixture, version);
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("Harness 源码工作树不干净");
+    expect(result.stderr).toContain("必须是精确 SemVer");
+    expect(existsSync(join(fixture.root, "npm-install-args"))).toBe(false);
     expect(existsSync(join(fixture.root, "config/maze-arena/install-manifest.json"))).toBe(false);
   });
 
-  it("安装后出现 tracked 修改时 doctor 关闭失败", () => {
-    const fixture = createFixture();
-    const commit = initializeHarnessRepository(fixture);
-    expect(installAtCommit(fixture, commit).status).toBe(0);
-    writeFileSync(join(fixture.harness, "README.md"), "changed after install\n");
-
-    const result = run(fixture, ["doctor"]);
+  it("npm 安装失败时不发布清单并清理暂存目录", () => {
+    const fixture = createFixture({ npm: 'printf "install failed\\n" >&2; exit 9' });
+    const result = install(fixture);
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("Harness 源码工作树不干净");
-  });
-
-  it("Harness ignored 文件不视为源码身份漂移", () => {
-    const fixture = createFixture();
-    const commit = initializeHarnessRepository(fixture);
-    writeFileSync(join(fixture.harness, "ignored.log"), "local cache\n");
-
-    const result = installAtCommit(fixture, commit);
-    expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(join(fixture.root, "config/maze-arena/install-manifest.json"))).toBe(false);
+    expect(readdirSync(join(fixture.root, "state/maze-arena")).some((name) => name.startsWith(".harness-npm-install-"))).toBe(false);
   });
 });

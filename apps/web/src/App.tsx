@@ -36,7 +36,7 @@ export function App() {
   const [providerId, setProviderId] = useState("");
   const [modelId, setModelId] = useState("");
   const [credentialRef, setCredentialRef] = useState("");
-  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("medium");
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("off");
   const [temperature, setTemperature] = useState("");
   const [topP, setTopP] = useState("");
   const [contextTokens, setContextTokens] = useState("");
@@ -142,7 +142,7 @@ export function App() {
 
   function resetModelFields(model: HarnessModel | undefined) {
     if (!model) return;
-    setReasoningEffort(model.capabilities.reasoningEfforts[0] ?? "medium");
+    setReasoningEffort(model.capabilities.reasoningEfforts[0] ?? "off");
     setTemperature(model.capabilities.temperature ? String(model.capabilities.temperature.minimum) : "");
     setTopP(model.capabilities.topP ? String(model.capabilities.topP.maximum) : "");
     setContextTokens(String(Math.min(4_000, model.capabilities.maxContextTokens)));

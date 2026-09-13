@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import {
+  chmodSync,
   closeSync,
   lstatSync,
   mkdtempSync,
@@ -15,6 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
+import type { Duplex } from "node:stream";
 import {
   isSensitiveProviderOptionName,
   type HarnessAgentEnvironments,
@@ -25,17 +27,27 @@ import {
   type ProviderOptionCapability,
   type ProviderOptionValue,
 } from "@maze-arena/contracts";
+import {
+  credentialEnvironmentNameFromReference,
+} from "./credential-environment-policy.js";
+
+export {
+  credentialEnvironmentNameFromReference,
+  credentialEnvironmentNameIssue,
+} from "./credential-environment-policy.js";
 
 export interface HarnessAdapter {
   listModels(): HarnessCatalogResponse;
   validateModelProfile(input: ModelProfileInput): ModelProfile;
-  smokeModel?(profile: ModelProfile): Promise<{ providerText?: string }>;
+  smokeModel?(profile: ModelProfile): Promise<{ providerText?: string; usage: HarnessUsage }>;
   evolvePlugin?(request: HarnessEvolutionRequest): Promise<HarnessEvolutionResponse>;
 }
 
 export const HARNESS_EVOLUTION_PROTOCOL_VERSION = 1 as const;
 export const HARNESS_EVOLUTION_REQUEST_TYPE = "maze-arena.harness-evolution.request" as const;
 export const HARNESS_EVOLUTION_RESPONSE_TYPE = "maze-arena.harness-evolution.response" as const;
+/** 严格进化 Session 至少需要 read、edit 和最终 JSON 三个模型回合。 */
+export const MIN_EVOLUTION_SESSION_MODEL_CALLS = 3;
 /** 完整协议请求必须严格小于该字节数。 */
 export const HARNESS_EVOLUTION_MAX_REQUEST_BYTES = 1024 * 1024;
 /** 为会话、模型配置和诊断信息保留固定余量，可信反馈最多占用请求预算的一半。 */
@@ -51,6 +63,12 @@ export const HARNESS_EVOLUTION_MAX_STRATEGY_PLAN_BYTES = 8 * 1024;
 export const HARNESS_EVOLUTION_ALLOWED_TOOLS = Object.freeze([
   "read", "edit", "search", "shell", "test", "public-check", "submit",
 ] as const);
+
+export interface HarnessUsage {
+  tokens: number;
+  cost: number;
+  modelCalls?: number;
+}
 
 const SECCOMP_DATA_ARCH_OFFSET = 4;
 const SECCOMP_DATA_ARGUMENTS_OFFSET = 16;
@@ -69,12 +87,11 @@ const ISOLATED_FORCE_KILL_CONFIRMATION_MS = 1_000;
 interface SeccompArchitecture {
   auditArchitecture: number;
   socketSystemCall: number;
-  socketPairSystemCall: number;
 }
 
 const seccompArchitectures: Readonly<Record<string, SeccompArchitecture>> = Object.freeze({
-  x64: { auditArchitecture: 0xc000003e, socketSystemCall: 41, socketPairSystemCall: 53 },
-  arm64: { auditArchitecture: 0xc00000b7, socketSystemCall: 198, socketPairSystemCall: 199 },
+  x64: { auditArchitecture: 0xc000003e, socketSystemCall: 41 },
+  arm64: { auditArchitecture: 0xc00000b7, socketSystemCall: 198 },
 });
 
 /** 生成供 bubblewrap 使用的经典 BPF，阻断宿主路径和抽象命名空间中的 Unix socket。 */
@@ -88,10 +105,7 @@ export function createHarnessNetworkSeccompProgram(architecture: string = proces
     [0x20, 0, 0, 0],
     [0x35, 0, 1, X32_SYSCALL_BIT],
     [0x06, 0, 0, SECCOMP_RETURN_ERRNO | ERROR_FUNCTION_NOT_IMPLEMENTED],
-    [0x15, 1, 0, selected.socketSystemCall],
-    [0x15, 2, 5, selected.socketPairSystemCall],
-    [0x20, 0, 0, SECCOMP_DATA_ARGUMENTS_OFFSET],
-    [0x15, 2, 3, ADDRESS_FAMILY_UNIX],
+    [0x15, 0, 3, selected.socketSystemCall],
     [0x20, 0, 0, SECCOMP_DATA_ARGUMENTS_OFFSET],
     [0x15, 0, 1, ADDRESS_FAMILY_UNIX],
     [0x06, 0, 0, SECCOMP_RETURN_ERRNO | ERROR_ADDRESS_FAMILY_NOT_SUPPORTED],
@@ -152,6 +166,10 @@ export interface IsolatedHarnessCommandOptions {
   cwd?: string;
   writablePaths?: readonly string[];
   readOnlyPaths?: readonly string[];
+  privateReadOnlyFile?: string;
+  privateReadOnlyContents?: string;
+  /** 使用固定 FD 5 向可信父进程请求预算事务；子进程不会获得数据库路径。 */
+  privateDuplexHandler?: (request: unknown) => unknown;
   unshareCommand?: string;
   bubblewrapCommand?: string;
   signal?: AbortSignal;
@@ -160,6 +178,27 @@ export interface IsolatedHarnessCommandOptions {
 export interface IsolatedHarnessCommandResult {
   stdout: string;
   exitCode: number;
+}
+
+/** 将预算响应写回隔离子进程，并把同步与异步写失败收敛到调用方。 */
+export function writeBudgetLedgerResponse(
+  stream: Pick<Duplex, "write">,
+  response: unknown,
+  onError: () => void,
+): void {
+  let failed = false;
+  const fail = () => {
+    if (failed) return;
+    failed = true;
+    onError();
+  };
+  try {
+    stream.write(`${JSON.stringify(response)}\n`, (error?: Error | null) => {
+      if (error) fail();
+    });
+  } catch {
+    fail();
+  }
 }
 
 export class IsolatedHarnessCommandError extends Error {
@@ -192,6 +231,11 @@ export async function runIsolatedHarnessCommand(
   }
   const writablePaths = (options.writablePaths ?? []).map((path) => isolatedRealPath(path, "Harness 可写路径"));
   const readOnlyPaths = (options.readOnlyPaths ?? []).map((path) => isolatedRealPath(path, "Harness 只读路径"));
+  if (options.privateReadOnlyFile !== undefined && options.privateReadOnlyContents !== undefined) {
+    throw new IsolatedHarnessCommandError("Harness 私有只读能力来源只能声明一种", "process");
+  }
+  const privateReadOnlyFile = options.privateReadOnlyFile
+    ? isolatedRealFile(options.privateReadOnlyFile, "Harness 私有只读文件") : undefined;
   const cwd = options.cwd ? isolatedRealDirectory(options.cwd, "Harness 工作目录") : undefined;
   if (cwd && !writablePaths.some((path) => isolatedNestedPath(path, cwd))) {
     throw new IsolatedHarnessCommandError("Harness 工作目录必须位于显式可写路径内", "process");
@@ -206,21 +250,43 @@ export async function runIsolatedHarnessCommand(
     "maze-harness-command-gate", command, ...options.args,
   );
   const seccompDescriptor = openIsolatedHarnessSeccompDescriptor();
+  let privateDescriptor: number | undefined;
+  if (privateReadOnlyFile) privateDescriptor = openSync(privateReadOnlyFile, "r");
+  else if (options.privateReadOnlyContents !== undefined) {
+    const privateRoot = mkdtempSync(join(tmpdir(), "maze-harness-private-"));
+    const privatePath = join(privateRoot, "capability");
+    try {
+      chmodSync(privateRoot, 0o700);
+      writeFileSync(privatePath, options.privateReadOnlyContents, { mode: 0o600, flag: "wx" });
+      privateDescriptor = openSync(privatePath, "r");
+    } finally {
+      rmSync(privateRoot, { recursive: true, force: true });
+    }
+  }
   let child: ChildProcessWithoutNullStreams;
   try {
+    const stdio: Array<"pipe" | "ignore" | number> = ["pipe", "pipe", "pipe", seccompDescriptor];
+    if (privateDescriptor !== undefined) stdio[4] = privateDescriptor;
+    else if (options.privateDuplexHandler) stdio[4] = "ignore";
+    if (options.privateDuplexHandler) stdio[5] = "pipe";
     child = spawn(options.unshareCommand ?? "/usr/bin/unshare", [
       "--user", "--map-current-user", "--pid", "--fork", "--kill-child=SIGKILL", "--mount-proc",
       options.bubblewrapCommand ?? "/usr/bin/bwrap", ...sandboxArguments,
     ], {
       detached: true,
-      stdio: ["pipe", "pipe", "pipe", seccompDescriptor],
+      stdio,
       cwd: "/",
       env: options.environment,
     }) as ChildProcessWithoutNullStreams;
   } finally {
     closeSync(seccompDescriptor);
+    if (privateDescriptor !== undefined) closeSync(privateDescriptor);
   }
   const processGroupId = child.pid;
+  const ledgerStream = options.privateDuplexHandler
+    ? (child.stdio as unknown as Array<Duplex | null>)[5] ?? null : null;
+  let ledgerBuffer = "";
+  let ledgerData: ((chunk: Buffer) => void) | undefined;
   const hostNamespace = readlinkSync("/proc/self/ns/pid");
   const stdout: Buffer[] = [];
   let stdoutBytes = 0;
@@ -237,6 +303,7 @@ export async function runIsolatedHarnessCommand(
     let namespaceDiscoveryDone = false;
     const stdoutData = (chunk: Buffer) => append(stdout, chunk, "stdout");
     const stderrData = (chunk: Buffer) => append(undefined, chunk, "stderr");
+    let ledgerError: (() => void) | undefined;
     const finish = (callback: () => void) => {
       if (settled) return;
       settled = true;
@@ -247,6 +314,9 @@ export async function runIsolatedHarnessCommand(
       options.signal?.removeEventListener("abort", abort);
       child.stdout.off("data", stdoutData);
       child.stderr.off("data", stderrData);
+      if (ledgerData) ledgerStream?.off("data", ledgerData);
+      if (ledgerError) ledgerStream?.off("error", ledgerError);
+      ledgerStream?.destroy();
       child.stdin.destroy();
       child.stdout.destroy();
       child.stderr.destroy();
@@ -302,6 +372,31 @@ export async function runIsolatedHarnessCommand(
         }, ISOLATED_FORCE_KILL_CONFIRMATION_MS);
       }, ISOLATED_TERMINATION_GRACE_MS);
     };
+    ledgerData = (chunk: Buffer) => {
+      ledgerBuffer += chunk.toString("utf8");
+      if (Buffer.byteLength(ledgerBuffer, "utf8") > 64 * 1024) {
+        terminate(new IsolatedHarnessCommandError("Harness 预算事务帧超过限制", "output"));
+        return;
+      }
+      while (ledgerBuffer.includes("\n")) {
+        const newline = ledgerBuffer.indexOf("\n");
+        const line = ledgerBuffer.slice(0, newline);
+        ledgerBuffer = ledgerBuffer.slice(newline + 1);
+        let response: unknown;
+        try { response = { ok: true, value: options.privateDuplexHandler!(JSON.parse(line)) }; }
+        catch { response = { ok: false, code: "BUDGET_LEDGER_REJECTED" }; }
+        if (!ledgerStream) {
+          terminate(new IsolatedHarnessCommandError("Harness 预算事务写入失败", "process"));
+          return;
+        }
+        writeBudgetLedgerResponse(ledgerStream, response, () => {
+          terminate(new IsolatedHarnessCommandError("Harness 预算事务写入失败", "process"));
+        });
+      }
+    };
+    ledgerError = () => {
+      if (!settled) terminate(new IsolatedHarnessCommandError("Harness 预算账本通道失败", "process"));
+    };
     const append = (target: Buffer[] | undefined, chunk: Buffer, kind: "stdout" | "stderr") => {
       if (kind === "stdout") stdoutBytes += chunk.length;
       else stderrBytes += chunk.length;
@@ -318,7 +413,11 @@ export async function runIsolatedHarnessCommand(
     );
     child.stdout.on("data", stdoutData);
     child.stderr.on("data", stderrData);
-    child.stdin.on("error", () => { /* 终止期间的 EPIPE 由进程退出统一处理。 */ });
+    if (ledgerData) ledgerStream?.on("data", ledgerData);
+    if (ledgerError) ledgerStream?.on("error", ledgerError);
+    child.stdin.on("error", () => {
+      if (!settled) terminate(new IsolatedHarnessCommandError("Harness stdin 管道失败", "process"));
+    });
     child.once("error", () => finish(() => reject(new IsolatedHarnessCommandError("无法启动隔离 Harness 进程", "process"))));
     child.once("close", (exitCode) => {
       closeCode = exitCode;
@@ -330,8 +429,12 @@ export async function runIsolatedHarnessCommand(
       namespaceDiscoveryDone = true;
       if (options.signal?.aborted) return abort();
       if (settled || shuttingDown) return;
-      child.stdin.write("\n");
-      child.stdin.end(options.stdin ?? "");
+      try {
+        child.stdin.write("\n");
+        child.stdin.end(options.stdin ?? "");
+      } catch {
+        terminate(new IsolatedHarnessCommandError("Harness stdin 管道写入失败", "process"));
+      }
     }, () => {
       namespaceDiscoveryDone = true;
       if (!settled) terminate(new IsolatedHarnessCommandError("Harness 进程无法建立受控 PID namespace", "process"));
@@ -501,6 +604,13 @@ export interface HarnessEvolutionRequest {
   allowedTools: readonly HarnessEvolutionTool[];
   repairAttempt: number;
   diagnostics: readonly string[];
+  budget?: { maxTokens: number; maxCost: number; maxModelCalls?: number };
+  /** 真实 Provider 只通过父进程能力执行持久预算事务，隔离子进程不接触 SQLite 路径。 */
+  budgetLedger?: {
+    reserveProviderAttempt(upper: { tokens: number; cost: number }): string;
+    settleProviderAttempt(reservationId: string, usage: { tokens: number; cost: number }): void;
+    reserveTopLevelToolCall(): boolean;
+  };
   signal?: AbortSignal;
 }
 
@@ -508,7 +618,7 @@ export interface HarnessEvolutionResponse {
   hypothesis: string;
   strategyPlan: string;
   submitted: boolean;
-  usage: { tokens: number; cost: number };
+  usage: HarnessUsage;
   reasoning?: string;
   toolActivity?: string;
   execution: HarnessExecutionIdentity;
@@ -521,6 +631,7 @@ export interface HarnessExecutionIdentity {
   harnessVersion: string;
   providerId: string;
   modelId: string;
+  costPolicyId?: string;
 }
 
 export interface HarnessEvolutionProtocolRequest {
@@ -542,6 +653,7 @@ export interface HarnessEvolutionProtocolRequest {
     diagnostics: readonly string[];
   };
   modelProfile: ModelProfile;
+  budget?: { maxTokens: number; maxCost: number; maxModelCalls?: number };
   input: HarnessEvolutionTrustedInput;
 }
 
@@ -556,15 +668,22 @@ export interface HarnessEvolutionProtocolResponse {
     reasoning?: string;
     toolActivity?: string;
   };
-  usage: { tokens: number; cost: number };
+  usage: HarnessUsage;
+  costPolicyId?: string;
 }
 
 export interface HarnessEvolutionProtocolErrorResponse {
   type: typeof HARNESS_EVOLUTION_RESPONSE_TYPE;
   protocolVersion: typeof HARNESS_EVOLUTION_PROTOCOL_VERSION;
   sessionId: string;
-  error: { kind: "transient-provider" | "provider"; code: string };
-  usage: { tokens: number; cost: number };
+  error: {
+    kind: "transient-provider" | "provider" | "protocol" | "process";
+    code: string;
+    failureFacts?: Record<string, unknown>;
+  };
+  usage: HarnessUsage | null;
+  modelCalls: number;
+  diagnostic?: Record<string, unknown>;
 }
 
 export interface ModelProfileIssue {
@@ -594,7 +713,7 @@ export interface HarnessModelCatalog {
 }
 
 const catalog: HarnessCatalogResponse = {
-  credentialRefs: ["dsh-credential://basic", "dsh-credential://reasoning"],
+  credentialRefs: ["dsh-credential://BASIC_CRED", "dsh-credential://REASONING_CRED"],
   providers: [
     {
       id: "fake-basic",
@@ -620,7 +739,7 @@ const catalog: HarnessCatalogResponse = {
         id: "reasoner-v1",
         label: "Reasoner V1",
         capabilities: {
-          reasoningEfforts: ["low", "medium", "high"],
+          reasoningEfforts: ["off", "low", "high", "max"],
           maxContextTokens: 32_000,
           maxOutputTokens: 8_000,
           maxTotalTokens: 40_000,
@@ -631,8 +750,8 @@ const catalog: HarnessCatalogResponse = {
   ],
 };
 
-const fakeCredentialRefs = new Set(["dsh-credential://basic", "dsh-credential://reasoning"]);
-const credentialReferencePattern = /^dsh-credential:\/\/[a-z0-9][a-z0-9._-]{0,79}$/;
+const fakeCredentialRefs = new Set(["dsh-credential://BASIC_CRED", "dsh-credential://REASONING_CRED"]);
+const credentialReferencePattern = /^dsh-credential:\/\/[A-Za-z_][A-Za-z0-9_]*$/;
 const catalogIdPattern = /^[a-z0-9][a-z0-9._-]{0,79}$/;
 const providerOptionNamePattern = /^[A-Za-z][A-Za-z0-9._-]{0,79}$/;
 const catalogIdentityPattern = /^sha256:[0-9a-f]{64}$/;
@@ -759,7 +878,7 @@ function validateAgainstCatalog(
   if (provider && !model) issues.push({ path: "modelId", message: "模型不属于所选提供方" });
 
   if (typeof input.credentialRef !== "string" || !credentialReferencePattern.test(input.credentialRef)) {
-    issues.push({ path: "credentialRef", message: "凭据引用必须使用 dsh-credential://<id> 格式" });
+    issues.push({ path: "credentialRef", message: "凭据引用必须使用 dsh-credential://<POSIX_NAME> 格式" });
   } else if (!credentialRefs.has(input.credentialRef)) {
     issues.push({ path: "credentialRef", message: "凭据引用未在只读 Harness 导出中注册" });
   }
@@ -833,7 +952,10 @@ export function parseHarnessModelCatalog(raw: unknown, expectedHarnessVersion: s
   if (raw.harnessVersion !== expectedHarnessVersion) {
     throw new HarnessConfigurationError("Harness 版本不匹配安装清单");
   }
-  if (!Array.isArray(raw.credentialRefs) || !raw.credentialRefs.every((value) => typeof value === "string" && credentialReferencePattern.test(value))) {
+  if (!Array.isArray(raw.credentialRefs) || !raw.credentialRefs.every((value) => {
+    if (typeof value !== "string" || !credentialReferencePattern.test(value)) return false;
+    try { credentialEnvironmentNameFromReference(value); return true; } catch { return false; }
+  })) {
     throw new HarnessConfigurationError("Harness 导出的 credentialRefs 无效");
   }
   if (new Set(raw.credentialRefs).size !== raw.credentialRefs.length) {
@@ -877,7 +999,7 @@ export function parseHarnessModelCatalog(raw: unknown, expectedHarnessVersion: s
         if (isPlainObject(range)) rejectUnknownFields(range, ["minimum", "maximum"], "Harness 导出的数值能力范围");
       }
       if (!Array.isArray(capabilities.reasoningEfforts)
-        || !capabilities.reasoningEfforts.every((value) => ["low", "medium", "high"].includes(String(value)))
+        || !capabilities.reasoningEfforts.every((value) => ["off", "low", "high", "max"].includes(String(value)))
         || new Set(capabilities.reasoningEfforts).size !== capabilities.reasoningEfforts.length
         || !validRange(capabilities.temperature) || !validRange(capabilities.topP)
         || !Number.isInteger(capabilities.maxContextTokens) || Number(capabilities.maxContextTokens) <= 0
@@ -947,8 +1069,8 @@ export class DeterministicFakeHarnessAdapter implements HarnessAdapter {
     return validateAgainstCatalog(input, catalog, fakeCredentialRefs, `sha256:${"0".repeat(64)}`);
   }
 
-  async smokeModel(profile: ModelProfile): Promise<{ providerText?: string }> {
-    return { providerText: `fake-smoke:${profile.providerId}/${profile.modelId}` };
+  async smokeModel(profile: ModelProfile): Promise<{ providerText?: string; usage: HarnessUsage }> {
+    return { providerText: `fake-smoke:${profile.providerId}/${profile.modelId}`, usage: { tokens: 0, cost: 0, modelCalls: 0 } };
   }
 
   async evolvePlugin(request: HarnessEvolutionRequest): Promise<HarnessEvolutionResponse> {
@@ -962,7 +1084,7 @@ export class DeterministicFakeHarnessAdapter implements HarnessAdapter {
       hypothesis: `${request.role} 第 ${request.generation} 代确定性候选`,
       strategyPlan: `尝试 ${request.attemptId}，保持协议与资源边界。`,
       submitted: true,
-      usage: { tokens: 100, cost: 0 },
+      usage: { tokens: 100, cost: 0, modelCalls: 1 },
       reasoning: "确定性假 Harness 已完成候选分析",
       toolActivity: "read,test,submit",
       execution: {

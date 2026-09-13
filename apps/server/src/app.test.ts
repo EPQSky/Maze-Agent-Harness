@@ -1,10 +1,11 @@
-import { chmodSync, cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import type { Stats } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { EventEmitter } from "node:events";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer as createNetServer } from "node:net";
 import type {
   CreateExperimentRequest,
@@ -33,7 +34,10 @@ import { ExperimentRuntimeRepository } from "@maze-arena/control-plane";
 import { PluginLineageRepository } from "@maze-arena/lineage";
 import { afterEach, describe, expect, it } from "vitest";
 import { createArenaServer as createArenaServerImpl, installPersistentShutdownHandlers, type ArenaServerOptions } from "./app.js";
-import { createProductionHarnessAdapter } from "./production-harness.js";
+import {
+  createProductionHarnessAdapter as createProductionHarnessAdapterImpl,
+  withSmokeSessionHome,
+} from "./production-harness.js";
 import { HarnessInvocationError } from "./harness-invocation-error.js";
 import { runBaselineMatch } from "@maze-arena/engine";
 import type { PairedEvaluationRunner } from "@maze-arena/match-profile";
@@ -41,6 +45,8 @@ import type { AutonomousEvolutionAdapter } from "./autonomous-runner.js";
 import { assembleTrustedEvolutionFeedback } from "./trusted-evolution-feedback.js";
 
 const servers: ReturnType<typeof createArenaServer>[] = [];
+const modelReleaseTestRoots = new Set<string>();
+const productionSessionHomes = new Set<string>();
 const deterministicMatchRunner = {
   run: async (seed: string, onEvents?: (events: readonly MatchEvent[]) => Promise<void> | void) => {
     const result = runBaselineMatch(seed);
@@ -115,8 +121,87 @@ function findHostProcess(marker: string): number | undefined {
   return undefined;
 }
 
+function cleanupModelReleaseTestRoots(): void {
+  const cleanupErrors: unknown[] = [];
+  for (const root of modelReleaseTestRoots) {
+    modelReleaseTestRoots.delete(root);
+    try {
+      if (existsSync(root)) {
+        chmodSync(root, 0o700);
+        rmSync(root, { recursive: true, force: true });
+      }
+      if (existsSync(root)) throw new Error(`测试模型发布目录清理后仍存在：${root}`);
+    } catch (error) { cleanupErrors.push(error); }
+  }
+  if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, "测试模型发布目录清理失败");
+}
+
+interface SessionHomeCleanupOperations {
+  chmodSync(path: string, mode: number): void;
+  lstatSync(path: string): Stats;
+  readdirSync(path: string): string[];
+  rmSync(path: string, options: { recursive: true; force: true }): void;
+}
+
+const sessionHomeCleanupOperations: SessionHomeCleanupOperations = {
+  chmodSync,
+  lstatSync,
+  readdirSync: (path) => readdirSync(path),
+  rmSync,
+};
+
+function createProductionSessionHome(): string {
+  const home = mkdtempSync(join(tmpdir(), "maze-harness-session-"));
+  productionSessionHomes.add(home);
+  return home;
+}
+
+function cleanupProductionSessionHomes(overrides: Partial<SessionHomeCleanupOperations> = {}): void {
+  const operations = { ...sessionHomeCleanupOperations, ...overrides };
+  const cleanupErrors: unknown[] = [];
+  for (const home of [...productionSessionHomes]) {
+    const homeErrors: unknown[] = [];
+    const restoreAccess = (path: string): void => {
+      let stat: Stats;
+      try { stat = operations.lstatSync(path); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") homeErrors.push(error);
+        return;
+      }
+      if (stat.isSymbolicLink()) return;
+      try { operations.chmodSync(path, (stat.mode & 0o777) | (stat.isDirectory() ? 0o700 : 0o600)); }
+      catch (error) { homeErrors.push(error); }
+      if (!stat.isDirectory()) return;
+      let entries: string[];
+      try { entries = operations.readdirSync(path); }
+      catch (error) { homeErrors.push(error); return; }
+      for (const entry of entries) restoreAccess(join(path, entry));
+    };
+    restoreAccess(home);
+    try { operations.rmSync(home, { recursive: true, force: true }); }
+    catch (error) { homeErrors.push(error); }
+    let exists = true;
+    try { operations.lstatSync(home); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") exists = false;
+      else homeErrors.push(error);
+    }
+    if (exists) homeErrors.push(new Error(`测试生产 Harness Session home 清理后仍存在：${home}`));
+    else productionSessionHomes.delete(home);
+    cleanupErrors.push(...homeErrors);
+  }
+  if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, "测试生产 Harness Session home 清理失败");
+}
+
 afterEach(async () => {
-  await Promise.all(servers.splice(0).map((server) => server.close()));
+  const cleanupErrors: unknown[] = [];
+  try { await Promise.all(servers.splice(0).map((server) => server.close())); }
+  catch (error) { cleanupErrors.push(error); }
+  try { cleanupModelReleaseTestRoots(); }
+  catch (error) { cleanupErrors.push(error); }
+  try { cleanupProductionSessionHomes(); }
+  catch (error) { cleanupErrors.push(error); }
+  if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, "测试 Server 与临时目录清理失败");
 });
 
 function createTestServer(databasePath: string, autonomousEvolutionAdapter?: AutonomousEvolutionAdapter) {
@@ -126,6 +211,31 @@ function createTestServer(databasePath: string, autonomousEvolutionAdapter?: Aut
   });
   servers.push(server);
   return server;
+}
+
+function createProductionHarnessAdapter(environment: NodeJS.ProcessEnv) {
+  const source = environment.ARENA_MODEL_CATALOG_PATH;
+  if (!source) return createProductionHarnessAdapterImpl(environment);
+  const root = mkdtempSync(join(tmpdir(), "maze-model-release-test-"));
+  modelReleaseTestRoots.add(root);
+  const catalog = readFileSync(source);
+  const settings = Buffer.from("{}\n");
+  const catalogPath = join(root, "catalog.json");
+  const exportPath = join(root, "model-export.json");
+  const settingsPath = join(root, "settings.yaml");
+  writeFileSync(catalogPath, catalog, { mode: 0o400 });
+  writeFileSync(exportPath, catalog, { mode: 0o400 });
+  writeFileSync(settingsPath, settings, { mode: 0o400 });
+  chmodSync(root, 0o500);
+  const digest = createHash("sha256").update(catalog).update("\0").update(catalog)
+    .update("\0").update(settings).digest("hex");
+  return createProductionHarnessAdapterImpl({
+    ...environment,
+    ARENA_MODEL_CATALOG_PATH: catalogPath,
+    DSH_MODEL_EXPORT_PATH: exportPath,
+    DSH_MODEL_SETTINGS_PATH: settingsPath,
+    ARENA_MODEL_RELEASE_SHA256: digest,
+  });
 }
 
 function createLineageCandidate(directory: string, suffix: string): string {
@@ -143,7 +253,8 @@ function createLineageCandidate(directory: string, suffix: string): string {
 function productionEvolutionRequest(
   request: Omit<HarnessEvolutionRequest, "sessionId" | "home" | "input" | "allowedTools">,
 ): HarnessEvolutionRequest {
-  const home = mkdtempSync(join(tmpdir(), "maze-harness-session-"));
+  const home = createProductionSessionHome();
+  let reservation = 0;
   return {
     ...request,
     sessionId: randomUUID(),
@@ -161,8 +272,64 @@ function productionEvolutionRequest(
       },
     },
     allowedTools: HARNESS_EVOLUTION_ALLOWED_TOOLS,
+    budgetLedger: {
+      reserveProviderAttempt: () => `test-reservation-${reservation += 1}`,
+      settleProviderAttempt: () => undefined,
+      reserveTopLevelToolCall: () => true,
+    },
   };
 }
+
+describe("Server 测试生产 Harness Session home 清理", () => {
+  it("首个删除失败不阻断后续，保留失败项重试且不跟随外部符号链接", () => {
+    const first = createProductionSessionHome();
+    const second = createProductionSessionHome();
+    const external = mkdtempSync(join(tmpdir(), "maze-harness-external-"));
+    try {
+      for (const home of [first, second]) {
+        mkdirSync(join(home, "nested", "deep"), { recursive: true });
+        writeFileSync(join(home, "nested", "deep", "locked"), "locked");
+        chmodSync(join(home, "nested", "deep", "locked"), 0o000);
+        chmodSync(join(home, "nested", "deep"), 0o000);
+        chmodSync(join(home, "nested"), 0o000);
+        chmodSync(home, 0o000);
+      }
+      writeFileSync(join(external, "outside"), "outside");
+      chmodSync(first, 0o700);
+      symlinkSync(external, join(first, "external-link"), "dir");
+      chmodSync(first, 0o000);
+      chmodSync(external, 0o000);
+      let failedOnce = false;
+      let caught: unknown;
+      try {
+        cleanupProductionSessionHomes({
+          rmSync: (path, options) => {
+            if (path === first && !failedOnce) {
+              failedOnce = true;
+              throw new Error("injected-first-session-remove-failure");
+            }
+            rmSync(path, options);
+          },
+        });
+      } catch (error) { caught = error; }
+      expect(caught).toBeInstanceOf(AggregateError);
+      expect(String((caught as AggregateError).errors[0])).toContain("injected-first-session-remove-failure");
+      expect(existsSync(first)).toBe(true);
+      expect(existsSync(second)).toBe(false);
+      expect(productionSessionHomes.has(first)).toBe(true);
+      expect(productionSessionHomes.has(second)).toBe(false);
+      expect(statSync(external).mode & 0o777).toBe(0o000);
+
+      cleanupProductionSessionHomes();
+      expect(productionSessionHomes.has(first)).toBe(false);
+      expect(existsSync(first)).toBe(false);
+      expect(existsSync(external)).toBe(true);
+    } finally {
+      chmodSync(external, 0o700);
+      rmSync(external, { recursive: true, force: true });
+    }
+  });
+});
 
 async function createExperiment(server: ReturnType<typeof createArenaServer>, name: string, costLimit?: number) {
   const payload: CreateExperimentRequest = {
@@ -171,7 +338,7 @@ async function createExperiment(server: ReturnType<typeof createArenaServer>, na
     modelProfile: {
       providerId: "fake-basic",
       modelId: "compact-v1",
-      credentialRef: "dsh-credential://basic",
+      credentialRef: "dsh-credential://BASIC_CRED",
       temperature: 0.4,
       topP: 0.9,
       contextTokens: 4_000,
@@ -190,8 +357,10 @@ async function createExperiment(server: ReturnType<typeof createArenaServer>, na
 }
 
 async function validateAndConfirm(server: ReturnType<typeof createArenaServer>, id: string): Promise<void> {
-  expect((await server.inject({ method: "POST", url: `/api/experiments/${id}/baseline-validation/run`, payload: {} })).statusCode).toBe(200);
-  expect((await server.inject({ method: "POST", url: `/api/experiments/${id}/baseline-validation/confirm`, payload: {} })).statusCode).toBe(200);
+  const validation = await server.inject({ method: "POST", url: `/api/experiments/${id}/baseline-validation/run`, payload: {} });
+  expect(validation.statusCode, validation.body).toBe(200);
+  const confirmation = await server.inject({ method: "POST", url: `/api/experiments/${id}/baseline-validation/confirm`, payload: {} });
+  expect(confirmation.statusCode, confirmation.body).toBe(200);
 }
 
 const abortableBlockingAdapter: AutonomousEvolutionAdapter = {
@@ -666,7 +835,7 @@ describe("实验工作台 API", () => {
         evolvePlugin: async (request) => {
           providerCalls += 1;
           if (providerCalls === 1) return delegate.evolvePlugin(request);
-          throw new HarnessInvocationError("受控失败", kind, { tokens: 7, cost: 0.27 }, {
+          throw new HarnessInvocationError("受控失败", kind, { tokens: 7, cost: 0.27, modelCalls: 1 }, {
             kind: "fake",
             protocolVersion: 1,
             sessionId: request.sessionId,
@@ -692,6 +861,51 @@ describe("实验工作台 API", () => {
     expect(snapshot).toMatchObject({ state: "paused", generation: 0, usage: { tokens, cost } });
   }, 20_000);
 
+  it("外层 Provider retry 不能释放无可信 usage 的跨进程 attempt 预留", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-provider-reservation-retry-"));
+    const databasePath = join(directory, "arena.sqlite");
+    const delegate = new DeterministicFakeHarnessAdapter();
+    let providerProcesses = 0;
+    const server = createArenaServer({
+      databasePath,
+      matchRunner: deterministicMatchRunner,
+      harnessAdapter: {
+        listModels: () => delegate.listModels(),
+        validateModelProfile: (input) => delegate.validateModelProfile(input),
+        smokeModel: (modelProfile) => delegate.smokeModel(modelProfile),
+        evolvePlugin: async (request) => {
+          providerProcesses += 1;
+          request.budgetLedger!.reserveProviderAttempt({ tokens: 4_000, cost: 0.4 });
+          throw new HarnessInvocationError("无 usage 的受控瞬态失败", "transient-provider", undefined, {
+            kind: "fake", protocolVersion: 1, sessionId: request.sessionId, harnessVersion: "fake",
+            providerId: request.modelProfile.providerId, modelId: request.modelProfile.modelId,
+          }, "TRANSPORT", 1);
+        },
+      },
+    });
+    servers.push(server);
+    const experiment = await createExperiment(server, "无 usage 预留跨进程保留");
+    await validateAndConfirm(server, experiment.id);
+    await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/start` });
+    let snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` }))
+      .json<import("@maze-arena/contracts").ExperimentRuntimeSnapshot>();
+    for (let attempt = 0; attempt < 300 && snapshot.state !== "paused"; attempt += 1) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+      snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json();
+    }
+    expect(providerProcesses).toBe(2);
+    expect(snapshot).toMatchObject({ state: "paused", usage: { tokens: 0, cost: 0 } });
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      expect(database.prepare(`SELECT reserved_tokens, reserved_cost
+        FROM generation_role_provider_attempts WHERE experiment_id = ?`).all(experiment.id)).toEqual([{
+        reserved_tokens: 4_000, reserved_cost: 0.4,
+      }]);
+      expect(database.prepare(`SELECT COUNT(*) AS count FROM generation_role_provider_usage_items
+        WHERE experiment_id = ?`).get(experiment.id)).toEqual({ count: 0 });
+    } finally { database.close(); }
+  }, 10_000);
+
   it.each([
     ["deterministic-fixture", "2026.09.fixture"],
     ["real-provider", "2026.09.real"],
@@ -705,6 +919,10 @@ describe("实验工作台 API", () => {
         validateModelProfile: (input) => delegate.validateModelProfile(input),
         smokeModel: (modelProfile) => delegate.smokeModel(modelProfile),
         evolvePlugin: async (request) => {
+          if (kind === "real-provider") {
+            const reservationId = request.budgetLedger!.reserveProviderAttempt({ tokens: 100, cost: 0.5 });
+            request.budgetLedger!.settleProviderAttempt(reservationId, { tokens: 37, cost: 0.25 });
+          }
           throw new HarnessInvocationError("sk-secret-value-must-not-persist", "protocol", { tokens: 37, cost: 0.25 }, {
             kind,
             protocolVersion: 1,
@@ -712,6 +930,16 @@ describe("实验工作台 API", () => {
             harnessVersion,
             providerId: request.modelProfile.providerId,
             modelId: request.modelProfile.modelId,
+          }, "RESULT_JSON_INVALID", 2, false, {
+            modelCalls: 2,
+            eventCounts: { "request/context": 1, "tool/call": 1, "turn/end": 1 },
+            turnEnds: [{ turn: 4, kind: "error", errorCode: "UNKNOWN" }],
+            toolNames: ["maze.read"],
+            requestContext: { provider: "fake-basic", model: "compact-v1", contextWindow: 2_000 },
+            errorCode: "UNKNOWN",
+            localFailureCode: null,
+            cleanupErrorCode: null,
+            stderrBytes: 0,
           });
         },
       },
@@ -739,12 +967,125 @@ describe("实验工作台 API", () => {
       modelId: "compact-v1",
       outcome: "failed",
       failureKind: "protocol",
+      failureCode: "RESULT_JSON_INVALID",
       usageTokens: 37,
       usageCost: 0.25,
+    });
+    expect(typeof activity?.details.diagnostic).toBe("string");
+    expect(JSON.parse(String(activity?.details.diagnostic))).toMatchObject({
+      modelCalls: 2,
+      turnEnds: [{ turn: 4, kind: "error", errorCode: "UNKNOWN" }],
+      toolNames: ["maze.read"],
+      requestContext: { provider: "fake-basic", model: "compact-v1", contextWindow: 2_000 },
+      errorCode: "UNKNOWN",
+      localFailureCode: null,
+      cleanupErrorCode: null,
     });
     expect(audit.body).not.toContain("sk-secret-value-must-not-persist");
     expect(audit.body).not.toContain("reasoning");
     expect(audit.body).not.toContain("toolActivity");
+  });
+
+  it("模型发布快照漂移在模型调用前写入具名 real-provider 失败审计", async () => {
+    const root = mkdtempSync(join(tmpdir(), "maze-model-release-drift-audit-"));
+    const releaseRoot = join(root, "release");
+    const databasePath = join(root, "arena.sqlite");
+    const lineageRoot = join(root, "lineages");
+    mkdirSync(releaseRoot, { mode: 0o700 });
+    const catalog = Buffer.from(JSON.stringify({
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://PRODUCTION_CRED"],
+      providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
+        reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000,
+        maxTotalTokens: 9_000, providerOptions: {},
+      } }] }],
+    }));
+    const settings = Buffer.from("{}\n");
+    const catalogPath = join(releaseRoot, "catalog.json");
+    const exportPath = join(releaseRoot, "model-export.json");
+    const settingsPath = join(releaseRoot, "settings.yaml");
+    writeFileSync(catalogPath, catalog, { mode: 0o400 });
+    writeFileSync(exportPath, catalog, { mode: 0o400 });
+    writeFileSync(settingsPath, settings, { mode: 0o400 });
+    chmodSync(releaseRoot, 0o500);
+    const releaseSha256 = createHash("sha256").update(catalog).update("\0").update(catalog)
+      .update("\0").update(settings).digest("hex");
+    const harness = createProductionHarnessAdapterImpl({
+      ARENA_MODEL_CATALOG_PATH: catalogPath,
+      DSH_MODEL_EXPORT_PATH: exportPath,
+      DSH_MODEL_SETTINGS_PATH: settingsPath,
+      ARENA_MODEL_RELEASE_SHA256: releaseSha256,
+      DSH_HARNESS_VERSION: "2026.09.2",
+      DSH_EVOLUTION_COMMAND: "/bin/false",
+      DSH_SMOKE_COMMAND: "/bin/false",
+      DSH_EVOLUTION_EXECUTION_KIND: "real-provider",
+    });
+    const server = createArenaServer({
+      databasePath,
+      harnessRoot: join(root, "harness"),
+      harnessAdapter: harness,
+      matchRunner: deterministicMatchRunner,
+      baselineValidationAdapter: (experiment) => ({
+        runStep: async (step) => {
+          if (step === "native-plugin-install") {
+            const lineages = new PluginLineageRepository(lineageRoot, databasePath);
+            try {
+              const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../../packages");
+              await lineages.initialize(experiment.id, "generator", join(packageRoot, "generator-plugin"));
+              await lineages.initialize(experiment.id, "solver", join(packageRoot, "solver-plugin"));
+            } finally { lineages.close(); }
+          }
+          return { step, passed: true, diagnostics: [] };
+        },
+        smokeProvider: async () => ({ passed: true, providerText: "pre-drift", usage: { tokens: 0, cost: 0, modelCalls: 0 } }),
+      }),
+    });
+    servers.push(server);
+    try {
+      const createdResponse = await server.inject({
+        method: "POST",
+        url: "/api/experiments",
+        payload: {
+          name: "模型发布漂移审计",
+          modelProfile: {
+            providerId: "provider", modelId: "model", credentialRef: "dsh-credential://PRODUCTION_CRED",
+            contextTokens: 2_000, outputTokens: 1_000, totalTokenLimit: 3_000,
+          },
+        },
+      });
+      expect(createdResponse.statusCode, createdResponse.body).toBe(201);
+      const experiment = createdResponse.json<Experiment>();
+      await validateAndConfirm(server, experiment.id);
+
+      chmodSync(releaseRoot, 0o700);
+      chmodSync(settingsPath, 0o600);
+      writeFileSync(settingsPath, "{\"drift\":true}\n");
+      chmodSync(settingsPath, 0o400);
+      chmodSync(releaseRoot, 0o500);
+
+      expect((await server.inject({ method: "POST", url: `/api/experiments/${experiment.id}/runtime/start` })).statusCode).toBe(200);
+      let snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` }))
+        .json<import("@maze-arena/contracts").ExperimentRuntimeSnapshot>();
+      for (let attempt = 0; attempt < 300 && snapshot.state !== "paused"; attempt += 1) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+        snapshot = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/runtime` })).json();
+      }
+      expect(snapshot).toMatchObject({ state: "paused", usage: { tokens: 0, cost: 0, modelCalls: 0 } });
+      const audit = (await server.inject({ method: "GET", url: `/api/experiments/${experiment.id}/audit-events` }))
+        .json<import("@maze-arena/contracts").ExperimentAuditEventPage>();
+      const activity = audit.events.find(({ type }) => type === "harness.activity");
+      expect(activity?.details).toMatchObject({
+        executionKind: "real-provider", protocolVersion: 1, harnessVersion: "2026.09.2",
+        providerId: "provider", modelId: "model", outcome: "failed", failureKind: "process",
+        usageTokens: null, usageCost: null,
+      });
+      expect(activity?.details.executionKind).not.toBe("unknown");
+      expect(activity?.details.failureKind).not.toBe("unknown");
+    } finally {
+      await server.close();
+      servers.splice(servers.indexOf(server), 1);
+      chmodSync(releaseRoot, 0o700);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("比较克隆继承密封套件且展示局不改变代次、冠军或用量", async () => {
@@ -1033,7 +1374,7 @@ describe("实验工作台 API", () => {
     expect(created.modelProfile).toMatchObject({
       providerId: "fake-basic",
       modelId: "compact-v1",
-      credentialRef: "dsh-credential://basic",
+      credentialRef: "dsh-credential://BASIC_CRED",
       providerLabel: "确定性基础提供方",
     });
     expect(created.harnessEnvironments.generator.home).not.toBe(created.harnessEnvironments.solver.home);
@@ -1056,7 +1397,7 @@ describe("实验工作台 API", () => {
     const invalid = await server.inject({
       method: "POST", url: "/api/experiments", payload: {
         name: "非法成本预算", costLimit: 0, modelProfile: {
-          providerId: "fake-basic", modelId: "compact-v1", credentialRef: "dsh-credential://basic",
+          providerId: "fake-basic", modelId: "compact-v1", credentialRef: "dsh-credential://BASIC_CRED",
           contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000,
         },
       },
@@ -1069,9 +1410,9 @@ describe("实验工作台 API", () => {
     const server = createTestServer(":memory:");
     const catalog = await server.inject({ method: "GET", url: "/api/harness/models" });
     expect(catalog.statusCode).toBe(200);
-    expect(catalog.json()).toMatchObject({ credentialRefs: ["dsh-credential://basic", "dsh-credential://reasoning"], providers: [
+    expect(catalog.json()).toMatchObject({ credentialRefs: ["dsh-credential://BASIC_CRED", "dsh-credential://REASONING_CRED"], providers: [
       { id: "fake-basic", models: [{ id: "compact-v1", capabilities: { reasoningEfforts: [] } }] },
-      { id: "fake-reasoning", models: [{ id: "reasoner-v1", capabilities: { reasoningEfforts: ["low", "medium", "high"] } }] },
+      { id: "fake-reasoning", models: [{ id: "reasoner-v1", capabilities: { reasoningEfforts: ["off", "low", "high", "max"] } }] },
     ] });
 
     const response = await server.inject({
@@ -1082,7 +1423,7 @@ describe("实验工作台 API", () => {
         modelProfile: {
           providerId: "fake-basic",
           modelId: "compact-v1",
-          credentialRef: "dsh-credential://basic",
+          credentialRef: "dsh-credential://BASIC_CRED",
           reasoningEffort: "high",
           contextTokens: 20_000,
           outputTokens: 1_000,
@@ -1110,8 +1451,8 @@ describe("实验工作台 API", () => {
     const replacement = {
       providerId: "fake-reasoning",
       modelId: "reasoner-v1",
-      credentialRef: "dsh-credential://reasoning",
-      reasoningEffort: "medium" as const,
+      credentialRef: "dsh-credential://REASONING_CRED",
+      reasoningEffort: "off" as const,
       contextTokens: 16_000,
       outputTokens: 2_000,
       totalTokenLimit: 20_000,
@@ -1137,7 +1478,7 @@ describe("实验工作台 API", () => {
     });
 
     const detail = await server.inject({ method: "GET", url: `/api/experiments/${created.id}` });
-    expect(detail.json<Experiment>().modelProfile?.reasoningEffort).toBe("medium");
+    expect(detail.json<Experiment>().modelProfile?.reasoningEffort).toBe("off");
   });
 
   it("创建时冻结目录能力快照，后续目录删除不影响基线与启动", async () => {
@@ -1168,7 +1509,7 @@ describe("实验工作台 API", () => {
       method: "PUT",
       url: `/api/experiments/${created.id}/model-profile`,
       payload: { modelProfile: {
-        providerId: "fake-basic", modelId: "compact-v1", credentialRef: "dsh-credential://basic",
+        providerId: "fake-basic", modelId: "compact-v1", credentialRef: "dsh-credential://BASIC_CRED",
         contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000,
       } },
     });
@@ -1222,6 +1563,24 @@ describe("实验工作台 API", () => {
     const response = await restartedServer.inject({ method: "GET", url: "/api/experiments" });
 
     expect(response.json<ExperimentListResponse>()).toEqual({ experiments: [created] });
+  });
+
+  it.each([
+    "generation_role_provider_attempt_receipts",
+    "generation_role_provider_usage_batches",
+  ])("启动拒绝未发布 Repair66 中间表且不部分修改数据库：%s", (table) => {
+    const databasePath = join(mkdtempSync(join(tmpdir(), "maze-server-intermediate-reject-")), "arena.sqlite");
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`CREATE TABLE ${table} (marker TEXT)`);
+    const before = legacy.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name").all();
+    legacy.close();
+
+    expect(() => createTestServer(databasePath)).toThrow(/未发布的 Repair66 Provider usage 中间表/);
+
+    const unchanged = new DatabaseSync(databasePath, { readOnly: true });
+    expect(unchanged.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name").all())
+      .toEqual(before);
+    unchanged.close();
   });
 
   it("从 Ticket 01 schema 事务迁移且重启后保留旧实验", async () => {
@@ -1284,7 +1643,7 @@ describe("实验工作台 API", () => {
       payload: {
         name: "原子冻结",
         modelProfile: {
-          providerId: "fake-basic", modelId: "compact-v1", credentialRef: "dsh-credential://basic",
+          providerId: "fake-basic", modelId: "compact-v1", credentialRef: "dsh-credential://BASIC_CRED",
           contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000,
         },
       },
@@ -1307,7 +1666,7 @@ describe("实验工作台 API", () => {
     writeFileSync(exportPath, JSON.stringify({
       schemaVersion: 1,
       harnessVersion: "2026.09-preview.1",
-      credentialRefs: ["dsh-credential://production"],
+      credentialRefs: ["dsh-credential://PRODUCTION_CRED"],
       providers: [{
         id: "configured-provider", label: "Configured", models: [{
           id: "configured-model", label: "Configured Model", capabilities: {
@@ -1326,12 +1685,12 @@ describe("实验工作台 API", () => {
     });
     expect(production.listModels().providers.map(({ id }) => id)).toEqual(["configured-provider"]);
     const updated = JSON.parse(readFileSync(exportPath, "utf8"));
-    updated.credentialRefs = ["dsh-credential://replacement"];
+    updated.credentialRefs = ["dsh-credential://REPLACEMENT_CRED"];
     updated.providers[0].id = "replacement-provider";
     writeFileSync(exportPath, JSON.stringify(updated));
     expect(production.listModels()).toMatchObject({
-      credentialRefs: ["dsh-credential://replacement"],
-      providers: [{ id: "replacement-provider" }],
+      credentialRefs: ["dsh-credential://PRODUCTION_CRED"],
+      providers: [{ id: "configured-provider" }],
     });
     expect(() => createProductionHarnessAdapter({})).toThrow(/必须配置/);
     expect(() => createProductionHarnessAdapter({
@@ -1341,13 +1700,68 @@ describe("实验工作台 API", () => {
     })).toThrow(/DSH_SMOKE_COMMAND/);
   });
 
+  it("测试生产适配器只清理本用例登记的模型发布目录", () => {
+    const sourceRoot = mkdtempSync(join(tmpdir(), "maze-model-release-source-"));
+    const source = join(sourceRoot, "catalog.json");
+    const releaseDirectories = () => readdirSync(tmpdir()).filter((entry) => entry.startsWith("maze-model-release-test-")).sort();
+    const before = releaseDirectories();
+    writeFileSync(source, JSON.stringify({ schemaVersion: 1, harnessVersion: "test", credentialRefs: [], providers: [] }));
+    try {
+      createProductionHarnessAdapter({
+        ARENA_MODEL_CATALOG_PATH: source,
+        DSH_HARNESS_VERSION: "test",
+        DSH_EVOLUTION_COMMAND: "/bin/false",
+        DSH_SMOKE_COMMAND: "/bin/false",
+      });
+      expect(modelReleaseTestRoots.size).toBe(1);
+      const [trackedRoot] = modelReleaseTestRoots;
+      expect(trackedRoot).toBeDefined();
+      expect(existsSync(trackedRoot!)).toBe(true);
+
+      cleanupModelReleaseTestRoots();
+
+      expect(modelReleaseTestRoots.size).toBe(0);
+      expect(existsSync(trackedRoot!)).toBe(false);
+      expect(releaseDirectories()).toEqual(before);
+    } finally {
+      rmSync(sourceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    "OPENSSL_MODULES", "UV_THREADPOOL_SIZE", "NPM_TOKEN", "YARN_ENABLE_SCRIPTS", "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+  ])("生产 Server 拒绝恶意冻结目录登记保留凭据名 %s", (name) => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-production-credential-policy-"));
+    const exportPath = join(directory, "models.json");
+    writeFileSync(exportPath, JSON.stringify({
+      schemaVersion: 1,
+      harnessVersion: "2026.09-preview.1",
+      credentialRefs: [`dsh-credential://${name}`],
+      providers: [{ id: "configured-provider", label: "Configured", models: [{
+        id: "configured-model", label: "Configured Model", capabilities: {
+          reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000,
+          maxTotalTokens: 9_000, providerOptions: {},
+        },
+      }] }],
+    }));
+    const production = createProductionHarnessAdapter({
+      ARENA_MODEL_CATALOG_PATH: exportPath,
+      DSH_HARNESS_VERSION: "2026.09-preview.1",
+      DSH_EVOLUTION_COMMAND: "/bin/false",
+      DSH_SMOKE_COMMAND: "/bin/false",
+    });
+
+    expect(() => production.listModels()).toThrow(/credentialRefs 无效/);
+  });
+
   it("API 拒绝目录中的敏感 provider option 且响应不回显", async () => {
     const directory = mkdtempSync(join(tmpdir(), "maze-production-secret-"));
     const exportPath = join(directory, "models.json");
     writeFileSync(exportPath, JSON.stringify({
       schemaVersion: 1,
       harnessVersion: "2026.09-preview.1",
-      credentialRefs: ["dsh-credential://production"],
+      credentialRefs: ["dsh-credential://PRODUCTION_CRED"],
       providers: [{ id: "provider", label: "Provider", models: [{
         id: "model", label: "Model", capabilities: {
           reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000,
@@ -1380,27 +1794,223 @@ describe("实验工作台 API", () => {
     const commandPath = join(directory, "evolve.mjs");
     const smokePath = join(directory, "smoke.mjs");
     writeFileSync(exportPath, JSON.stringify({
-      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://PRODUCTION_CRED"],
       providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
         reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
       } }] }],
     }));
-    writeFileSync(commandPath, `#!/usr/bin/env node\nlet input="";for await(const chunk of process.stdin)input+=chunk;const request=JSON.parse(input);process.stdout.write(JSON.stringify({type:"maze-arena.harness-evolution.response",protocolVersion:1,sessionId:request.session.id,result:{hypothesis:request.attempt.attemptId,strategyPlan:"plan",submitted:true,reasoning:"provider reasoning",toolActivity:"read,test"},usage:{tokens:321,cost:0.12}}));\n`);
-    writeFileSync(smokePath, `#!/usr/bin/env node\nlet input="";for await(const chunk of process.stdin)input+=chunk;const request=JSON.parse(input);process.stdout.write(JSON.stringify({providerText:request.modelProfile.modelId+":"+process.env.DSH_HARNESS_OPERATION}));\n`);
+    writeFileSync(commandPath, `#!/usr/bin/env node
+import fs from "node:fs";
+const ask=(request)=>{fs.writeSync(5,JSON.stringify(request)+"\\n");let value="";const chunk=Buffer.alloc(4096);while(!value.includes("\\n")){const length=fs.readSync(5,chunk,0,chunk.length,null);if(length===0)throw new Error("ledger closed");value+=chunk.subarray(0,length).toString("utf8");}return JSON.parse(value.slice(0,value.indexOf("\\n")));};
+let input="";for await(const chunk of process.stdin)input+=chunk;const request=JSON.parse(input);const credential=fs.readFileSync(4,"utf8");
+const reserved=ask({operation:"reserve-provider",tokens:400,cost:0.2});
+const settled=ask({operation:"settle-provider",reservationId:reserved.value,tokens:321,cost:0.12});
+const tool=ask({operation:"reserve-tool"});
+process.stdout.write(JSON.stringify({type:"maze-arena.harness-evolution.response",protocolVersion:1,sessionId:request.session.id,result:{hypothesis:request.attempt.attemptId,strategyPlan:"plan",submitted:true,reasoning:"provider reasoning",toolActivity:JSON.stringify({budget:request.budget,reserved,settled,tool,modelExportPath:process.env.DSH_MODEL_EXPORT_PATH,credentialFd:process.env.DSH_CREDENTIAL_FD,budgetFd:process.env.DSH_BUDGET_LEDGER_FD,credentialPassed:credential.includes("opaque-fd4-secret"),credentialNotInEnvironment:process.env.PRODUCTION_CRED===undefined})},usage:{tokens:321,cost:0.12,modelCalls:1},costPolicyId:"deepseek-official-cost-v1"}));
+`);
+    writeFileSync(smokePath, `#!/usr/bin/env node\nimport fs from "node:fs";let input="";for await(const chunk of process.stdin)input+=chunk;const request=JSON.parse(input);const credential=fs.readFileSync(4,"utf8");process.stdout.write(JSON.stringify({type:"maze-arena.harness-smoke.response",protocolVersion:1,result:{providerText:request.modelProfile.modelId+":"+process.env.DSH_HARNESS_OPERATION+":"+(credential.includes("opaque-fd4-secret")&&process.env.PRODUCTION_CRED===undefined?"fd4":"missing")},usage:{tokens:1,cost:0,modelCalls:1}}));\n`);
     chmodSync(commandPath, 0o755);
     chmodSync(smokePath, 0o755);
     const adapter = createProductionHarnessAdapter({
       ARENA_MODEL_CATALOG_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
-      DSH_EVOLUTION_COMMAND: commandPath, DSH_SMOKE_COMMAND: smokePath,
+      DSH_EVOLUTION_COMMAND: commandPath, DSH_SMOKE_COMMAND: smokePath, DSH_MODEL_EXPORT_PATH: exportPath,
+      PRODUCTION_CRED: "opaque-fd4-secret",
     });
-    const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model", credentialRef: "dsh-credential://production",
+    const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model", credentialRef: "dsh-credential://PRODUCTION_CRED",
       contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
-    await expect(adapter.evolvePlugin!(productionEvolutionRequest({ experimentId: "exp", generation: 1, role: "generator", attemptId: "attempt-1",
-      modelProfile, workspace: directory, repairAttempt: 0, diagnostics: [] }))).resolves.toMatchObject({
+    const evolutionRequest = productionEvolutionRequest({ experimentId: "exp", generation: 1, role: "generator", attemptId: "attempt-1",
+      modelProfile, workspace: directory, repairAttempt: 0, diagnostics: [] });
+    const ledgerOperations: string[] = [];
+    evolutionRequest.budgetLedger = {
+      reserveProviderAttempt: ({ tokens, cost }) => {
+        ledgerOperations.push(`reserve:${tokens}:${cost}`);
+        return "sqlite-reservation-1";
+      },
+      settleProviderAttempt: (reservationId, usage) => {
+        ledgerOperations.push(`settle:${reservationId}:${usage.tokens}:${usage.cost}`);
+      },
+      reserveTopLevelToolCall: () => { ledgerOperations.push("tool"); return true; },
+    };
+    evolutionRequest.budget = { maxTokens: 400, maxCost: 0.2 };
+    const evolved = await adapter.evolvePlugin!(evolutionRequest);
+    expect(evolved).toMatchObject({
       hypothesis: "attempt-1", usage: { tokens: 321, cost: 0.12 }, reasoning: "provider reasoning",
-      execution: { kind: "real-provider", protocolVersion: 1, providerId: "provider", modelId: "model" },
+      execution: { kind: "real-provider", protocolVersion: 1, providerId: "provider", modelId: "model",
+        costPolicyId: "deepseek-official-cost-v1" },
     });
-    await expect(adapter.smokeModel!(modelProfile)).resolves.toMatchObject({ providerText: "model:smoke" });
+    expect(JSON.parse(evolved.toolActivity ?? "{}")).toMatchObject({
+      budget: { maxTokens: 400, maxCost: 0.2, maxModelCalls: 8 },
+      modelExportPath: expect.stringMatching(/model-export\.json$/),
+      credentialFd: "4",
+      budgetFd: "5",
+      reserved: { ok: true, value: "sqlite-reservation-1" },
+      settled: { ok: true, value: true },
+      tool: { ok: true, value: true },
+      credentialPassed: true,
+      credentialNotInEnvironment: true,
+    });
+    expect(ledgerOperations).toEqual(["reserve:400:0.2", "settle:sqlite-reservation-1:321:0.12", "tool"]);
+    const missingLedger = { ...evolutionRequest };
+    delete missingLedger.budgetLedger;
+    await expect(adapter.evolvePlugin!(missingLedger)).rejects.toMatchObject({
+      kind: "process", code: "PARENT_BUDGET_LEDGER_MISSING",
+    });
+    evolutionRequest.budget = { maxTokens: 300, maxCost: 0.2 };
+    await expect(adapter.evolvePlugin!(evolutionRequest)).rejects.toMatchObject({
+      kind: "protocol", usage: { tokens: 321, cost: 0.12 },
+    });
+    evolutionRequest.budget = { maxTokens: 400, maxCost: 0.1 };
+    await expect(adapter.evolvePlugin!(evolutionRequest)).rejects.toMatchObject({
+      kind: "protocol", usage: { tokens: 321, cost: 0.12 },
+    });
+    await expect(adapter.smokeModel!(modelProfile)).resolves.toMatchObject({ providerText: "model:smoke:fd4" });
+    for (const [kind, label, code] of [
+      ["transient-provider", "瞬态提供方故障", "RATE_LIMIT"],
+      ["provider", "提供方故障", "AUTH"],
+      ["protocol", "协议故障", "MODEL_CALL_BUDGET_EXHAUSTED"],
+      ["process", "进程故障", "SDK_RUNTIME_FAILED"],
+    ] as const) {
+      writeFileSync(smokePath, `#!/usr/bin/env node\nprocess.stdin.resume();process.stdin.on("end",()=>process.stdout.write(JSON.stringify({type:"maze-arena.harness-smoke.response",protocolVersion:1,error:{kind:${JSON.stringify(kind)},code:${JSON.stringify(code)}},usage:{tokens:0,cost:0,modelCalls:0}})));\n`);
+      const failure = adapter.smokeModel!(modelProfile);
+      await expect(failure).rejects.toMatchObject({ name: "HarnessInvocationError", kind });
+      await expect(failure).rejects.toThrow(`DSH 冒烟调用失败（${label}：${code}）`);
+    }
+  });
+
+  it("生产 Harness 为并发 smoke 隔离可写 home，并在成功、失败与超时后清理", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "maze-production-smoke-home-"));
+    const exportPath = join(directory, "models.json");
+    const globalHome = join(directory, "global-home");
+    const successPath = join(directory, "smoke-success.mjs");
+    const failurePath = join(directory, "smoke-failure.mjs");
+    const timeoutPath = join(directory, "smoke-timeout.mjs");
+    const escapeTarget = join(directory, "escape-target.txt");
+    mkdirSync(globalHome, { mode: 0o700 });
+    writeFileSync(join(globalHome, "readonly.txt"), "global-home-unchanged", { mode: 0o400 });
+    chmodSync(globalHome, 0o500);
+    writeFileSync(escapeTarget, "must-not-be-followed", { mode: 0o600 });
+    writeFileSync(exportPath, JSON.stringify({
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://PRODUCTION_CRED"],
+      providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
+        reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
+      } }] }],
+    }));
+    const lockSessionTree = `
+const nested=home+"/nested/deep";mkdirSync(nested,{recursive:true});
+writeFileSync(nested+"/locked.txt","locked");symlinkSync(${JSON.stringify(escapeTarget)},home+"/escape-link");
+chmodSync(nested+"/locked.txt",0o000);chmodSync(nested,0o000);chmodSync(home+"/nested",0o000);chmodSync(home,0o000);`;
+    writeFileSync(successPath, `#!/usr/bin/env node
+import { chmodSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+let input="";for await(const chunk of process.stdin)input+=chunk;JSON.parse(input);
+const home=process.env.DSH_HOME;writeFileSync(home+"/.maze-arena-sdk.patch.yml","session-only");
+await new Promise((resolve)=>setTimeout(resolve,100));
+const credential=readFileSync(4,"utf8");
+const response=JSON.stringify({type:"maze-arena.harness-smoke.response",protocolVersion:1,result:{providerText:JSON.stringify({home,homeMatches:home===process.env.HOME&&home===process.env.TMPDIR,mode:statSync(home).mode&0o777,credentialPassed:credential.includes("opaque-smoke-secret"),credentialNotInEnvironment:process.env.PRODUCTION_CRED===undefined})},usage:{tokens:1,cost:0,modelCalls:1}});
+${lockSessionTree}
+process.stdout.write(response);
+`);
+    writeFileSync(failurePath, `#!/usr/bin/env node
+import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";const home=process.env.DSH_HOME;
+${lockSessionTree}
+process.exit(7);
+`);
+    writeFileSync(timeoutPath, `#!/usr/bin/env node
+import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";const home=process.env.DSH_HOME;
+${lockSessionTree}
+setInterval(()=>{},1000);
+`);
+    for (const path of [successPath, failurePath, timeoutPath]) chmodSync(path, 0o755);
+    const smokeHomes = () => readdirSync(tmpdir()).filter((entry) => entry.startsWith("maze-dsh-smoke-")).sort();
+    const before = smokeHomes();
+    const createAdapter = (smokeCommand: string, timeout = "5000") => createProductionHarnessAdapter({
+      ARENA_MODEL_CATALOG_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
+      DSH_EVOLUTION_COMMAND: successPath, DSH_SMOKE_COMMAND: smokeCommand, DSH_HOME: globalHome,
+      DSH_EVOLUTION_TIMEOUT_MS: timeout, DSH_EVOLUTION_EXECUTION_KIND: "deterministic-fixture",
+      PRODUCTION_CRED: "opaque-smoke-secret",
+    });
+    const profileInput = { providerId: "provider", modelId: "model", credentialRef: "dsh-credential://PRODUCTION_CRED",
+      contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 };
+    try {
+      const success = createAdapter(successPath);
+      const profile = success.validateModelProfile(profileInput);
+      const reports = await Promise.all([success.smokeModel!(profile), success.smokeModel!(profile)]);
+      const evidence = reports.map(({ providerText }) => JSON.parse(providerText ?? "{}") as Record<string, unknown>);
+      expect(new Set(evidence.map(({ home }) => home)).size).toBe(2);
+      expect(evidence).toEqual(evidence.map(({ home }) => ({
+        home, homeMatches: true, mode: 0o700, credentialPassed: true, credentialNotInEnvironment: true,
+      })));
+      for (const { home } of evidence) expect(existsSync(String(home))).toBe(false);
+      expect(smokeHomes()).toEqual(before);
+
+      const failure = createAdapter(failurePath);
+      await expect(failure.smokeModel!(failure.validateModelProfile(profileInput))).rejects.toThrow(/退出码 7/);
+      expect(smokeHomes()).toEqual(before);
+
+      const timeout = createAdapter(timeoutPath, "1000");
+      await expect(timeout.smokeModel!(timeout.validateModelProfile(profileInput))).rejects.toThrow(/超过超时限制/);
+      expect(smokeHomes()).toEqual(before);
+      expect(readFileSync(join(globalHome, "readonly.txt"), "utf8")).toBe("global-home-unchanged");
+      expect(readdirSync(globalHome)).toEqual(["readonly.txt"]);
+      expect(readFileSync(escapeTarget, "utf8")).toBe("must-not-be-followed");
+      expect(JSON.stringify(reports)).not.toContain("opaque-smoke-secret");
+    } finally {
+      chmodSync(globalHome, 0o700);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["权限恢复", "最终删除"] as const)("smoke 操作失败与%s系统调用失败时保留组合错误且不遗留", async (stage) => {
+    const before = readdirSync(tmpdir()).filter((entry) => entry.startsWith("maze-dsh-smoke-")).sort();
+    const operationError = new Error("original-smoke-operation-error");
+    let injected = false;
+    let chmodCalls = 0;
+    let caught: unknown;
+    try {
+      await withSmokeSessionHome(async (home) => {
+        mkdirSync(join(home, "nested", "deep"), { recursive: true });
+        writeFileSync(join(home, "nested", "deep", "locked.txt"), "locked");
+        chmodSync(join(home, "nested", "deep"), 0o000);
+        chmodSync(join(home, "nested"), 0o000);
+        chmodSync(home, 0o000);
+        throw operationError;
+      }, stage === "权限恢复" ? {
+        chmodSync: (path, mode) => {
+          chmodSync(path, mode);
+          chmodCalls += 1;
+          if (chmodCalls === 2) {
+            injected = true;
+            throw new Error("injected-restore-access-error");
+          }
+        },
+      } : {
+        rmSync: (path, options) => {
+          rmSync(path, options);
+          if (!injected) {
+            injected = true;
+            throw new Error("injected-final-remove-error");
+          }
+        },
+      });
+    } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).errors[0]).toBe(operationError);
+    expect(String(caught)).toContain("DSH 冒烟失败且 Session home 清理失败");
+    expect(JSON.stringify((caught as AggregateError).errors, Object.getOwnPropertyNames(operationError))).not.toContain("opaque-secret");
+    expect(readdirSync(tmpdir()).filter((entry) => entry.startsWith("maze-dsh-smoke-")).sort()).toEqual(before);
+  });
+
+  it("smoke Session 权限初始化失败时仍清理已创建目录", async () => {
+    const before = readdirSync(tmpdir()).filter((entry) => entry.startsWith("maze-dsh-smoke-")).sort();
+    const initializationError = new Error("injected-session-initialization-error");
+    let operationCalled = false;
+    let caught: unknown;
+    try {
+      await withSmokeSessionHome(async () => { operationCalled = true; }, { chmodSync: () => { throw initializationError; } });
+    } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).errors[0]).toBe(initializationError);
+    expect(operationCalled).toBe(false);
+    expect(readdirSync(tmpdir()).filter((entry) => entry.startsWith("maze-dsh-smoke-")).sort()).toEqual(before);
   });
 
   it("生产 Harness 每次调用前复核实例快照，依赖载荷漂移后关闭失败", async () => {
@@ -1409,7 +2019,7 @@ describe("实验工作台 API", () => {
     const commandPath = join(runtimeRoot, "harness.mjs");
     const dependencyPath = join(runtimeRoot, "runtime-dependency.txt");
     writeFileSync(exportPath, JSON.stringify({
-      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://PRODUCTION_CRED"],
       providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
         reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
       } }] }],
@@ -1418,7 +2028,11 @@ describe("实验工作台 API", () => {
     writeFileSync(commandPath, `#!/usr/bin/env node
 import { readFileSync } from "node:fs";
 process.stdin.resume();
-process.stdin.on("end", () => process.stdout.write(JSON.stringify({ providerText: readFileSync(${JSON.stringify(dependencyPath)}, "utf8").trim() })));
+process.stdin.on("end", () => process.stdout.write(JSON.stringify({
+  type: "maze-arena.harness-smoke.response", protocolVersion: 1,
+  result: { providerText: readFileSync(${JSON.stringify(dependencyPath)}, "utf8").trim() },
+  usage: { tokens: 1, cost: 0, modelCalls: 1 },
+})));
 `);
     chmodSync(commandPath, 0o755);
     const payloadSha256 = hashHarnessRuntimePayload(runtimeRoot);
@@ -1431,9 +2045,11 @@ process.stdin.on("end", () => process.stdout.write(JSON.stringify({ providerText
       DSH_HARNESS_RUNTIME_SHA256: payloadSha256,
     });
     const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model",
-      credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+      credentialRef: "dsh-credential://PRODUCTION_CRED", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
 
-    await expect(adapter.smokeModel!(modelProfile)).resolves.toEqual({ providerText: "A" });
+    await expect(adapter.smokeModel!(modelProfile)).resolves.toEqual({
+      providerText: "A", usage: { tokens: 1, cost: 0, modelCalls: 1 },
+    });
     writeFileSync(dependencyPath, "B\n");
     await expect(adapter.smokeModel!(modelProfile)).rejects.toThrow(/Harness runtime 冻结载荷身份已漂移/);
   });
@@ -1449,7 +2065,7 @@ process.stdin.on("end", () => process.stdout.write(JSON.stringify({ providerText
     writeFileSync(join(workspace, "package.json"), JSON.stringify({ name: "fixture-plugin", version: "1.0.0" }));
     writeFileSync(join(workspace, "src/index.ts"), "export const baseline = true;\n");
     writeFileSync(exportPath, JSON.stringify({
-      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://PRODUCTION_CRED"],
       providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
         reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
       } }] }],
@@ -1462,7 +2078,7 @@ process.stdin.on("end", () => process.stdout.write(JSON.stringify({ providerText
       DSH_HOME: globalHome,
     });
     const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model",
-      credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+      credentialRef: "dsh-credential://PRODUCTION_CRED", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
 
     const request = productionEvolutionRequest({
       experimentId: "exp", generation: 1, role: "generator", attemptId: "deterministic-1",
@@ -1497,7 +2113,7 @@ process.stdin.on("end", () => process.stdout.write(JSON.stringify({ providerText
     writeFileSync(join(workspace, "package.json"), JSON.stringify({ name: "fixture-plugin", version: "1.0.0" }));
     writeFileSync(join(workspace, "src/index.ts"), "export const baseline = true;\n");
     writeFileSync(exportPath, JSON.stringify({
-      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://PRODUCTION_CRED"],
       providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
         reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
       } }] }],
@@ -1508,7 +2124,7 @@ process.stdin.on("end", () => process.stdout.write(JSON.stringify({ providerText
       DSH_SMOKE_COMMAND: "/bin/false", DSH_EVOLUTION_EXECUTION_KIND: "deterministic-fixture",
     });
     const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model",
-      credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+      credentialRef: "dsh-credential://PRODUCTION_CRED", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
     const attemptId = `g0001-${role}`;
     const hiddenMetrics: Record<string, number> = role === "generator"
       ? { gateFailures: 0, failedCases: 1, extraActions: 2, structuralNovelty: 3 }
@@ -1722,7 +2338,7 @@ process.stdin.on("end", () => process.stdout.write(JSON.stringify({ providerText
     mkdirSync(globalHome);
     writeFileSync(join(workspace, "package.json"), JSON.stringify({ name: "ipc-fixture", version: "1.0.0" }));
     writeFileSync(exportPath, JSON.stringify({
-      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://PRODUCTION_CRED"],
       providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
         reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
       } }] }],
@@ -1740,7 +2356,7 @@ const dockerConnections=await Promise.all(dockerPaths.map(connectable));
 const result={dockerVisible:dockerPaths.some(existsSync),dockerConnect:dockerConnections.some((value)=>value.connected),homeVisible:existsSync(${JSON.stringify(hostSocket)}),homeConnect:(await connectable(${JSON.stringify(hostSocket)})).connected,mountVisible:existsSync(mountedSocket),mountConnect:(await connectable(mountedSocket)).connected,abstractConnect:await connectable(${JSON.stringify(abstractSocket)}),tcpLoopback:await tcpLoopback(),tmpWritable:writable("/tmp/unscoped-write"),runWritable:writable("/run/unscoped-write")};
 writeFileSync(request.session.home+"/ipc-session-write.txt","allowed");
 writeFileSync(request.session.workspace+"/ipc-workspace-write.txt","allowed");
-process.stdout.write(JSON.stringify({type:"maze-arena.harness-evolution.response",protocolVersion:1,sessionId:request.session.id,result:{hypothesis:JSON.stringify(result),strategyPlan:"ipc boundary",submitted:false},usage:{tokens:1,cost:0}}));
+process.stdout.write(JSON.stringify({type:"maze-arena.harness-evolution.response",protocolVersion:1,sessionId:request.session.id,result:{hypothesis:JSON.stringify(result),strategyPlan:"ipc boundary",submitted:false},usage:{tokens:1,cost:0,modelCalls:1}}));
 `);
     chmodSync(commandPath, 0o755);
     const listener = createNetServer();
@@ -1762,7 +2378,7 @@ process.stdout.write(JSON.stringify({type:"maze-arena.harness-evolution.response
         DSH_HOME: globalHome,
       });
       const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model",
-        credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+        credentialRef: "dsh-credential://PRODUCTION_CRED", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
       const request = productionEvolutionRequest({
         experimentId: "exp", generation: 1, role: "generator", attemptId: "ipc-check",
         modelProfile, workspace, repairAttempt: 0, diagnostics: [],
@@ -1796,7 +2412,7 @@ process.stdout.write(JSON.stringify({type:"maze-arena.harness-evolution.response
     const exportPath = join(directory, "models.json");
     const commandPath = join(directory, "fail.mjs");
     writeFileSync(exportPath, JSON.stringify({
-      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://PRODUCTION_CRED"],
       providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
         reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
       } }] }],
@@ -1808,7 +2424,7 @@ process.stdout.write(JSON.stringify({type:"maze-arena.harness-evolution.response
       DSH_EVOLUTION_COMMAND: commandPath, DSH_SMOKE_COMMAND: commandPath,
     });
     const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model",
-      credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+      credentialRef: "dsh-credential://PRODUCTION_CRED", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
     let message = "";
     try {
       await adapter.evolvePlugin!(productionEvolutionRequest({ experimentId: "exp", generation: 1, role: "generator", attemptId: "attempt",
@@ -1826,7 +2442,7 @@ process.stdout.write(JSON.stringify({type:"maze-arena.harness-evolution.response
     const markerPath = join(directory, "executed");
     const commandPath = join(directory, "must-not-run.mjs");
     writeFileSync(exportPath, JSON.stringify({
-      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://PRODUCTION_CRED"],
       providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
         reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
       } }] }],
@@ -1839,7 +2455,7 @@ process.stdout.write(JSON.stringify({type:"maze-arena.harness-evolution.response
       DSH_UNSHARE_EXECUTABLE: "/bin/false",
     });
     const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model",
-      credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+      credentialRef: "dsh-credential://PRODUCTION_CRED", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
     await expect(adapter.smokeModel!(modelProfile)).rejects.toThrow(/无法建立受控 PID namespace/);
     expect(existsSync(markerPath)).toBe(false);
   });
@@ -1849,30 +2465,47 @@ process.stdout.write(JSON.stringify({type:"maze-arena.harness-evolution.response
     const exportPath = join(directory, "models.json");
     const commandPath = join(directory, "evolve.mjs");
     writeFileSync(exportPath, JSON.stringify({
-      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://PRODUCTION_CRED"],
       providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
         reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
       } }] }],
     }));
     writeFileSync(commandPath, `#!/usr/bin/env node
+import fs from "node:fs";
 let input="";for await(const chunk of process.stdin)input+=chunk;const request=JSON.parse(input);
 const mode=request.attempt.attemptId;
 if(mode==="block"){setInterval(()=>{},1000);await new Promise(()=>{});}
 if(mode==="non-json"){process.stdout.write("not-json");process.exit(0);}
 if(mode==="transient-provider"){process.stdout.write(JSON.stringify({
   type:"maze-arena.harness-evolution.response",protocolVersion:1,sessionId:request.session.id,
-  error:{kind:"transient-provider",code:"RATE_LIMITED"},usage:{tokens:7,cost:0.02},
+  error:{kind:"transient-provider",code:"RATE_LIMITED"},usage:{tokens:7,cost:0.02,modelCalls:1},modelCalls:1,
 }));process.exit(0);}
+if(mode==="transient-no-usage"){process.stdout.write(JSON.stringify({
+  type:"maze-arena.harness-evolution.response",protocolVersion:1,sessionId:request.session.id,
+  error:{kind:"transient-provider",code:"TRANSPORT"},usage:null,modelCalls:1,
+}));process.exit(0);}
+if(mode==="diagnostic"){const stale=process.env.DSH_DIAGNOSTIC_PATH;const nonce=process.env.DSH_DIAGNOSTIC_NONCE;
+  if(stale)fs.writeFileSync(stale,JSON.stringify({schemaVersion:1,sessionId:request.session.id,diagnosticNonce:"stale",events:[],modelCalls:99,stderrBytes:0,error:{code:"STALE_SECRET"}}));
+  process.stdout.write(JSON.stringify({type:"maze-arena.harness-evolution.response",protocolVersion:1,sessionId:request.session.id,
+    error:{kind:"provider",code:"UNKNOWN"},usage:{tokens:7,cost:0.02,modelCalls:1},modelCalls:1,
+    diagnostic:{schemaVersion:1,sessionId:request.session.id,diagnosticNonce:nonce,modelCalls:1,usage:{tokens:7,cost:0.02},events:[
+      {type:"request/context",data:{provider:"provider",model:"model",contextWindow:4000}},
+      {type:"turn/end",data:{turn:1,reason:{kind:"error",error:{code:"UNKNOWN",failureFacts:{status:503,requestId:"diag-1",messageFingerprint:"0123456789abcdef",dataType:"object",dataCode:"RATE_LIMIT",dataStatus:429,dataFingerprint:"fedcba9876543210"}}}}}],
+      stderrBytes:3,error:{code:"UNKNOWN",failureFacts:{status:503,requestId:"diag-1",messageFingerprint:"0123456789abcdef",dataType:"object",dataCode:"RATE_LIMIT",dataStatus:429,dataFingerprint:"fedcba9876543210"}},finalization:{}}}));process.exit(0);}
 if(mode==="unknown-field"){process.stdout.write(JSON.stringify({
   type:"maze-arena.harness-evolution.response",protocolVersion:1,sessionId:request.session.id,
-  result:{hypothesis:"h",strategyPlan:"p",submitted:true},usage:{tokens:37,cost:0.25},unexpected:true,
+  result:{hypothesis:"h",strategyPlan:"p",submitted:true},usage:{tokens:37,cost:0.25,modelCalls:1},unexpected:true,
+}));process.exit(0);}
+if(mode==="aggregate-budget"){process.stdout.write(JSON.stringify({
+  type:"maze-arena.harness-evolution.response",protocolVersion:1,sessionId:request.session.id,
+  result:{hypothesis:"aggregate-budget",strategyPlan:"bounded",submitted:true},usage:{tokens:1,cost:0,modelCalls:1},
 }));process.exit(0);}
 process.stdout.write(JSON.stringify({
   type:"maze-arena.harness-evolution.response",
   protocolVersion:mode==="future-version"?2:1,
   sessionId:request.session.id,
   result:{hypothesis:"h",strategyPlan:"p",submitted:true},
-  usage:mode==="excessive-usage"?{tokens:5001,cost:0}:{tokens:1,cost:0,untrusted:true},
+  usage:mode==="excessive-usage"?{tokens:5001,cost:0,modelCalls:1}:{tokens:1,cost:0,modelCalls:1,untrusted:true},
 }));
 `);
     chmodSync(commandPath, 0o755);
@@ -1880,7 +2513,7 @@ process.stdout.write(JSON.stringify({
       ARENA_MODEL_CATALOG_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
       DSH_EVOLUTION_COMMAND: commandPath, DSH_SMOKE_COMMAND: "/bin/false",
     });
-    const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model", credentialRef: "dsh-credential://production",
+    const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model", credentialRef: "dsh-credential://PRODUCTION_CRED",
       contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
     const request = productionEvolutionRequest({ experimentId: "exp", generation: 1, role: "generator" as const,
       attemptId: "invalid", modelProfile, workspace: directory, repairAttempt: 0, diagnostics: [] });
@@ -1888,18 +2521,79 @@ process.stdout.write(JSON.stringify({
     await expect(adapter.evolvePlugin!(productionEvolutionRequest({ ...request, attemptId: "future-version" })))
       .rejects.toThrow(/响应字段非法/);
     await expect(adapter.evolvePlugin!(productionEvolutionRequest({ ...request, attemptId: "excessive-usage" })))
-      .rejects.toMatchObject({ name: "HarnessInvocationError", kind: "protocol", usage: undefined });
+      .rejects.toMatchObject({ name: "HarnessInvocationError", kind: "protocol", usage: { tokens: 5_001, cost: 0 } });
     await expect(adapter.evolvePlugin!(productionEvolutionRequest({ ...request, attemptId: "non-json" })))
       .rejects.toThrow(/未返回合法 JSON/);
     await expect(adapter.evolvePlugin!(productionEvolutionRequest({ ...request, attemptId: "transient-provider" })))
-      .rejects.toMatchObject({ name: "HarnessInvocationError", kind: "transient-provider", usage: { tokens: 7, cost: 0.02 } });
+      .rejects.toMatchObject({ name: "HarnessInvocationError", kind: "transient-provider", code: "RATE_LIMITED",
+        usage: { tokens: 7, cost: 0.02 } });
+    await expect(adapter.evolvePlugin!(productionEvolutionRequest({ ...request, attemptId: "transient-no-usage" })))
+      .rejects.toMatchObject({ name: "HarnessInvocationError", kind: "transient-provider", code: "TRANSPORT",
+        usage: undefined, attemptedModelCalls: 1 });
+    const diagnosticFailure = adapter.evolvePlugin!(productionEvolutionRequest({ ...request, attemptId: "diagnostic" }));
+    await expect(diagnosticFailure).rejects.toMatchObject({
+      name: "HarnessInvocationError", kind: "provider", code: "UNKNOWN",
+      diagnostic: {
+        modelCalls: 1,
+        requestContext: { provider: "provider", model: "model", contextWindow: 4_000 },
+       failureFacts: {
+         status: 503, requestId: "diag-1", messageFingerprint: "0123456789abcdef",
+         dataType: "object", dataCode: "RATE_LIMIT", dataStatus: 429, dataFingerprint: "fedcba9876543210",
+       },
+     },
+   });
+    const diagnosticError = await diagnosticFailure.catch((error) => error) as HarnessInvocationError;
+    expect(JSON.stringify(diagnosticError.diagnostic)).not.toContain("STALE_SECRET");
     await expect(adapter.evolvePlugin!(productionEvolutionRequest({ ...request, attemptId: "unknown-field" })))
       .rejects.toMatchObject({
         name: "HarnessInvocationError",
         kind: "protocol",
+        code: "RESULT_ENVELOPE_INVALID",
         usage: { tokens: 37, cost: 0.25 },
         execution: { kind: "real-provider", harnessVersion: "2026.09.2", providerId: "provider", modelId: "model" },
       });
+
+    const aggregateBudget = productionEvolutionRequest({ ...request, attemptId: "aggregate-budget" });
+    aggregateBudget.budget = { maxTokens: 7_512, maxCost: 0.5, maxModelCalls: 2 };
+    await expect(adapter.evolvePlugin!(aggregateBudget)).resolves.toMatchObject({
+      hypothesis: "aggregate-budget",
+      usage: { tokens: 1, cost: 0, modelCalls: 1 },
+      execution: {
+        kind: "real-provider", sessionId: aggregateBudget.sessionId, harnessVersion: "2026.09.2",
+        providerId: "provider", modelId: "model",
+      },
+    });
+
+    const invalidBudgets = [
+      { maxTokens: 0, maxCost: 0.5 },
+      { maxTokens: 7_512.5, maxCost: 0.5 },
+      { maxTokens: 7_512, maxCost: 0 },
+      { maxTokens: 7_512, maxCost: Number.POSITIVE_INFINITY },
+      { maxTokens: 7_512, maxCost: 0.5, maxModelCalls: 0 },
+      { maxTokens: 7_512, maxCost: 0.5, maxModelCalls: 9 },
+    ];
+    for (const budget of invalidBudgets) {
+      const invalidBudget = productionEvolutionRequest({ ...request, attemptId: "aggregate-budget" });
+      invalidBudget.budget = budget;
+      await expect(adapter.evolvePlugin!(invalidBudget)).rejects.toMatchObject({
+        name: "HarnessInvocationError",
+        kind: "protocol",
+        execution: {
+          kind: "real-provider", protocolVersion: 1, sessionId: invalidBudget.sessionId,
+          harnessVersion: "2026.09.2", providerId: "provider", modelId: "model",
+        },
+      });
+    }
+
+    const invalidSession = { ...productionEvolutionRequest({ ...request, attemptId: "aggregate-budget" }), sessionId: "invalid-session" };
+    await expect(adapter.evolvePlugin!(invalidSession)).rejects.toMatchObject({
+      name: "HarnessInvocationError",
+      kind: "process",
+      execution: {
+        kind: "real-provider", protocolVersion: 1, sessionId: "invalid-session",
+        harnessVersion: "2026.09.2", providerId: "provider", modelId: "model",
+      },
+    });
 
     const controller = new AbortController();
     const blocked = adapter.evolvePlugin!({ ...request, attemptId: "block", signal: controller.signal });
@@ -1912,7 +2606,7 @@ process.stdout.write(JSON.stringify({
     const exportPath = join(directory, "models.json");
     const commandPath = join(directory, "process-tree.mjs");
     writeFileSync(exportPath, JSON.stringify({
-      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://production"],
+      schemaVersion: 1, harnessVersion: "2026.09.2", credentialRefs: ["dsh-credential://PRODUCTION_CRED"],
       providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
         reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000, providerOptions: {},
       } }] }],
@@ -1936,7 +2630,7 @@ setTimeout(() => {
   if (request.attempt.attemptId === "error") process.exit(7);
   if (request.attempt.attemptId === "success") {
     process.stdout.write(JSON.stringify({ type: "maze-arena.harness-evolution.response", protocolVersion: 1,
-      sessionId: request.session.id, result: { hypothesis: "h", strategyPlan: "p", submitted: true }, usage: { tokens: 1, cost: 0 } }));
+      sessionId: request.session.id, result: { hypothesis: "h", strategyPlan: "p", submitted: true }, usage: { tokens: 1, cost: 0, modelCalls: 1 } }));
     process.exit(0);
   }
 }, 100);
@@ -1946,10 +2640,10 @@ setInterval(() => {}, 1000);
     const adapter = createProductionHarnessAdapter({
       ARENA_MODEL_CATALOG_PATH: exportPath, DSH_HARNESS_VERSION: "2026.09.2",
       DSH_EVOLUTION_COMMAND: commandPath, DSH_SMOKE_COMMAND: commandPath,
-      DSH_EVOLUTION_TIMEOUT_MS: "1000",
+      DSH_EVOLUTION_TIMEOUT_MS: "1000", DSH_EVOLUTION_EXECUTION_KIND: "deterministic-fixture",
     });
     const modelProfile = adapter.validateModelProfile({ providerId: "provider", modelId: "model",
-      credentialRef: "dsh-credential://production", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
+      credentialRef: "dsh-credential://PRODUCTION_CRED", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000 });
     const assertTreeStopped = async (attemptId: "success" | "cancel" | "timeout" | "stdout-limit" | "stderr-limit" | "error") => {
       const controller = new AbortController();
       const running = adapter.evolvePlugin!(productionEvolutionRequest({ experimentId: "exp", generation: 1, role: "generator", attemptId,

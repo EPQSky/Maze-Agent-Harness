@@ -3,10 +3,17 @@ import { ExperimentRuntimeRepository, withProviderRetry } from "@maze-arena/cont
 import { HarnessInvocationError } from "./harness-invocation-error.js";
 import type { AuditRepository } from "./audit-repository.js";
 import type { ExperimentRepository } from "./experiment-repository.js";
+import { reconcileProviderUsageItems } from "./provider-usage-reconciliation.js";
 
 export interface AutonomousRoleExecution {
   result: GenerationRoleResult;
-  usage: { tokens: number; cost: number };
+  usage: { tokens: number; cost: number; modelCalls?: number };
+}
+
+export interface AutonomousUsageBudget {
+  remaining(): { tokens: number; cost: number };
+  consume(usage: { tokens: number; cost: number; modelCalls?: number }): boolean;
+  consumeOnce?(batchId: string, usage: { tokens: number; cost: number; modelCalls?: number }): boolean;
 }
 
 export interface AutonomousEvolutionAdapter {
@@ -17,6 +24,7 @@ export interface AutonomousEvolutionAdapter {
     attemptId: string;
     frozenChampions: Readonly<Record<EvolutionRole, string>>;
     compatibilityFingerprint: string;
+    usageBudget?: AutonomousUsageBudget;
     signal: AbortSignal;
   }): Promise<AutonomousRoleExecution>;
   createChampionExhibition?(input: {
@@ -35,6 +43,8 @@ export class AutonomousExperimentRunner {
     private readonly adapter: AutonomousEvolutionAdapter,
     private readonly backupTerminal: (experimentId: string) => void = () => undefined,
     private readonly backupStart: (experimentId: string) => void = () => undefined,
+    private readonly usageBudgetFor: (experimentId: string) => AutonomousUsageBudget | undefined = () => undefined,
+    private readonly terminalSettled: (experimentId: string, snapshot: ExperimentRuntimeSnapshot) => void = () => undefined,
   ) {}
 
   resumePersisted(): void {
@@ -44,13 +54,18 @@ export class AutonomousExperimentRunner {
         this.backupStart(snapshot.experimentId);
         this.launch(snapshot.experimentId);
       }
+      else if (isTerminal(snapshot)) this.terminalSettled(snapshot.experimentId, snapshot);
     }
   }
 
   launch(experimentId: string): void {
     if (this.tasks.has(experimentId)) return;
     const controller = new AbortController();
-    const task = this.run(experimentId, controller.signal).finally(() => this.tasks.delete(experimentId));
+    const task = this.run(experimentId, controller.signal).finally(() => {
+      this.tasks.delete(experimentId);
+      const snapshot = this.runtime.get(experimentId);
+      if (snapshot && isTerminal(snapshot)) this.terminalSettled(experimentId, snapshot);
+    });
     this.tasks.set(experimentId, { controller, task });
   }
 
@@ -58,6 +73,8 @@ export class AutonomousExperimentRunner {
     const active = this.tasks.get(experimentId);
     active?.controller.abort();
     if (active) await active.task;
+    const snapshot = this.runtime.get(experimentId);
+    if (snapshot && isTerminal(snapshot)) this.terminalSettled(experimentId, snapshot);
   }
 
   async pause(experimentId: string): Promise<ExperimentRuntimeSnapshot> {
@@ -70,6 +87,7 @@ export class AutonomousExperimentRunner {
       : current;
     if (!paused) throw new Error("实验运行时不存在");
     this.experiments.setStatus(experimentId, experimentStatus(paused));
+    if (isTerminal(paused)) this.terminalSettled(experimentId, paused);
     return paused;
   }
 
@@ -85,38 +103,59 @@ export class AutonomousExperimentRunner {
       const generation = before.generation + 1;
       const champions = Object.freeze({ ...before.champions });
       const results = {} as Record<EvolutionRole, GenerationRoleResult>;
-      const uncheckpointedUsage = { tokens: 0, cost: 0 };
+      const uncheckpointedUsage = { tokens: 0, cost: 0, modelCalls: 0 };
+      let activeRole: EvolutionRole | undefined;
       try {
         for (const role of ["generator", "solver"] as const) {
+          activeRole = role;
+          const usageBudget = this.usageBudgetFor(experimentId);
+          reconcileProviderUsageItems({
+            runtime: this.runtime, audits: this.audits, usageBudget, experimentId, generation, role,
+          });
           const checkpoint = this.runtime.getRoleCheckpoint(experimentId, generation, role);
           if (checkpoint) { results[role] = checkpoint.result; continue; }
           const attemptId = `g${String(generation).padStart(4, "0")}-${role}`;
+          const remaining = usageBudget?.remaining();
+          if (remaining && (remaining.tokens <= 0 || remaining.cost <= 0)) {
+            throw new Error("金丝雀硬预算已耗尽，拒绝开始下一角色");
+          }
           const execution = await withProviderRetry(() => {
             if (signal.aborted) return Promise.reject(new Error("自治任务已取消"));
             return this.adapter.runRole({
               experimentId, generation, role, attemptId, frozenChampions: champions,
-              compatibilityFingerprint: before.compatibilityFingerprint, signal,
+              compatibilityFingerprint: before.compatibilityFingerprint, usageBudget, signal,
             });
           }, async (attempt) => new Promise((resolve) => setTimeout(resolve, attempt * 10)), (error) => {
-            if (error instanceof HarnessInvocationError && error.usage) {
+            if (error instanceof HarnessInvocationError && error.usage && !error.usageLedgerBacked) {
               uncheckpointedUsage.tokens += error.usage.tokens;
               uncheckpointedUsage.cost += error.usage.cost;
+              uncheckpointedUsage.modelCalls += error.usage.modelCalls ?? 0;
             }
             return !signal.aborted && error instanceof HarnessInvocationError && error.kind === "transient-provider";
           });
           execution.usage.tokens += uncheckpointedUsage.tokens;
           execution.usage.cost += uncheckpointedUsage.cost;
+          execution.usage.modelCalls = (execution.usage.modelCalls ?? 0) + uncheckpointedUsage.modelCalls;
           validateRoleResult(role, champions[role], execution);
           this.runtime.saveRoleCheckpoint({ experimentId, generation, role, attemptId, ...execution.usage, result: execution.result });
           uncheckpointedUsage.tokens = 0;
           uncheckpointedUsage.cost = 0;
+          uncheckpointedUsage.modelCalls = 0;
           results[role] = execution.result;
           // 已完成的角色副作用必须先落检查点，暂停或取消才能从下一原子步骤恢复。
           if (signal.aborted) return;
         }
       } catch (error) {
-        if (uncheckpointedUsage.tokens > 0 || uncheckpointedUsage.cost > 0) {
-          this.runtime.recordUsage(experimentId, uncheckpointedUsage.tokens, uncheckpointedUsage.cost);
+        const ledgerBacked = error instanceof HarnessInvocationError && error.usageLedgerBacked;
+        if (ledgerBacked && activeRole) {
+          this.runtime.recordRoleFailureUsage({
+            experimentId, generation, role: activeRole, tokens: 0, cost: 0, modelCalls: 0,
+          });
+        } else if (uncheckpointedUsage.tokens > 0 || uncheckpointedUsage.cost > 0) {
+          if (activeRole) this.runtime.recordRoleFailureUsage({
+            experimentId, generation, role: activeRole, ...uncheckpointedUsage,
+          });
+          else this.runtime.recordUsage(experimentId, uncheckpointedUsage.tokens, uncheckpointedUsage.cost, uncheckpointedUsage.modelCalls);
         }
         if (signal.aborted) return;
         // Provider 与模型控制的异常文本不得进入运行时状态或公开审计，只持久化稳定分类。
@@ -176,6 +215,10 @@ export class AutonomousExperimentRunner {
 
 function experimentStatus(snapshot: ExperimentRuntimeSnapshot): "draft" | "running" | "paused" | "completed" | "failed" | "cancelled" {
   return snapshot.state === "ready" ? "draft" : snapshot.state;
+}
+
+function isTerminal(snapshot: ExperimentRuntimeSnapshot): boolean {
+  return ["paused", "completed", "failed", "cancelled"].includes(snapshot.state);
 }
 
 function validateRoleResult(role: EvolutionRole, champion: string, execution: AutonomousRoleExecution): void {

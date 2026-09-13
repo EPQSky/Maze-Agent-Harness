@@ -8,13 +8,21 @@ const stepLabels: Record<string, string> = {
   "event-replay": "事件回放", determinism: "确定性复检", "maze-legality": "迷宫合法性",
   persistence: "持久化", "live-delivery": "直播交付", "paired-evaluation": "配对评测", "promotion-tag": "晋级标签",
 };
-const tabs = ["Arena", "Generations", "Matches", "Lineages", "Candidates", "Audit"] as const;
+const tabs = [
+  { id: "Arena", label: "竞技场" },
+  { id: "Generations", label: "进化代" },
+  { id: "Matches", label: "比赛" },
+  { id: "Lineages", label: "谱系" },
+  { id: "Candidates", label: "候选" },
+  { id: "Audit", label: "审计" },
+] as const;
+type WorkbenchTab = (typeof tabs)[number]["id"];
 
 export function ExperimentWorkbench({ experimentId, modelProfile, onOpenMatch }: { experimentId: string; modelProfile: ModelProfileInput | null; onOpenMatch(matchId: string): void }) {
   const [baseline, setBaseline] = useState<BaselineValidationRecord>();
   const [runtime, setRuntime] = useState<ExperimentRuntimeSnapshot | null>(null);
   const [audit, setAudit] = useState<ExperimentAuditEvent[]>([]);
-  const [tab, setTab] = useState<(typeof tabs)[number]>("Arena");
+  const [tab, setTab] = useState<WorkbenchTab>("Arena");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [derivedName, setDerivedName] = useState("");
@@ -113,7 +121,7 @@ export function ExperimentWorkbench({ experimentId, modelProfile, onOpenMatch }:
     <section className="experiment-workbench" aria-label="自治实验工作台">
       {error ? <div className="error-banner" role="alert">{error}</div> : null}
       <div className="workbench-tabs" role="tablist">
-        {tabs.map((value) => <button key={value} role="tab" aria-selected={tab === value} onClick={() => setTab(value)}>{value}</button>)}
+        {tabs.map(({ id, label }) => <button key={id} role="tab" aria-selected={tab === id} onClick={() => setTab(id)}>{label}</button>)}
       </div>
 
       {tab === "Arena" && (
@@ -134,11 +142,19 @@ export function ExperimentWorkbench({ experimentId, modelProfile, onOpenMatch }:
               </div>;
             })}
           </div>
+          {baseline?.smoke.attempted && <div className="runtime-strip">
+            <span>冒烟 <strong>{baseline.smoke.passed ? "通过" : "失败"}</strong></span>
+            <span>令牌 <strong>{baseline.smoke.usage?.tokens ?? 0}</strong></span>
+            <span>成本 <strong>{baseline.smoke.usage?.cost ?? 0}</strong></span>
+            <span>模型调用 <strong>{baseline.smoke.usage?.modelCalls ?? 0}</strong></span>
+          </div>}
           {runtime && <>
             <div className="runtime-strip">
               <span>阶段 <strong>{runtime.phase}</strong></span><span>代次 <strong>{runtime.generation}</strong></span>
               <span>停滞 <strong>{runtime.stagnationCount}/5</strong></span><span>令牌 <strong>{runtime.usage.tokens}/{runtime.budget.tokenLimit}</strong></span>
               <span>成本 <strong>{runtime.usage.cost}/{runtime.budget.costLimit ?? "不限"}</strong></span>
+              <span>模型调用 <strong>{runtime.usage.modelCalls}</strong></span>
+              <span>保守预留 <strong>{runtime.modelCallsReserved}</strong></span>
               <span>密封 <strong>{runtime.sealed ? "是" : "否"}</strong></span>
               <span>Generator <code>{runtime.champions.generator.substring(0, 12)}</code></span>
               <span>Solver <code>{runtime.champions.solver.substring(0, 12)}</code></span>
@@ -234,7 +250,7 @@ function CandidateEvidenceView({ runtime, audit }: { runtime: ExperimentRuntimeS
 
 function LineageEvidenceView({ runtime, lineages }: { runtime: ExperimentRuntimeSnapshot | null; lineages: LineageHistoryResponse }) {
   return <><div className="evidence-heading"><div><p className="eyebrow">Git 权威证据</p><h3>插件谱系</h3></div><span className="privacy-note"><GitBranch size={14} />候选、冠军与标签可定位</span></div>
-    <div className="champion-grid"><div><GitBranch size={17} /><span>Generator Champion Version</span><code>{runtime?.champions.generator ?? "baseline"}</code></div><div><GitBranch size={17} /><span>Solver Champion Version</span><code>{runtime?.champions.solver ?? "baseline"}</code></div></div>
+    <div className="champion-grid"><div><GitBranch size={17} /><span>生成器冠军版本</span><code>{runtime?.champions.generator ?? "baseline"}</code></div><div><GitBranch size={17} /><span>求解器冠军版本</span><code>{runtime?.champions.solver ?? "baseline"}</code></div></div>
     {(["generator", "solver"] as const).map((role) => <section className="lineage-lane" key={role} aria-label={`${roleLabel(role)} 谱系`}><h4>{roleLabel(role)}</h4>{lineages[role].map((entry) => {
       const isChampion = runtime?.champions[role] === entry.commit;
       return <div className="lineage-row" key={entry.commit}><GitCommitHorizontal size={16} /><div><code>{entry.commit}</code><span>{entry.subject}</span></div><div className="lineage-milestones"><LineageMilestone entry={entry} />{isChampion ? <span className="milestone champion"><Trophy size={12} />当前冠军</span> : null}{entry.tags.map((tag) => <code className="tag-proof" key={tag}>{tag}</code>)}</div></div>;

@@ -17,8 +17,12 @@ import type {
   FrozenExperimentConfiguration,
   GenerationRoleResult,
   MatchListResponse,
+  RealDshCanaryReport,
+  RealDshCanaryRequest,
 } from "@maze-arena/contracts";
+import { REAL_DSH_CANARY_MAX_COST, REAL_DSH_CANARY_MAX_TOKENS } from "@maze-arena/contracts";
 import {
+  assertSupportedRuntimeDatabaseSchema,
   ControlPlaneRepository,
   ExperimentRuntimeRepository,
   type BaselineValidationAdapter,
@@ -50,6 +54,9 @@ import { fileURLToPath } from "node:url";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { extname, join } from "node:path";
+import { createHash } from "node:crypto";
+import { buildCanaryReport, CanaryAcceptanceRepository } from "./canary-acceptance.js";
+import { isImmutableImageReference } from "./immutable-image-reference.js";
 
 export interface ArenaServerOptions {
   databasePath: string;
@@ -71,6 +78,22 @@ export interface ArenaServerOptions {
   versionedMatchRunner?: VersionedMatchRunner;
   autonomousEvolutionAdapter?: AutonomousEvolutionAdapter;
   backupManager?: { create(trigger: "experiment-start" | "experiment-terminal"): unknown };
+  canaryPreflight?: {
+    executionKind: "real-provider" | "deterministic-fixture";
+    serverDoctor(): Promise<{
+      checkedAt: string;
+      runtimeIdentity: {
+        harnessPackage: string;
+        harnessVersion: string;
+        modelCatalogRelease: string;
+        modelReleaseSha256: string;
+        imageDigest: string;
+        harnessRuntimePayloadSha256: string;
+      };
+      completeBackup: { backupId: string; createdAt: string };
+    }>;
+    allowDeterministicTestRun?: boolean;
+  };
 }
 
 type ShutdownSignal = "SIGTERM" | "SIGINT";
@@ -148,6 +171,8 @@ function parseCostLimit(value: unknown): number | null {
 }
 
 export function createArenaServer(options: ArenaServerOptions): FastifyInstance {
+  // 在任何 Repository 建表前拒绝未发布 schema，避免启动失败后留下部分当前结构。
+  assertSupportedRuntimeDatabaseSchema(options.databasePath);
   const server = Fastify({ logger: options.logger ?? false });
   if (options.startupCommitted) {
     server.addHook("onRequest", async (_request, reply) => {
@@ -163,6 +188,7 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
   const audits = new AuditRepository(options.databasePath);
   const controlPlane = new ControlPlaneRepository(options.databasePath);
   const runtime = new ExperimentRuntimeRepository(options.databasePath);
+  const canaries = new CanaryAcceptanceRepository(options.databasePath);
   const lineageRoot = options.databasePath === ":memory:"
     ? `${harnessRoot}.lineages`
     : resolve(dirname(options.databasePath), "lineages");
@@ -177,6 +203,66 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
   const matchBatchDelayMs = options.matchBatchDelayMs ?? 4;
   const matchRunner = options.matchRunner;
   const subscribers = new Map<string, Set<{ socket: import("ws").WebSocket; delivered: number }>>();
+
+  // 终态报告必须在 experiment-terminal 备份前写入 SQLite，且重复收尾回调不得覆盖首份证据。
+  const persistCanaryTerminalReport = (experimentId: string): boolean => {
+    try {
+      const row = canaries.finishExperiment(experimentId);
+      if (!row || row.terminal_report_json) return true;
+      const report = buildCanaryReport({
+        row,
+        runtime,
+        lineage,
+        audits,
+        frozenModelProfile: controlPlane.getBaselineValidation(experimentId)?.frozenConfiguration?.modelProfile ?? null,
+      });
+      if (report.status === "running" || report.completedAt === null) {
+        server.log.error({ experimentId, canaryId: row.canary_id }, "金丝雀已关闭但尚未形成终态报告");
+        return false;
+      }
+      canaries.persistTerminalReport(row.canary_id, report);
+      return true;
+    } catch (error) {
+      // 报告落盘失败时禁止创建缺证据的终态备份；重启恢复会再次尝试补写。
+      server.log.error({ err: error, experimentId }, "金丝雀终态报告持久化失败");
+      return false;
+    }
+  };
+
+  const terminalBackupsAttempted = new Set<string>();
+  const terminalBackupsCreated = new Set<string>();
+  const createCanaryTerminalBackup = (experimentId: string): void => {
+    if (!options.backupManager || terminalBackupsAttempted.has(experimentId) || terminalBackupsCreated.has(experimentId)) return;
+    const canary = canaries.getByExperimentId(experimentId);
+    const marker: Record<string, string> = canary?.terminal_report_json ? {
+      canaryId: canary.canary_id,
+      terminalReportSha256: createHash("sha256").update(canary.terminal_report_json).digest("hex"),
+    } : {};
+    if (audits.hasBackupCreated(experimentId, "experiment-terminal", marker)) {
+      terminalBackupsCreated.add(experimentId);
+      return;
+    }
+    // 失败后本进程内不重复制造备份；重启时依靠持久化审计重新尝试。
+    terminalBackupsAttempted.add(experimentId);
+    try {
+      options.backupManager.create("experiment-terminal");
+      const idempotencyKey = marker.canaryId
+        ? `experiment-terminal-canary-backup:${experimentId}`
+        : `experiment-terminal-backup:${experimentId}`;
+      audits.appendOnce(idempotencyKey, experimentId, "backup.created", {
+        trigger: "experiment-terminal", ...marker,
+      });
+      terminalBackupsCreated.add(experimentId);
+    } catch (error) {
+      try { audits.append(experimentId, "backup.failed", { trigger: "experiment-terminal" }); }
+      catch (auditError) { server.log.error({ err: auditError, experimentId }, "实验终态备份失败审计写入失败"); }
+      server.log.error({ err: error, experimentId }, "实验终态完整备份失败");
+    }
+  };
+
+  const settleTerminalExperiment = (experimentId: string): void => {
+    if (persistCanaryTerminalReport(experimentId)) createCanaryTerminalBackup(experimentId);
+  };
 
   void server.register(websocket);
 
@@ -220,6 +306,7 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
     experiments.close();
     controlPlane.close();
     runtime.close();
+    canaries.close();
     lineage.close();
   });
 
@@ -366,15 +453,7 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
       startExhibition: startExhibitionMatch,
     }),
     (experimentId) => {
-      if (options.backupManager) {
-        try {
-          options.backupManager.create("experiment-terminal");
-          audits.append(experimentId, "backup.created", { trigger: "experiment-terminal" });
-        } catch (error) {
-          audits.append(experimentId, "backup.failed", { trigger: "experiment-terminal" });
-          server.log.error({ err: error, experimentId }, "实验终态完整备份失败");
-        }
-      }
+      if (persistCanaryTerminalReport(experimentId)) createCanaryTerminalBackup(experimentId);
     },
     (experimentId) => {
       if (options.backupManager) {
@@ -382,7 +461,36 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
         audits.append(experimentId, "backup.created", { trigger: "experiment-start", resumed: true });
       }
     },
+    (experimentId) => canaries.remaining(experimentId) ? {
+      remaining: () => canaries.remaining(experimentId) ?? { tokens: 0, cost: 0 },
+      consume: (usage) => canaries.consume(experimentId, usage),
+      consumeOnce: (batchId, usage) => canaries.consumeOnce(batchId, experimentId, usage),
+    } : undefined,
+    settleTerminalExperiment,
   );
+
+  // 启动恢复先收敛未能注册运行时的孤儿金丝雀，再恢复仍有运行时记录的实验。
+  // 这样 reserve/attach 与 registerReady 之间的进程崩溃不会永久占用单例租约。
+  const runtimeSnapshots = runtime.list();
+  const activeExperimentIds = new Set(
+    runtimeSnapshots.filter((snapshot) => snapshot.state === "running").map((snapshot) => snapshot.experimentId),
+  );
+  const terminalExperimentIds = new Set(
+    runtimeSnapshots.filter((snapshot) => ["paused", "completed", "failed", "cancelled"].includes(snapshot.state))
+      .map((snapshot) => snapshot.experimentId),
+  );
+  for (const orphan of canaries.recoverOrphaned(activeExperimentIds, terminalExperimentIds)) {
+    if (persistCanaryTerminalReport(orphan.experiment_id)) createCanaryTerminalBackup(orphan.experiment_id);
+  }
+  for (const pending of canaries.listUnreportedTerminalReports()) {
+    // 该记录尚未有终态报告；本次启动补写成功后立即备份，覆盖进程在 terminalSettled 前退出的窗口。
+    const persisted = persistCanaryTerminalReport(pending.experiment_id);
+    if (persisted) createCanaryTerminalBackup(pending.experiment_id);
+  }
+  for (const reported of canaries.listReportedTerminalReports()) {
+    // 报告已存在但上次进程可能在备份失败，或在写入成功审计前崩溃；缺少成功事实时必须重试。
+    createCanaryTerminalBackup(reported.experiment_id);
+  }
   autonomousRunner.resumePersisted();
 
   registerControlRoutes({
@@ -407,6 +515,10 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
       experimentId, seed, exhibitionId, generatorCommit, solverCommit,
     }),
     backupBoundary: (trigger, experimentId) => {
+      if (trigger === "experiment-terminal") {
+        settleTerminalExperiment(experimentId);
+        return;
+      }
       if (options.backupManager) {
         options.backupManager.create(trigger);
         audits.append(experimentId, "backup.created", { trigger });
@@ -419,6 +531,143 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
   }));
 
   server.get<{ Reply: HarnessCatalogResponse }>("/api/harness/models", async () => harnessAdapter.listModels());
+
+  server.post<{ Body: RealDshCanaryRequest; Reply: RealDshCanaryReport | DomainErrorResponse }>(
+    "/api/canaries",
+    async (request, reply) => {
+      const preflight = options.canaryPreflight;
+      if (!preflight) {
+        return reply.code(409).send({ error: { code: "RUNTIME_STATE_INVALID", message: "正式运行未配置金丝雀前置身份" } });
+      }
+      if (preflight.executionKind !== "real-provider" && preflight.allowDeterministicTestRun !== true) {
+        return reply.code(409).send({ error: { code: "RUNTIME_STATE_INVALID", message: "正式金丝雀拒绝 deterministic-fixture 或 Fake Harness" } });
+      }
+      if (!options.backupManager) {
+        return reply.code(409).send({ error: { code: "RUNTIME_STATE_INVALID", message: "正式金丝雀必须配置一致性备份管理器" } });
+      }
+      if (request.body?.operatorConfirmed !== true) {
+        return reply.code(400).send({ error: { code: "RUNTIME_STATE_INVALID", message: "真实金丝雀必须由操作员显式确认" } });
+      }
+      if (!Number.isSafeInteger(request.body.tokenLimit) || request.body.tokenLimit < 1
+        || request.body.tokenLimit > REAL_DSH_CANARY_MAX_TOKENS
+        || !Number.isFinite(request.body.costLimit) || request.body.costLimit <= 0
+        || request.body.costLimit > REAL_DSH_CANARY_MAX_COST
+        || !Number.isSafeInteger(request.body.modelProfile?.totalTokenLimit)
+        || request.body.modelProfile.totalTokenLimit * 2 > request.body.tokenLimit) {
+        return reply.code(400).send({ error: { code: "EXPERIMENT_BUDGET_INVALID",
+          message: `金丝雀上限为 ${REAL_DSH_CANARY_MAX_TOKENS} tokens 与 ${REAL_DSH_CANARY_MAX_COST} 成本单位，且双角色会话令牌上限之和不得超过总上限` } });
+      }
+      let experiment: Experiment | undefined;
+      let canaryId: string | undefined;
+      try {
+        if (!validName(request.body.name)) throw new Error("金丝雀名称必须为 1 到 120 个非空字符");
+        const modelProfile = validateModelProfile(request.body.modelProfile);
+        if (experiments.list().some(({ status }) => status === "running")) throw new Error("当前 Arena 已有运行中的实验");
+        const doctor = await preflight.serverDoctor();
+        assertCanaryDoctorEvidence(doctor);
+        canaryId = canaries.reserve({
+          tokenLimit: request.body.tokenLimit,
+          costLimit: request.body.costLimit,
+          executionKind: preflight.executionKind,
+          imageDigest: doctor.runtimeIdentity.imageDigest,
+          backupId: doctor.completeBackup.backupId,
+          backupCreatedAt: doctor.completeBackup.createdAt,
+          doctorCheckedAt: doctor.checkedAt,
+          runtimeIdentity: {
+            harnessPackage: doctor.runtimeIdentity.harnessPackage,
+            harnessVersion: doctor.runtimeIdentity.harnessVersion,
+            modelCatalogRelease: doctor.runtimeIdentity.modelCatalogRelease,
+            modelReleaseSha256: doctor.runtimeIdentity.modelReleaseSha256,
+            imageDigest: doctor.runtimeIdentity.imageDigest,
+            harnessRuntimePayloadSha256: doctor.runtimeIdentity.harnessRuntimePayloadSha256,
+          },
+        });
+        if (experiments.list().some(({ status }) => status === "running")) throw new Error("当前 Arena 已有运行中的实验");
+        experiment = experiments.create(request.body.name, modelProfile, request.body.costLimit);
+        canaries.attachExperiment(canaryId, experiment.id);
+        const validation = await controlPlane.runBaselineValidation(
+          experiment.id,
+          (options.baselineValidationAdapter ?? ((candidate) => createRealBaselineValidationAdapter({
+            experiment: candidate, harnessAdapter, matchRunner, matches, lineage, pluginRoots,
+          })))(experiment),
+          { smokeProvider: true },
+        );
+        audits.append(experiment.id, validation.status === "passed" ? "baseline.passed" : "baseline.failed", { steps: validation.steps.length });
+        if (validation.smoke.usage) {
+          audits.append(experiment.id, "baseline.smoke", {
+            outcome: validation.smoke.passed === true ? "succeeded" : "failed",
+            usageTokens: validation.smoke.usage.tokens,
+            usageCost: validation.smoke.usage.cost,
+            usageModelCalls: validation.smoke.usage.modelCalls,
+            failureKind: validation.smoke.failureKind,
+          });
+        }
+        if (validation.smoke.usage) canaries.recordSmoke(canaryId, validation.smoke.passed === true, validation.smoke.usage);
+        if (validation.status !== "passed" || validation.smoke.passed !== true) throw new Error("真实模型冒烟或基线验收未通过");
+        const configuration: FrozenExperimentConfiguration = {
+          modelProfile: modelProfile as unknown as Record<string, unknown>,
+          tokenLimit: request.body.tokenLimit,
+          costLimit: request.body.costLimit,
+          rulesDigest: "maze-rules-v1",
+          seedPolicyDigest: "seed-policy-v1",
+          resourcePolicyDigest: options.resourcePolicyDigest ?? "unconfigured-resource-policy",
+          scoringVersion: "lexicographic-v1",
+          compatibilityFingerprint: options.compatibilityFingerprint ?? "maze-arena-v1",
+          modelReleaseSha256: doctor.runtimeIdentity.modelReleaseSha256,
+        };
+        controlPlane.confirmBaseline(experiment.id, configuration);
+        const champions = {
+          generator: lineage.baselineCommit(experiment.id, "generator"),
+          solver: lineage.baselineCommit(experiment.id, "solver"),
+        };
+        runtime.registerReady({
+          experimentId: experiment.id,
+          champions,
+          tokenLimit: request.body.tokenLimit,
+          costLimit: request.body.costLimit,
+          compatibilityFingerprint: configuration.compatibilityFingerprint,
+        });
+        audits.append(experiment.id, "baseline.confirmed", { canaryId });
+        options.backupManager.create("experiment-start");
+        audits.append(experiment.id, "backup.created", { trigger: "experiment-start", canaryId });
+        runtime.start(experiment.id);
+        // 金丝雀只运行一代；先写安全暂停请求，运行器会在双角色结果原子提交后停下。
+        runtime.requestPause(experiment.id);
+        experiments.setStatus(experiment.id, "running");
+        audits.append(experiment.id, "runtime.started", { canaryId, oneGeneration: true });
+        autonomousRunner.launch(experiment.id);
+        return reply.code(202).send(buildCanaryReport({
+          row: canaries.get(canaryId)!, runtime, lineage, audits,
+          frozenModelProfile: controlPlane.getBaselineValidation(experiment.id)?.frozenConfiguration?.modelProfile ?? null,
+        }));
+      } catch (error) {
+        if (canaryId) canaries.failPreflight(canaryId, error instanceof Error ? error.message : "金丝雀前置检查失败");
+        if (canaryId) {
+          const row = canaries.get(canaryId)!;
+          if (persistCanaryTerminalReport(row.experiment_id)) createCanaryTerminalBackup(row.experiment_id);
+          const report = buildCanaryReport({
+            row, runtime, lineage, audits,
+            frozenModelProfile: controlPlane.getBaselineValidation(row.experiment_id)?.frozenConfiguration?.modelProfile ?? null,
+          });
+          return reply.code(409).send(report);
+        }
+        return reply.code(409).send({ error: { code: "RUNTIME_STATE_INVALID", message: error instanceof Error ? error.message : "金丝雀启动失败" } });
+      }
+    },
+  );
+
+  server.get<{ Params: { id: string }; Reply: RealDshCanaryReport | DomainErrorResponse }>(
+    "/api/canaries/:id",
+    async (request, reply) => {
+      const row = canaries.get(request.params.id);
+      if (!row) return reply.code(404).send({ error: { code: "RUNTIME_NOT_FOUND", message: "未找到金丝雀记录" } });
+      const report = buildCanaryReport({
+        row, runtime, lineage, audits,
+        frozenModelProfile: controlPlane.getBaselineValidation(row.experiment_id)?.frozenConfiguration?.modelProfile ?? null,
+      });
+      return report;
+    },
+  );
 
   server.get<{ Params: { id: string }; Reply: Experiment | DomainErrorResponse }>(
     "/api/experiments/:id",
@@ -663,4 +912,20 @@ export function createArenaServer(options: ArenaServerOptions): FastifyInstance 
   }
 
   return server;
+}
+
+function assertCanaryDoctorEvidence(value: Awaited<ReturnType<NonNullable<ArenaServerOptions["canaryPreflight"]>["serverDoctor"]>>): void {
+  const checkedAt = new Date(value.checkedAt);
+  const backupCreatedAt = new Date(value.completeBackup.createdAt);
+  const identity = value.runtimeIdentity;
+  if (checkedAt.toISOString() !== value.checkedAt || backupCreatedAt.toISOString() !== value.completeBackup.createdAt
+    || backupCreatedAt.getTime() > checkedAt.getTime()
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,180}$/.test(value.completeBackup.backupId)
+    || identity.harnessPackage !== "@deepseek-ai/dsh" || !identity.harnessVersion || !identity.modelCatalogRelease
+    || !isImmutableImageReference(identity.imageDigest)
+    || !/^[0-9a-f]{64}$/.test(identity.harnessRuntimePayloadSha256)
+    || !/^[0-9a-f]{64}$/.test(identity.modelReleaseSha256)
+    || identity.modelCatalogRelease !== identity.modelReleaseSha256) {
+    throw new Error("Server doctor 未返回绑定当前运行身份与最近完整备份的可信证据");
+  }
 }

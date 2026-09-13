@@ -95,7 +95,7 @@ export function registerControlRoutes(options: ControlRouteOptions): void {
         operatorConfirmed: false,
         frozenConfiguration: null,
         frozenDigest: null,
-        smoke: { attempted: false, passed: null },
+      smoke: { attempted: false, passed: null, usage: null, failureKind: null },
       };
     },
   );

@@ -12,11 +12,11 @@ afterEach(() => {
 describe("实验工作台", () => {
   it("派生实验复用冻结配置时不携带仅供展示的提供方与模型标签", () => {
     expect(toModelProfileInput({
-      providerId: "custom-basic", modelId: "custom-compact", credentialRef: "dsh-credential://existing",
+      providerId: "custom-basic", modelId: "custom-compact", credentialRef: "dsh-credential://EXISTING_CRED",
       contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000,
       providerLabel: "确定性基础提供方", modelLabel: "Compact V1",
     })).toEqual({
-      providerId: "custom-basic", modelId: "custom-compact", credentialRef: "dsh-credential://existing",
+      providerId: "custom-basic", modelId: "custom-compact", credentialRef: "dsh-credential://EXISTING_CRED",
       contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000,
     });
   });
@@ -49,7 +49,7 @@ describe("实验工作台", () => {
       createdAt: "2026-09-01T08:00:00.000Z",
       costLimit: null,
       modelProfile: {
-        providerId: "custom-basic", modelId: "custom-compact", credentialRef: "dsh-credential://existing",
+        providerId: "custom-basic", modelId: "custom-compact", credentialRef: "dsh-credential://EXISTING_CRED",
         contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000,
         providerLabel: "确定性基础提供方", modelLabel: "Compact V1",
       },
@@ -65,7 +65,7 @@ describe("实验工作台", () => {
       createdAt: "2026-09-01T09:00:00.000Z",
       costLimit: null,
       modelProfile: {
-        providerId: "custom-reasoning", modelId: "custom-reasoner", credentialRef: "dsh-credential://reasoning",
+        providerId: "custom-reasoning", modelId: "custom-reasoner", credentialRef: "dsh-credential://REASONING_CRED",
         reasoningEffort: "high", contextTokens: 16_000, outputTokens: 2_000, totalTokenLimit: 20_000,
         providerLabel: "确定性推理提供方", modelLabel: "Reasoner V1",
       },
@@ -74,7 +74,7 @@ describe("实验工作台", () => {
         solver: { home: "/h/n/s/home", workspace: "/h/n/s/workspace" },
       },
     };
-    const catalog: HarnessCatalogResponse = { credentialRefs: ["dsh-credential://basic", "dsh-credential://reasoning"], providers: [
+    const catalog: HarnessCatalogResponse = { credentialRefs: ["dsh-credential://BASIC_CRED", "dsh-credential://REASONING_CRED"], providers: [
       {
         id: "custom-basic", label: "确定性基础提供方", models: [{ id: "custom-compact", label: "Compact V1", capabilities: {
           reasoningEfforts: [], temperature: { minimum: 0, maximum: 2 }, topP: { minimum: 0, maximum: 1 },
@@ -84,7 +84,7 @@ describe("实验工作台", () => {
       },
       {
         id: "custom-reasoning", label: "确定性推理提供方", models: [{ id: "custom-reasoner", label: "Reasoner V1", capabilities: {
-          reasoningEfforts: ["low", "medium", "high"], maxContextTokens: 32_000, maxOutputTokens: 8_000,
+          reasoningEfforts: ["off", "low", "high", "max"], maxContextTokens: 32_000, maxOutputTokens: 8_000,
           maxTotalTokens: 40_000, providerOptions: { thinkingBudget: { type: "number", minimum: 1_000, maximum: 20_000 } },
         } }],
       },
@@ -105,10 +105,16 @@ describe("实验工作台", () => {
     const experimentList = await screen.findByRole("region", { name: "实验列表" });
     expect(experimentList).toHaveTextContent("已有实验");
     expect(screen.queryByRole("button", { name: "保存到当前草稿" })).not.toBeInTheDocument();
+    for (const label of ["竞技场", "进化代", "比赛", "谱系", "候选", "审计"]) {
+      expect(screen.getByRole("tab", { name: label })).toBeInTheDocument();
+    }
+    await user.click(screen.getByRole("tab", { name: "谱系" }));
+    expect(screen.getByText("生成器冠军版本")).toBeInTheDocument();
+    expect(screen.getByText("求解器冠军版本")).toBeInTheDocument();
 
     await user.type(screen.getByLabelText("新实验名称"), "新的实验");
     await user.selectOptions(screen.getByLabelText("模型提供方"), "custom-reasoning");
-    await user.selectOptions(screen.getByLabelText("凭据引用"), "dsh-credential://reasoning");
+    await user.selectOptions(screen.getByLabelText("凭据引用"), "dsh-credential://REASONING_CRED");
     await user.type(screen.getByLabelText("成本上限"), "1.25");
     await user.selectOptions(screen.getByLabelText("推理强度"), "high");
     await user.click(screen.getByRole("button", { name: "创建" }));
@@ -120,12 +126,12 @@ describe("实验工作台", () => {
     expect(createCall).toBeDefined();
     expect(JSON.parse(createCall?.[1]?.body as string)).toMatchObject({
       costLimit: 1.25,
-      modelProfile: { providerId: "custom-reasoning", modelId: "custom-reasoner", credentialRef: "dsh-credential://reasoning", reasoningEffort: "high" },
+      modelProfile: { providerId: "custom-reasoning", modelId: "custom-reasoner", credentialRef: "dsh-credential://REASONING_CRED", reasoningEffort: "high" },
     });
   });
 
   it("从仅有自定义 ID 的目录初始化首个模型并直接提交该配置", async () => {
-    const catalog: HarnessCatalogResponse = { credentialRefs: ["dsh-credential://vendor"], providers: [{
+    const catalog: HarnessCatalogResponse = { credentialRefs: ["dsh-credential://VENDOR_CRED"], providers: [{
       id: "vendor-only",
       label: "Vendor Only",
       models: [{
@@ -147,7 +153,7 @@ describe("实验工作台", () => {
       createdAt: "2026-09-01T10:00:00.000Z",
       costLimit: null,
       modelProfile: {
-        providerId: "vendor-only", modelId: "model-only", credentialRef: "dsh-credential://vendor",
+        providerId: "vendor-only", modelId: "model-only", credentialRef: "dsh-credential://VENDOR_CRED",
         reasoningEffort: "low", contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000,
         providerLabel: "Vendor Only", modelLabel: "Model Only",
       },
@@ -189,7 +195,7 @@ describe("实验工作台", () => {
   });
 
   it("不展示或提交目录中的敏感 provider option", async () => {
-    const catalog: HarnessCatalogResponse = { credentialRefs: ["dsh-credential://vendor"], providers: [{
+    const catalog: HarnessCatalogResponse = { credentialRefs: ["dsh-credential://VENDOR_CRED"], providers: [{
       id: "vendor", label: "Vendor", models: [{ id: "model", label: "Model", capabilities: {
         reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000, maxTotalTokens: 9_000,
         providerOptions: Object.fromEntries([

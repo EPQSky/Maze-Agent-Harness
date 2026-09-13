@@ -68,5 +68,5 @@ process.stdout.write(JSON.stringify({
     submitted: true,
     toolActivity: "read,edit,test,submit",
   },
-  usage: { tokens: request.attempt.attemptId.startsWith("g000") ? 2_500 : 64, cost: 0 },
+  usage: { tokens: request.attempt.attemptId.startsWith("g000") ? 2_500 : 64, cost: 0, modelCalls: 1 },
 }));

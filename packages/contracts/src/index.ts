@@ -7,6 +7,10 @@ export const experimentStatuses = [
   "cancelled",
 ] as const;
 
+/** 正式金丝雀单次执行的硬预算上限；累计外部授权不属于 API 请求配置。 */
+export const REAL_DSH_CANARY_MAX_TOKENS = 640_000;
+export const REAL_DSH_CANARY_MAX_COST = 5;
+
 export type ExperimentStatus = (typeof experimentStatuses)[number];
 
 export interface Experiment {
@@ -38,6 +42,7 @@ export interface FrozenExperimentConfiguration {
   resourcePolicyDigest: string;
   scoringVersion: string;
   compatibilityFingerprint: string;
+  modelReleaseSha256?: string;
 }
 
 export interface BaselineValidationRecord {
@@ -47,7 +52,12 @@ export interface BaselineValidationRecord {
   operatorConfirmed: boolean;
   frozenConfiguration: FrozenExperimentConfiguration | null;
   frozenDigest: string | null;
-  smoke: { attempted: boolean; passed: boolean | null };
+  smoke: {
+    attempted: boolean;
+    passed: boolean | null;
+    usage: { tokens: number; cost: number; modelCalls: number } | null;
+    failureKind: "transient-provider" | "provider" | "protocol" | "process" | null;
+  };
 }
 
 export type EvolutionRole = "generator" | "solver";
@@ -103,7 +113,9 @@ export interface ExperimentRuntimeSnapshot {
   stagnationCount: number;
   champions: Record<EvolutionRole, string>;
   pauseRequested: boolean;
-  usage: { tokens: number; cost: number };
+  usage: { tokens: number; cost: number; modelCalls: number };
+  modelCallsUsed: number;
+  modelCallsReserved: number;
   budget: { tokenLimit: number; costLimit: number | null };
   evaluationSuiteId: string;
   sealGroupId: string;
@@ -111,6 +123,83 @@ export interface ExperimentRuntimeSnapshot {
   evolutionPermitted: boolean;
   compatibilityFingerprint: string;
   generations: GenerationRecord[];
+}
+
+export interface RealDshCanaryRequest {
+  name: string;
+  modelProfile: ModelProfileInput;
+  tokenLimit: number;
+  costLimit: number;
+  operatorConfirmed: true;
+}
+
+export interface RealDshCanaryRoleReport {
+  role: EvolutionRole;
+  evidenceLevel: EvolutionEvidenceLevel | null;
+  candidateCommit: string | null;
+  championBefore: string | null;
+  championAfter: string | null;
+  outcome: "promoted" | "failed" | "tie" | null;
+  promotionTag: string | null;
+  nextGenerationStart: string | null;
+  diff: string | null;
+  diffSha256: string | null;
+  diffTruncated: boolean;
+  usage: { tokens: number; cost: number; modelCalls: number };
+  usageReconciled: boolean;
+  executionIdentityVerified: boolean;
+  gitIntegrityVerified: boolean;
+  promotionVerified: boolean;
+  evaluation: {
+    trustedBuildSha256: string | null;
+    publicCases: number;
+    hiddenCases: number;
+    isolatedInDocker: boolean;
+  };
+  sessionIds: string[];
+  reason: string;
+}
+
+export interface RealDshCanaryReport {
+  schemaVersion: 1;
+  canaryId: string;
+  experimentId: string;
+  status: "preflight-failed" | "running" | "closed" | "failed";
+  startedAt: string;
+  completedAt: string | null;
+  executionKind: EvolutionEvidenceLevel;
+  limits: {
+    tokens: number;
+    cost: number;
+    consumedTokens: number;
+    consumedCost: number;
+    modelCalls: number;
+    consumedModelCalls: number;
+    withinLimit: boolean;
+    reconciled: boolean;
+  };
+  preflight: {
+    doctorPassed: boolean;
+    doctorCheckedAt: string;
+    modelSmokePassed: boolean;
+    modelSmokeUsage: { tokens: number; cost: number; modelCalls: number };
+    immutableImage: string;
+    completeBackupId: string;
+    completeBackupCreatedAt: string;
+    runtimeIdentity: {
+      harnessPackage: string;
+      harnessVersion: string;
+      modelCatalogRelease: string;
+      harnessRuntimePayloadSha256: string;
+      modelReleaseSha256: string;
+    };
+  };
+  roles: Record<EvolutionRole, RealDshCanaryRoleReport>;
+  mechanismClosed: boolean;
+  promoted: boolean;
+  formalAcceptancePassed: boolean;
+  reason: string;
+  nonGuarantee: string;
 }
 
 export interface ObservationMatch {
@@ -152,7 +241,7 @@ export interface CreateExperimentRequest {
   costLimit?: number | null;
 }
 
-export type ReasoningEffort = "low" | "medium" | "high";
+export type ReasoningEffort = "off" | "low" | "high" | "max";
 export type ProviderOptionValue = boolean | number | string;
 
 export interface ModelProfileInput {
@@ -336,6 +425,7 @@ export type ExperimentAuditEventType =
   | "match.failed"
   | "match.integrity-failed"
   | "baseline.passed"
+  | "baseline.smoke"
   | "baseline.failed"
   | "baseline.confirmed"
   | "runtime.started"
@@ -369,6 +459,26 @@ export const MATCH_OUTPUT_LIMIT_BYTES = 16 * 1024;
 
 export type MazeDirection = "north" | "east" | "south" | "west";
 export type MatchPluginRole = "generator" | "solver";
+export const MATCH_PROFILE_PATCH_RELOAD = "startup" as const;
+
+export function createMatchProfileConfiguration(bundles: readonly string[]): {
+  bundles: string[];
+  patchReload: typeof MATCH_PROFILE_PATCH_RELOAD;
+} {
+  return { bundles: [...bundles], patchReload: MATCH_PROFILE_PATCH_RELOAD };
+}
+
+export function isMatchProfileConfiguration(value: unknown, expectedBundles: readonly string[]): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const profile = value as Record<string, unknown>;
+  if (Object.keys(profile).sort().join("\0") !== ["bundles", "patchReload"].join("\0")
+    || profile.patchReload !== MATCH_PROFILE_PATCH_RELOAD || !Array.isArray(profile.bundles)) return false;
+  const bundles = profile.bundles;
+  return bundles.every((name) => typeof name === "string")
+    && bundles.length === expectedBundles.length
+    && new Set(bundles).size === bundles.length
+    && expectedBundles.every((name) => bundles.includes(name));
+}
 
 export interface GeneratorRules {
   size: 31;

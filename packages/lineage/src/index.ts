@@ -62,12 +62,24 @@ export interface StrategyRecord {
   strategyPlan: string;
 }
 
+export interface RecordedCandidateResult {
+  attemptId: string;
+  commit: string;
+  outcome: CandidateCommitInput["outcome"];
+  generation: number | null;
+}
+
 export interface RegisteredLineage {
   experimentId: string;
   role: PluginRole;
   repositoryPath: string;
   baselineCommit: string;
   baselineTagObject: string;
+}
+
+export interface LineageGitRunner {
+  run(repository: string, args: string[]): string;
+  optional(repository: string, args: string[]): string | undefined;
 }
 
 interface PromotionRow {
@@ -131,7 +143,11 @@ export function withLineageMutationLock<T>(root: string, callback: () => T): T {
 export class PluginLineageRepository {
   private readonly database: DatabaseSync;
 
-  constructor(private readonly root: string, databasePath: string) {
+  constructor(
+    private readonly root: string,
+    databasePath: string,
+    private readonly gitRunner: LineageGitRunner = defaultLineageGitRunner,
+  ) {
     mkdirSync(root, { recursive: true });
     if (databasePath !== ":memory:") mkdirSync(dirname(databasePath), { recursive: true });
     this.database = new DatabaseSync(databasePath);
@@ -172,17 +188,17 @@ export class PluginLineageRepository {
       const repository = this.repositoryPath(experimentId, role);
       if (existsSync(repository)) throw new Error(`谱系目录已存在但未登记：${repository}`);
       mkdirSync(repository, { recursive: true });
-      git(repository, ["init", "--initial-branch=main"]);
-      git(repository, ["config", "user.name", "Maze Arena Orchestrator"]);
-      git(repository, ["config", "user.email", "arena@localhost"]);
+      this.gitRunner.run(repository, ["init", "--initial-branch=main"]);
+      this.gitRunner.run(repository, ["config", "user.name", "Maze Arena Orchestrator"]);
+      this.gitRunner.run(repository, ["config", "user.email", "arena@localhost"]);
       replaceWorktree(repository, baselineSource);
-      git(repository, ["add", "-A"]);
-      git(repository, ["commit", "-m", `baseline: ${role}`]);
-      const baselineCommit = git(repository, ["rev-parse", "HEAD"]);
+      this.gitRunner.run(repository, ["add", "-A"]);
+      this.gitRunner.run(repository, ["commit", "-m", `baseline: ${role}`]);
+      const baselineCommit = this.gitRunner.run(repository, ["rev-parse", "HEAD"]);
       const tagName = `baseline/${experimentId}/${role}`;
       const metadata = canonicalJson({ experimentId, role, kind: "baseline", targetCommit: baselineCommit });
-      git(repository, ["tag", "-a", tagName, baselineCommit, "-m", metadata]);
-      const baselineTagObject = git(repository, ["rev-parse", `${tagName}^{tag}`]);
+      this.gitRunner.run(repository, ["tag", "-a", tagName, baselineCommit, "-m", metadata]);
+      const baselineTagObject = this.gitRunner.run(repository, ["rev-parse", `${tagName}^{tag}`]);
       this.database.prepare(`INSERT INTO lineage_repositories
         (experiment_id, role, repository_path, baseline_commit, baseline_tag_object) VALUES (?, ?, ?, ?, ?)`)
         .run(experimentId, role, repository, baselineCommit, baselineTagObject);
@@ -204,15 +220,15 @@ export class PluginLineageRepository {
       this.verifyIntegrityUnlocked(input.experimentId, input.role);
       const repository = this.repositoryPath(input.experimentId, input.role);
       const metadata = canonicalJson({ attemptId: input.attemptId, hypothesis: input.hypothesis });
-      const sourceTree = sourceTreeObject(input.sourceRoot);
-      const existing = findCandidateCommits(repository, input.attemptId).find((commit) =>
-        git(repository, ["rev-parse", `${commit}^{tree}`]) === sourceTree
-        && git(repository, ["show", "-s", "--format=%B", commit]).trim() === `candidate: ${input.attemptId}\n\n${metadata}`);
+      const sourceTree = sourceTreeObject(input.sourceRoot, this.gitRunner);
+      const existing = findCandidateCommits(repository, input.attemptId, this.gitRunner).find((commit) =>
+        this.gitRunner.run(repository, ["rev-parse", `${commit}^{tree}`]) === sourceTree
+        && this.gitRunner.run(repository, ["show", "-s", "--format=%B", commit]).trim() === `candidate: ${input.attemptId}\n\n${metadata}`);
       if (existing) return { commit: existing, role: input.role };
       replaceWorktree(repository, input.sourceRoot);
-      git(repository, ["add", "-A"]);
-      git(repository, ["commit", "--allow-empty", "-m", `candidate: ${input.attemptId}`, "-m", metadata]);
-      return { commit: git(repository, ["rev-parse", "HEAD"]), role: input.role };
+      this.gitRunner.run(repository, ["add", "-A"]);
+      this.gitRunner.run(repository, ["commit", "--allow-empty", "-m", `candidate: ${input.attemptId}`, "-m", metadata]);
+      return { commit: this.gitRunner.run(repository, ["rev-parse", "HEAD"]), role: input.role };
     });
   }
 
@@ -228,8 +244,8 @@ export class PluginLineageRepository {
       throw new Error("晋级候选必须提供正整数代次");
     }
     const repository = this.repositoryPath(input.experimentId, input.role);
-    const resolved = optionalGit(repository, ["rev-parse", `${input.commit}^{commit}`]);
-    if (resolved !== input.commit || !findCandidateCommits(repository, input.attemptId).includes(input.commit)) {
+    const resolved = this.gitRunner.optional(repository, ["rev-parse", `${input.commit}^{commit}`]);
+    if (resolved !== input.commit || !findCandidateCommits(repository, input.attemptId, this.gitRunner).includes(input.commit)) {
       throw new Error("候选结果目标与正式谱系提交不一致");
     }
     const metadata = canonicalJson({
@@ -288,14 +304,14 @@ export class PluginLineageRepository {
     if (row.tag_name !== tagName || row.target_commit !== targetCommit || row.metadata_digest !== digest) {
       return this.tampered(experimentId, role, "晋级标签预期元数据冲突");
     }
-    const existing = optionalGit(repository, ["rev-parse", `${tagName}^{tag}`]);
+    const existing = this.gitRunner.optional(repository, ["rev-parse", `${tagName}^{tag}`]);
     if (row.state === "complete") {
       if (!existing || existing !== row.tag_object) return this.tampered(experimentId, role, "已完成晋级标签被删除、移动或替换");
       this.verifyTag(repository, row);
       return tagName;
     }
-    if (!existing) git(repository, ["tag", "-a", tagName, targetCommit, "-m", metadataJson]);
-    const tagObject = git(repository, ["rev-parse", `${tagName}^{tag}`]);
+    if (!existing) this.gitRunner.run(repository, ["tag", "-a", tagName, targetCommit, "-m", metadataJson]);
+    const tagObject = this.gitRunner.run(repository, ["rev-parse", `${tagName}^{tag}`]);
     const pending = { ...row, tag_object: tagObject };
     this.verifyTag(repository, pending);
     this.database.prepare(`UPDATE promotion_tags SET tag_object = ?, state = 'complete'
@@ -313,10 +329,10 @@ export class PluginLineageRepository {
     const repositoryRow = this.repositoryRow(experimentId, role);
     if (!repositoryRow) throw new Error(`尚未初始化 ${role} 谱系`);
     const repository = repositoryRow.repository_path;
-    if (optionalGit(repository, ["remote"]) !== "") this.tampered(experimentId, role, "谱系仓库出现远程地址");
+    if (this.gitRunner.optional(repository, ["remote"]) !== "") this.tampered(experimentId, role, "谱系仓库出现远程地址");
     const baselineTag = `baseline/${experimentId}/${role}`;
-    const baselineObject = optionalGit(repository, ["rev-parse", `${baselineTag}^{tag}`]);
-    const baselineTarget = optionalGit(repository, ["rev-parse", `${baselineTag}^{commit}`]);
+    const baselineObject = this.gitRunner.optional(repository, ["rev-parse", `${baselineTag}^{tag}`]);
+    const baselineTarget = this.gitRunner.optional(repository, ["rev-parse", `${baselineTag}^{commit}`]);
     if (baselineObject !== repositoryRow.baseline_tag_object || baselineTarget !== repositoryRow.baseline_commit) {
       this.tampered(experimentId, role, "基线标签被删除、移动或替换");
     }
@@ -326,13 +342,13 @@ export class PluginLineageRepository {
     for (const row of rows) {
       if (row.state === "pending") this.ensurePromotionUnlocked(experimentId, role, row.generation, row.target_commit, parsePromotionMetadata(row.metadata_json));
       else {
-        const actual = optionalGit(repository, ["rev-parse", `${row.tag_name}^{tag}`]);
+        const actual = this.gitRunner.optional(repository, ["rev-parse", `${row.tag_name}^{tag}`]);
         if (!actual || actual !== row.tag_object) this.tampered(experimentId, role, "晋级标签完整性不一致");
         this.verifyTag(repository, row);
       }
     }
     const expectedAuthorityTags = new Set([baselineTag, ...rows.map((row) => row.tag_name)]);
-    const actualAuthorityTags = git(repository, ["for-each-ref", "--format=%(refname:strip=2)", "refs/tags/baseline", "refs/tags/promotion"])
+    const actualAuthorityTags = this.gitRunner.run(repository, ["for-each-ref", "--format=%(refname:strip=2)", "refs/tags/baseline", "refs/tags/promotion"])
       .split("\n").filter(Boolean);
     if (actualAuthorityTags.length !== expectedAuthorityTags.size
       || actualAuthorityTags.some((tag) => !expectedAuthorityTags.has(tag))) {
@@ -347,7 +363,7 @@ export class PluginLineageRepository {
         resultSummary: result.result_summary, outcome: result.outcome, generation: result.generation,
       });
       if (sha256(metadata) !== result.metadata_digest
-        || !findCandidateCommits(repository, result.attempt_id).includes(result.target_commit)) {
+        || !findCandidateCommits(repository, result.attempt_id, this.gitRunner).includes(result.target_commit)) {
         this.tampered(experimentId, role, "候选结果记录与 Git 提交身份不一致");
       }
     }
@@ -362,7 +378,7 @@ export class PluginLineageRepository {
         attempt_id: string; target_commit: string; outcome: CandidateCommitInput["outcome"]; generation: number | null;
       }>;
     const resultByCommit = new Map(results.map((result) => [result.target_commit, result]));
-    const lines = git(repository, ["log", "--format=%H%x09%s%x09%D", "--reverse"]).split("\n").filter(Boolean);
+    const lines = this.gitRunner.run(repository, ["log", "--format=%H%x09%s%x09%D", "--reverse"]).split("\n").filter(Boolean);
     return lines.map((line) => {
       const [commit = "", subject = "", decorations = ""] = line.split("\t");
       const tags = [...decorations.matchAll(/tag: ([^,)]+)/g)].map((match) => match[1]!);
@@ -381,6 +397,14 @@ export class PluginLineageRepository {
     });
   }
 
+  candidateResult(experimentId: string, role: PluginRole, attemptId: string): RecordedCandidateResult | undefined {
+    this.verifyIntegrity(experimentId, role);
+    const row = this.database.prepare(`SELECT attempt_id, target_commit, outcome, generation FROM candidate_results
+      WHERE experiment_id = ? AND role = ? AND attempt_id = ?`).get(experimentId, role, attemptId) as
+      { attempt_id: string; target_commit: string; outcome: CandidateCommitInput["outcome"]; generation: number | null } | undefined;
+    return row ? { attemptId: row.attempt_id, commit: row.target_commit, outcome: row.outcome, generation: row.generation } : undefined;
+  }
+
   listStrategyRecords(experimentId: string, role: PluginRole): StrategyRecord[] {
     this.verifyIntegrity(experimentId, role);
     const repository = this.repositoryPath(experimentId, role);
@@ -392,7 +416,7 @@ export class PluginLineageRepository {
       if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(attemptId)) {
         return this.tampered(experimentId, role, "候选提交包含非法尝试标识");
       }
-      const strategyPlan = optionalGit(repository, ["show", `${commit}:lineage/${attemptId}.md`]);
+      const strategyPlan = this.gitRunner.optional(repository, ["show", `${commit}:lineage/${attemptId}.md`]);
       if (strategyPlan !== undefined) records.push({ attemptId, strategyPlan });
     }
     return records;
@@ -400,7 +424,7 @@ export class PluginLineageRepository {
 
   diff(experimentId: string, role: PluginRole, from: string, to: string): string {
     this.verifyIntegrity(experimentId, role);
-    return git(this.repositoryPath(experimentId, role), ["diff", "--no-ext-diff", from, to, "--"]);
+    return this.gitRunner.run(this.repositoryPath(experimentId, role), ["diff", "--no-ext-diff", from, to, "--"]);
   }
 
   baselineCommit(experimentId: string, role: PluginRole): string {
@@ -411,22 +435,20 @@ export class PluginLineageRepository {
   materialize(experimentId: string, role: PluginRole, commit: string, destination: string): void {
     this.verifyIntegrity(experimentId, role);
     const repository = this.repositoryPath(experimentId, role);
-    const resolved = optionalGit(repository, ["rev-parse", `${commit}^{commit}`]);
+    const resolved = this.gitRunner.optional(repository, ["rev-parse", `${commit}^{commit}`]);
     if (!resolved) throw new Error(`插件提交不存在：${commit}`);
     rmSync(destination, { recursive: true, force: true });
-    const clone = spawnSync("git", ["clone", "--no-hardlinks", "--no-checkout", repository, destination], {
-      encoding: "utf8", maxBuffer: 16 * 1024 * 1024, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" },
-    });
-    if (clone.status !== 0) throw new Error(`无法克隆插件谱系提交 ${commit}`);
-    git(destination, ["checkout", "--detach", resolved]);
-    if (git(destination, ["status", "--porcelain", "--untracked-files=all"]) !== "") {
+    try { this.gitRunner.run(dirname(destination), ["clone", "--no-hardlinks", "--no-checkout", repository, destination]); }
+    catch { throw new Error(`无法克隆插件谱系提交 ${commit}`); }
+    this.gitRunner.run(destination, ["checkout", "--detach", resolved]);
+    if (this.gitRunner.run(destination, ["status", "--porcelain", "--untracked-files=all"]) !== "") {
       throw new Error(`插件提交 ${commit} 物化后不是干净工作树`);
     }
   }
 
   contains(experimentId: string, role: PluginRole, commit: string): boolean {
     this.verifyIntegrity(experimentId, role);
-    return optionalGit(this.repositoryPath(experimentId, role), ["cat-file", "-e", `${commit}^{commit}`]) !== undefined;
+    return this.gitRunner.optional(this.repositoryPath(experimentId, role), ["cat-file", "-e", `${commit}^{commit}`]) !== undefined;
   }
 
   branchFrom(sourceId: string, childId: string, role: PluginRole, selectedCommit: string): string {
@@ -434,20 +456,20 @@ export class PluginLineageRepository {
       validateIdentity(childId);
       this.verifyIntegrityUnlocked(sourceId, role);
       const source = this.repositoryPath(sourceId, role);
-      const resolved = optionalGit(source, ["rev-parse", `${selectedCommit}^{commit}`]);
+      const resolved = this.gitRunner.optional(source, ["rev-parse", `${selectedCommit}^{commit}`]);
       if (!resolved) throw new Error(`选定的 ${role} 提交不属于源实验谱系`);
       const destination = this.repositoryPath(childId, role);
       if (existsSync(destination) || this.repositoryRow(childId, role)) throw new Error(`派生 ${role} 谱系已经存在`);
       mkdirSync(dirname(destination), { recursive: true });
       assertSafeSourceTree(source);
       cpSync(source, destination, { recursive: true, dereference: false });
-      const inheritedTags = git(destination, ["for-each-ref", "--format=%(refname:strip=2)", "refs/tags"])
+      const inheritedTags = this.gitRunner.run(destination, ["for-each-ref", "--format=%(refname:strip=2)", "refs/tags"])
         .split("\n").filter(Boolean);
-      for (const inheritedTag of inheritedTags) git(destination, ["tag", "-d", inheritedTag]);
+      for (const inheritedTag of inheritedTags) this.gitRunner.run(destination, ["tag", "-d", inheritedTag]);
       const tagName = `baseline/${childId}/${role}`;
       const metadata = canonicalJson({ experimentId: childId, role, kind: "baseline", targetCommit: resolved });
-      git(destination, ["tag", "-a", tagName, resolved, "-m", metadata]);
-      const tagObject = git(destination, ["rev-parse", `${tagName}^{tag}`]);
+      this.gitRunner.run(destination, ["tag", "-a", tagName, resolved, "-m", metadata]);
+      const tagObject = this.gitRunner.run(destination, ["rev-parse", `${tagName}^{tag}`]);
       this.database.prepare(`INSERT INTO lineage_repositories
         (experiment_id, role, repository_path, baseline_commit, baseline_tag_object) VALUES (?, ?, ?, ?, ?)`)
         .run(childId, role, destination, resolved, tagObject);
@@ -502,8 +524,8 @@ export class PluginLineageRepository {
   close(): void { this.database.close(); }
 
   private verifyTag(repository: string, row: PromotionRow): void {
-    const target = optionalGit(repository, ["rev-parse", `${row.tag_name}^{commit}`]);
-    const message = optionalGit(repository, ["for-each-ref", `refs/tags/${row.tag_name}`, "--format=%(contents)"]);
+    const target = this.gitRunner.optional(repository, ["rev-parse", `${row.tag_name}^{commit}`]);
+    const message = this.gitRunner.optional(repository, ["for-each-ref", `refs/tags/${row.tag_name}`, "--format=%(contents)"]);
     if (target !== row.target_commit || message === undefined
       || sha256(message.trim()) !== row.metadata_digest || message.trim() !== row.metadata_json) {
       this.tampered(row.experiment_id, row.role, "晋级标签目标或元数据不一致");
@@ -588,23 +610,30 @@ function git(repository: string, args: string[]): string {
   return result.stdout.trim();
 }
 
-function optionalGit(repository: string, args: string[]): string | undefined {
-  try { return git(repository, args); } catch { return undefined; }
-}
+const defaultLineageGitRunner: LineageGitRunner = {
+  run: git,
+  optional(repository, args) {
+    try { return git(repository, args); } catch { return undefined; }
+  },
+};
 
-function findCandidateCommits(repository: string, attemptId: string): string[] {
+function findCandidateCommits(
+  repository: string,
+  attemptId: string,
+  runner: LineageGitRunner = defaultLineageGitRunner,
+): string[] {
   const subject = `candidate: ${attemptId}`;
-  return git(repository, ["log", "--all", "--format=%H%x09%s"]).split("\n")
+  return runner.run(repository, ["log", "--all", "--format=%H%x09%s"]).split("\n")
     .filter((entry) => entry.slice(41) === subject).map((entry) => entry.slice(0, 40));
 }
 
-function sourceTreeObject(sourceRoot: string): string {
+function sourceTreeObject(sourceRoot: string, runner: LineageGitRunner = defaultLineageGitRunner): string {
   const temporary = mkdtempSync(join(dirname(sourceRoot), ".maze-tree-"));
   try {
-    git(temporary, ["init"]);
+    runner.run(temporary, ["init"]);
     replaceWorktree(temporary, sourceRoot);
-    git(temporary, ["add", "-A"]);
-    return git(temporary, ["write-tree"]);
+    runner.run(temporary, ["add", "-A"]);
+    return runner.run(temporary, ["write-tree"]);
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }

@@ -5,7 +5,7 @@
 - 所有面向用户的交付物必须使用简体中文，包括但不限于回复、文档、规格说明、计划、评审报告、交接说明和变更摘要。
 - 所有软件开发均应遵循 SOLID、DRY、KISS、YAGNI、清晰分层、关注点分离、显式异常处理、安全配置、依赖最小化和可测试性等通用规范，优先沿用项目既有架构、编码约定与工具链，并根据实际业务复杂度合理采用工厂、策略、适配器、仓储、依赖注入等设计模式，避免为套用原则或模式而过度设计；新增或修改的代码块应使用简体中文提供必要的注释或说明，重点解释业务意图、关键边界和非显而易见的实现原因，避免逐行复述代码。
 
-<!-- vibeforge-lite:start version=0.3.5 -->
+<!-- vibeforge-lite:start version=0.3.7 -->
 ## Vibecoding workflow
 
 - Prefer the project-local workflow in `.agents/skills/`; rely on an installed Plugin only when the project explicitly selects Plugin mode.

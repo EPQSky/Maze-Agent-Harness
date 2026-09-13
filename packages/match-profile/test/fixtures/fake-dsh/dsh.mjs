@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
-import { join, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const args = process.argv.slice(2);
@@ -46,21 +46,78 @@ if (args[0] === "--version") {
   manifest.dependencies ??= {};
   manifest.dsh.profile.bundles ??= [];
   if (action === "add") {
+    const installedPackages = [];
     for (const spec of values) {
       const root = spec.startsWith("file:") ? spec.slice(5) : spec;
       const packageManifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
       if (!packageManifest.dsh?.bundle?.patch) throw new Error(`${packageManifest.name} 不是 dsh.bundle`);
-      const installedRoot = join(home, "profiles", profile, "node_modules", ...packageManifest.name.split("/"));
-      mkdirSync(resolve(installedRoot, ".."), { recursive: true });
-      rmSync(installedRoot, { recursive: true, force: true });
-      symlinkSync(root, installedRoot, "dir");
+      const profileRoot = join(home, "profiles", profile);
+      const storeKey = `${packageManifest.name.replace("/", "+")}@file+fixture`;
+      const installedRoot = join(profileRoot, "node_modules/.pnpm", storeKey, "node_modules", ...packageManifest.name.split("/"));
+      mkdirSync(dirname(installedRoot), { recursive: true });
+      cpSync(root, installedRoot, { recursive: true });
+      const topLevel = join(profileRoot, "node_modules", ...packageManifest.name.split("/"));
+      mkdirSync(dirname(topLevel), { recursive: true });
+      rmSync(topLevel, { recursive: true, force: true });
+      symlinkSync(relative(dirname(topLevel), installedRoot), topLevel, "dir");
       manifest.dependencies[packageManifest.name] = `file:${root}`;
       if (!manifest.dsh.profile.bundles.includes(packageManifest.name)) manifest.dsh.profile.bundles.push(packageManifest.name);
+      installedPackages.push({ name: packageManifest.name, root });
     }
     if (process.env.DSH_TAMPER_INSTALLED_PATCH) {
       const name = Object.keys(manifest.dependencies).at(-1);
       const installedRoot = join(home, "profiles", profile, "node_modules", ...name.split("/"));
       writeFileSync(join(installedRoot, "cordis.patch.yml"), "- insert: [{ id: extra, name: dangerous }]\n");
+    }
+    const manifestMode = process.env.DSH_PROFILE_MANIFEST_MODE;
+    if (manifestMode === "reverse") {
+      manifest.dependencies = Object.fromEntries(Object.entries(manifest.dependencies).reverse());
+      manifest.dsh.profile.bundles.reverse();
+    } else if (manifestMode === "dependency-extra") {
+      manifest.dependencies["@maze-arena/extra"] = "file:/untrusted/extra";
+    } else if (manifestMode === "dependency-missing") {
+      const missing = Object.keys(manifest.dependencies)[0];
+      delete manifest.dependencies[missing];
+    } else if (manifestMode === "bundle-extra") {
+      manifest.dsh.profile.bundles.push("@maze-arena/extra");
+    } else if (manifestMode === "bundle-missing") {
+      const missing = manifest.dsh.profile.bundles[0];
+      manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.filter((name) => name !== missing);
+    } else if (manifestMode === "bundle-duplicate") {
+      manifest.dsh.profile.bundles.push(manifest.dsh.profile.bundles[0]);
+    } else if (manifestMode === "package-source-mismatch") {
+      manifest.dependencies[installedPackages[0].name] = "file:/untrusted/mismatch";
+    } else if (manifestMode === "patch-reload-live") {
+      manifest.dsh.profile.patchReload = "live";
+    } else if (manifestMode === "patch-reload-missing") {
+      delete manifest.dsh.profile.patchReload;
+    }
+    const profileRoot = join(home, "profiles", profile);
+    const lockPackages = Object.fromEntries(installedPackages.map(({ name, root }) => {
+      const reference = `file:${relative(profileRoot, root).split(sep).join("/")}`;
+      return [`${name}@${reference}`, { resolution: { directory: reference.slice(5), type: "directory" } }];
+    }));
+    const lockDependencies = Object.fromEntries(installedPackages.map(({ name, root }) => {
+      const relativeReference = `file:${relative(profileRoot, root).split(sep).join("/")}`;
+      return [name, { specifier: `file:${root}`, version: relativeReference }];
+    }));
+    if (manifestMode === "lock-source-mismatch") {
+      lockDependencies[installedPackages[0].name].specifier = "file:/untrusted/mismatch";
+    }
+    writeFileSync(join(profileRoot, "pnpm-lock.yaml"), `${JSON.stringify({
+      lockfileVersion: "9.0",
+      importers: { ".": { dependencies: lockDependencies } },
+      packages: lockPackages,
+      snapshots: Object.fromEntries(Object.keys(lockPackages).map((key) => [key, {}])),
+    }, null, 2)}\n`);
+    if (manifestMode === "installed-content-tamper") {
+      const installed = join(profileRoot, "node_modules", ...installedPackages[0].name.split("/"), "package.json");
+      writeFileSync(installed, `${readFileSync(installed, "utf8")} `);
+    } else if (manifestMode === "virtual-store-escape") {
+      const { name, root } = installedPackages[0];
+      const topLevel = join(profileRoot, "node_modules", ...name.split("/"));
+      rmSync(topLevel, { recursive: true, force: true });
+      symlinkSync(root, topLevel, "dir");
     }
   } else {
     for (const name of values) {

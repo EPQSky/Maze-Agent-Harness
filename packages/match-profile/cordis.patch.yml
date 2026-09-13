@@ -1,9 +1,9 @@
 - insert:
     - id: maze-match-protocol-generator
-      name: '@maze-arena/match-profile/host'
+      name: './dist/host.js'
       inject: [mazeGenerator]
       disabled: !!js process.env.MAZE_MATCH_ROLE !== 'generator'
     - id: maze-match-protocol-solver
-      name: '@maze-arena/match-profile/host'
+      name: './dist/host.js'
       inject: [mazeSolver]
       disabled: !!js process.env.MAZE_MATCH_ROLE !== 'solver'

@@ -13,6 +13,9 @@ importers:
       '@maze-arena/backup':
         specifier: workspace:*
         version: link:../../packages/backup
+      '@maze-arena/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@maze-arena/dsh-integration':
         specifier: workspace:*
         version: link:../../packages/dsh-integration

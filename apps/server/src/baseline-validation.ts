@@ -30,6 +30,7 @@ import { PluginLineageRepository } from "@maze-arena/lineage";
 import { validatePluginPackage, type ArenaMatchRunner } from "@maze-arena/match-profile";
 import { createSolverCapability } from "@maze-arena/solver-plugin";
 import type { MatchRepository } from "./match-repository.js";
+import { HarnessInvocationError } from "./harness-invocation-error.js";
 
 interface BaselineAdapterOptions {
   experiment: Experiment;
@@ -183,9 +184,26 @@ export function createRealBaselineValidationAdapter(options: BaselineAdapterOpti
   return {
     runStep,
     smokeProvider: async () => {
-      if (!options.experiment.modelProfile || !options.harnessAdapter.smokeModel) return { passed: false };
-      const response = await options.harnessAdapter.smokeModel(options.experiment.modelProfile);
-      return { passed: true, providerText: response.providerText };
+      if (!options.experiment.modelProfile || !options.harnessAdapter.smokeModel) {
+        return { passed: false, usage: { tokens: 0, cost: 0, modelCalls: 0 } };
+      }
+      try {
+        const response = await options.harnessAdapter.smokeModel(options.experiment.modelProfile);
+        return { passed: true, providerText: response.providerText, usage: {
+          tokens: response.usage.tokens,
+          cost: response.usage.cost,
+          modelCalls: response.usage.modelCalls ?? 0,
+        } };
+      } catch (error) {
+        if (error instanceof HarnessInvocationError) {
+          return { passed: false, usage: {
+            tokens: error.usage?.tokens ?? 0,
+            cost: error.usage?.cost ?? 0,
+            modelCalls: error.usage?.modelCalls ?? 0,
+          }, failureKind: error.kind === "cancelled" || error.kind === "timeout" ? "process" : error.kind };
+        }
+        throw error;
+      }
     },
   };
 }

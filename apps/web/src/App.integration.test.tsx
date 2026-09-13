@@ -117,7 +117,7 @@ describe("实验工作台端到端持久化", () => {
     const detail = await server.inject({ method: "GET", url: "/api/experiments/legacy-web-id" });
     expect(detail.json()).toMatchObject({
       status: "running",
-      modelProfile: { providerId: "fake-basic", credentialRef: "dsh-credential://basic" },
+      modelProfile: { providerId: "fake-basic", credentialRef: "dsh-credential://BASIC_CRED" },
     });
   });
 });

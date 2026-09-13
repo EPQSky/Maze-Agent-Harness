@@ -13,7 +13,7 @@ const resources: Array<{ close(): void | Promise<void> }> = [];
 afterEach(async () => { await Promise.allSettled(resources.splice(0).reverse().map((resource) => resource.close())); });
 
 const profile: ModelProfile = {
-  providerId: "fake-basic", modelId: "compact-v1", credentialRef: "dsh-credential://basic",
+  providerId: "fake-basic", modelId: "compact-v1", credentialRef: "dsh-credential://BASIC_CRED",
   contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 10_000,
   providerLabel: "Fake", modelLabel: "Fake",
 };
@@ -24,6 +24,8 @@ function setup(
   costLimit?: number,
   backupTerminal?: (experimentId: string) => void,
   backupStart?: (experimentId: string) => void,
+  usageBudgetFor?: ConstructorParameters<typeof AutonomousExperimentRunner>[6],
+  terminalSettled?: ConstructorParameters<typeof AutonomousExperimentRunner>[7],
 ) {
   const root = mkdtempSync(join(tmpdir(), "maze-autonomous-runner-"));
   const databasePath = join(root, "arena.sqlite");
@@ -34,7 +36,9 @@ function setup(
   runtime.start(experiment.id);
   experiments.setStatus(experiment.id, "running");
   const audits = new AuditRepository(databasePath);
-  const runner = new AutonomousExperimentRunner(runtime, experiments, audits, adapter, backupTerminal, backupStart);
+  const runner = new AutonomousExperimentRunner(
+    runtime, experiments, audits, adapter, backupTerminal, backupStart, usageBudgetFor, terminalSettled,
+  );
   resources.push(runner, audits, runtime, experiments);
   return { experiment, runtime, runner, experiments };
 }
@@ -130,7 +134,7 @@ describe("自治实验后台运行器", () => {
     first.runner.launch(first.experiment.id);
     const protocolSnapshot = await waitForState(first.runtime, first.experiment.id, "paused");
     expect(protocolRun).toHaveBeenCalledTimes(1);
-    expect(protocolSnapshot.usage).toEqual({ tokens: 37, cost: 0.25 });
+    expect(protocolSnapshot.usage).toEqual({ tokens: 37, cost: 0.25, modelCalls: 0 });
 
     const transientRun = vi.fn(async () => {
       throw new HarnessInvocationError("提供方限流", "transient-provider", { tokens: 7, cost: 0.02 });
@@ -139,7 +143,45 @@ describe("自治实验后台运行器", () => {
     second.runner.launch(second.experiment.id);
     const snapshot = await waitForState(second.runtime, second.experiment.id, "paused");
     expect(transientRun).toHaveBeenCalledTimes(3);
-    expect(snapshot.usage).toEqual({ tokens: 21, cost: 0.06 });
+    expect(snapshot.usage).toEqual({ tokens: 21, cost: 0.06, modelCalls: 0 });
+  });
+
+  it("持久账本支持的瞬态错误跨外层重试不重复累计内存用量", async () => {
+    const runRole = vi.fn(async () => {
+      throw new HarnessInvocationError("提供方限流", "transient-provider", { tokens: 7, cost: 0.02, modelCalls: 1 },
+        undefined, "RATE_LIMITED", 1, true);
+    });
+    const { experiment, runtime, runner } = setup({ runRole }, 1_000);
+    runner.launch(experiment.id);
+    const snapshot = await waitForState(runtime, experiment.id, "paused");
+    expect(runRole).toHaveBeenCalledTimes(3);
+    expect(snapshot.usage).toEqual({ tokens: 0, cost: 0, modelCalls: 0 });
+  });
+
+  it("第一角色耗尽金丝雀硬预算后拒绝启动第二角色", async () => {
+    const remaining = { tokens: 10, cost: 0.1 };
+    const runRole = vi.fn(async ({ role, generation, frozenChampions, usageBudget }) => {
+      const usage = { tokens: 10, cost: 0.1 };
+      expect(role).toBe("generator");
+      expect(usageBudget?.consume(usage)).toBe(true);
+      return { result: result(role, frozenChampions[role], "tie", generation), usage };
+    });
+    const usageBudget = {
+      remaining: () => ({ ...remaining }),
+      consume: (usage: { tokens: number; cost: number }) => {
+        if (usage.tokens > remaining.tokens || usage.cost > remaining.cost) return false;
+        remaining.tokens -= usage.tokens;
+        remaining.cost -= usage.cost;
+        return true;
+      },
+    };
+    const { experiment, runtime, runner } = setup({ runRole }, 1_000, undefined, undefined, undefined, () => usageBudget);
+    runner.launch(experiment.id);
+    const snapshot = await waitForState(runtime, experiment.id, "paused");
+    expect(runRole).toHaveBeenCalledTimes(1);
+    expect(runtime.getRoleCheckpoint(experiment.id, 1, "generator")?.tokens).toBe(10);
+    expect(runtime.getRoleCheckpoint(experiment.id, 1, "solver")).toBeUndefined();
+    expect(snapshot.generation).toBe(0);
   });
 
   it("重启恢复复用已提交角色检查点，不重复调用或计费", async () => {
@@ -201,6 +243,14 @@ describe("自治实验后台运行器", () => {
     runner.resumePersisted();
     expect(experiments.find(experiment.id)?.status).toBe("running");
     expect(backupStart).toHaveBeenCalledWith(experiment.id);
+  });
+
+  it("重启恢复时主动收敛既有终态，不依赖报告 GET 释放外部租约", () => {
+    const terminalSettled = vi.fn();
+    const created = setup({ runRole: vi.fn() }, 1_000, undefined, undefined, undefined, undefined, terminalSettled);
+    const paused = created.runtime.recordInfrastructureFailure(created.experiment.id, "restart-test");
+    created.runner.resumePersisted();
+    expect(terminalSettled).toHaveBeenCalledWith(created.experiment.id, paused);
   });
 
   it("持续有晋级时运行到第 20 代自动完成", async () => {

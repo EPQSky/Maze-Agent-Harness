@@ -1,8 +1,9 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
-import { baselineValidationSteps, CompatibilityFingerprintChangedError, ControlPlaneRepository, ExperimentRuntimeRepository, runSynchronousGeneration, withProviderRetry, type FrozenExperimentConfiguration } from "./index.js";
+import { baselineValidationSteps, CompatibilityFingerprintChangedError, ControlPlaneRepository, ExperimentRuntimeRepository, MAX_TOP_LEVEL_TOOL_CALLS, runSynchronousGeneration, withProviderRetry, type FrozenExperimentConfiguration } from "./index.js";
 
 const configuration: FrozenExperimentConfiguration = {
   modelProfile: { provider: "fake", model: "deterministic" }, tokenLimit: 10_000, costLimit: 1.5,
@@ -38,13 +39,51 @@ describe("人工监督基线验收", () => {
 
   it("可选真实提供方冒烟只记录成败，不冻结返回文本", async () => {
     const repository = new ControlPlaneRepository(":memory:");
-    const smokeProvider = vi.fn(async () => ({ passed: true, providerText: `随机文本 ${Math.random()}` }));
+    const smokeProvider = vi.fn(async () => ({
+      passed: true,
+      providerText: `随机文本 ${Math.random()}`,
+      usage: { tokens: 7, cost: 0.01, modelCalls: 1 },
+    }));
     const record = await repository.runBaselineValidation("exp", {
       runStep: async (step) => ({ step, passed: true, diagnostics: [] }), smokeProvider,
     }, { smokeProvider: true });
-    expect(record.smoke).toEqual({ attempted: true, passed: true });
+    expect(record.smoke).toEqual({
+      attempted: true, passed: true, usage: { tokens: 7, cost: 0.01, modelCalls: 1 }, failureKind: null,
+    });
     expect(JSON.stringify(record)).not.toContain("随机文本");
     repository.close();
+  });
+
+  it("冒烟失败分类可跨重启持久化且不保存提供方原文", async () => {
+    const root = mkdtempSync(join(tmpdir(), "maze-control-smoke-failure-"));
+    const databasePath = join(root, "arena.sqlite");
+    const sensitiveText = "provider-secret-diagnostic";
+    try {
+      const first = new ControlPlaneRepository(databasePath);
+      const record = await first.runBaselineValidation("exp", {
+        runStep: async (step) => ({ step, passed: true, diagnostics: [] }),
+        smokeProvider: async () => ({
+          passed: false,
+          providerText: sensitiveText,
+          usage: { tokens: 11, cost: 0.02, modelCalls: 1 },
+          failureKind: "transient-provider",
+        }),
+      }, { smokeProvider: true });
+      expect(record.smoke).toEqual({
+        attempted: true,
+        passed: false,
+        usage: { tokens: 11, cost: 0.02, modelCalls: 1 },
+        failureKind: "transient-provider",
+      });
+      first.close();
+
+      const restarted = new ControlPlaneRepository(databasePath);
+      expect(restarted.getBaselineValidation("exp")?.smoke).toEqual(record.smoke);
+      restarted.close();
+      expect(readFileSync(databasePath)).not.toContain(Buffer.from(sensitiveText));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("重启后冻结配置保持一致，指纹变化关闭失败", async () => {
@@ -174,11 +213,342 @@ describe("同步进化运行控制", () => {
     first.saveRoleCheckpoint({ experimentId: "exp", generation: 1, role: "solver", attemptId: "g1-solver", result: roleResult("solver", "failed"), tokens: 0, cost: 0 });
     first.close();
     const restarted = new ExperimentRuntimeRepository(databasePath);
-    expect(restarted.getRoleCheckpoint("exp", 1, "generator")).toEqual({ attemptId: "g1-generator", result, tokens: 123, cost: 0.25 });
+    expect(restarted.getRoleCheckpoint("exp", 1, "generator")).toEqual({
+      attemptId: "g1-generator", result, tokens: 123, cost: 0.25, modelCalls: 0,
+    });
     expect(restarted.listRoleCheckpoints("exp", "generator", 2)).toEqual([{ generation: 1, attemptId: "g1-generator", result }]);
     restarted.saveRoleCheckpoint({ experimentId: "exp", generation: 1, role: "generator", attemptId: "g1-generator", result, tokens: 123, cost: 0.25 });
-    expect(restarted.get("exp")?.usage).toEqual({ tokens: 123, cost: 0.25 });
+    expect(restarted.get("exp")?.usage).toEqual({ tokens: 123, cost: 0.25, modelCalls: 0 });
     restarted.close();
+  });
+
+  it("父 Session 模型调用额度按可信用量结算并跨仓储重启保持", () => {
+    const databasePath = join(mkdtempSync(join(tmpdir(), "maze-model-calls-")), "arena.sqlite");
+    const first = new ExperimentRuntimeRepository(databasePath);
+    first.registerReady({
+      experimentId: "exp", champions: { generator: "g", solver: "s" }, tokenLimit: 1_000,
+      compatibilityFingerprint: "compat",
+    });
+
+    const initial = first.reserveRemainingModelCalls("exp", 1, "generator");
+    expect(initial).toBe(8);
+    first.settleModelCallReservation({
+      experimentId: "exp", generation: 1, role: "generator", reserved: initial, used: 2,
+    });
+    expect(first.get("exp")?.modelCallsReserved).toBe(2);
+    first.close();
+
+    const restarted = new ExperimentRuntimeRepository(databasePath);
+    const afterSuccess = restarted.reserveRemainingModelCalls("exp", 1, "generator");
+    expect(afterSuccess).toBe(6);
+    // 结构化失败与成功使用相同的可信结算入口，只保留实际发生的调用。
+    restarted.settleModelCallReservation({
+      experimentId: "exp", generation: 1, role: "generator", reserved: afterSuccess, used: 3,
+    });
+    expect(restarted.get("exp")?.modelCallsReserved).toBe(5);
+
+    const beforeCrash = restarted.reserveRemainingModelCalls("exp", 1, "generator");
+    expect(beforeCrash).toBe(3);
+    restarted.close();
+
+    const afterCrash = new ExperimentRuntimeRepository(databasePath);
+    expect(afterCrash.get("exp")?.modelCallsReserved).toBe(8);
+    expect(() => afterCrash.reserveRemainingModelCalls("exp", 1, "generator"))
+      .toThrow(/八次模型调用额度已耗尽/);
+    expect(afterCrash.reserveRemainingModelCalls("exp", 1, "solver")).toBe(8);
+    expect(afterCrash.reserveRemainingModelCalls("exp", 2, "generator")).toBe(8);
+    afterCrash.close();
+  });
+
+  it("剩余模型调用不足以收尾时在预留前拒绝新 Session", () => {
+    const databasePath = join(mkdtempSync(join(tmpdir(), "maze-model-call-minimum-")), "arena.sqlite");
+    const runtime = new ExperimentRuntimeRepository(databasePath);
+    runtime.registerReady({
+      experimentId: "exp", champions: { generator: "g", solver: "s" }, tokenLimit: 1_000,
+      compatibilityFingerprint: "compat",
+    });
+
+    expect(runtime.reserveRemainingModelCalls("exp", 1, "generator")).toBe(8);
+    runtime.settleModelCallReservation({
+      experimentId: "exp", generation: 1, role: "generator", reserved: 8, used: 6,
+    });
+    expect(() => runtime.reserveRemainingModelCalls("exp", 1, "generator", 3))
+      .toThrow(/最小收尾.*至少 3 次.*仅剩 2 次/);
+    expect(runtime.get("exp")?.modelCallsReserved).toBe(6);
+    runtime.close();
+  });
+
+  it("首个进化 Session 最多预留五次，后续只在至少三次时启动", () => {
+    const runtime = new ExperimentRuntimeRepository(":memory:");
+    runtime.registerReady({
+      experimentId: "exp", champions: { generator: "g", solver: "s" }, tokenLimit: 1_000,
+      compatibilityFingerprint: "compat",
+    });
+
+    const first = runtime.reserveRemainingModelCalls("exp", 1, "generator", 3, 5);
+    expect(first).toBe(5);
+    runtime.settleModelCallReservation({
+      experimentId: "exp", generation: 1, role: "generator", reserved: first, used: 3,
+    });
+    expect(runtime.get("exp")?.modelCallsReserved).toBe(3);
+
+    const second = runtime.reserveRemainingModelCalls("exp", 1, "generator", 3, 8);
+    expect(second).toBe(5);
+    runtime.settleModelCallReservation({
+      experimentId: "exp", generation: 1, role: "generator", reserved: second, used: 3,
+    });
+    expect(runtime.get("exp")?.modelCallsReserved).toBe(6);
+    expect(() => runtime.reserveRemainingModelCalls("exp", 1, "generator", 3, 8))
+      .toThrow(/最小收尾.*至少 3 次.*仅剩 2 次/);
+    runtime.close();
+  });
+
+  it("Provider attempt actual 跨进程原子转入持久 batch，未结算上界继续保留", () => {
+    const databasePath = join(mkdtempSync(join(tmpdir(), "maze-provider-budget-")), "arena.sqlite");
+    const first = new ExperimentRuntimeRepository(databasePath);
+    first.registerReady({
+      experimentId: "exp", champions: { generator: "g", solver: "s" }, tokenLimit: 1_000, costLimit: 1,
+      compatibilityFingerprint: "compat",
+    });
+    expect(first.reserveRemainingModelCalls("exp", 1, "generator")).toBe(8);
+    const settled = first.reserveProviderAttempt({
+      experimentId: "exp", generation: 1, role: "generator", tokens: 600, cost: 0.6,
+      invocationId: "a".repeat(64), reservedModelCalls: 8, auditDetails: { outcome: "failed" },
+    });
+    const settledBatch = first.settleProviderAttempt({ reservationId: settled, tokens: 100, cost: 0.1 });
+    expect(settledBatch).toMatchObject({
+      itemId: settled, invocationId: "a".repeat(64), tokens: 100, cost: 0.1, modelCalls: 1,
+    });
+    first.close();
+
+    const restarted = new ExperimentRuntimeRepository(databasePath);
+    const item = restarted.listPendingProviderUsageItems("exp", 1, "generator")[0]!;
+    expect(restarted.listPendingProviderUsageItems("exp", 1, "generator")).toHaveLength(1);
+    expect(restarted.accountProviderUsageItemModelCalls(item.itemId)).toBe(true);
+    restarted.accountProviderUsageItemRuntime(item.itemId);
+    restarted.recordRoleFailureUsage({
+      experimentId: "exp", generation: 1, role: "generator", tokens: 100, cost: 0.1, modelCalls: 1,
+    });
+    const crashed = restarted.reserveProviderAttempt({
+      experimentId: "exp", generation: 1, role: "generator", tokens: 800, cost: 0.8,
+      invocationId: "b".repeat(64), reservedModelCalls: 7, auditDetails: { outcome: "failed" },
+    });
+    expect(crashed).toMatch(/[0-9a-f-]{36}/);
+    expect(() => restarted.reserveProviderAttempt({
+      experimentId: "exp", generation: 1, role: "generator", tokens: 101, cost: 0.01,
+      invocationId: "b".repeat(64), reservedModelCalls: 7, auditDetails: { outcome: "failed" },
+    })).toThrow(/保守预算不足/);
+    // 已结算的 100 tokens 已正式入账；无 usage 的 800 tokens 崩溃预留仍不可释放。
+    expect(() => restarted.reserveProviderAttempt({
+      experimentId: "exp", generation: 1, role: "generator", tokens: 101, cost: 0.01,
+      invocationId: "b".repeat(64), reservedModelCalls: 7, auditDetails: { outcome: "failed" },
+    })).toThrow(/保守预算不足/);
+    restarted.close();
+  });
+
+  it("逐 attempt item 在双仓储交错结算后保持不可变并让晚到 usage 重新 pending", () => {
+    const databasePath = join(mkdtempSync(join(tmpdir(), "maze-provider-batch-race-")), "arena.sqlite");
+    const first = new ExperimentRuntimeRepository(databasePath);
+    first.registerReady({
+      experimentId: "exp", champions: { generator: "g", solver: "s" }, tokenLimit: 1_000_000,
+      costLimit: 10, compatibilityFingerprint: "compat",
+    });
+    expect(first.reserveRemainingModelCalls("exp", 1, "generator")).toBe(8);
+    const reservations = ([[100_000, 1], [40_000, 0.4]] as const).map(([tokens, cost]) => ({
+      reservationId: first.reserveProviderAttempt({
+        experimentId: "exp", generation: 1, role: "generator", tokens: 200_000, cost: 2,
+        invocationId: "c".repeat(64), reservedModelCalls: 8, auditDetails: { outcome: "failed" },
+      }), tokens, cost,
+    }));
+    const second = new ExperimentRuntimeRepository(databasePath);
+    const firstItem = first.settleProviderAttempt({ ...reservations[0]!, tokens: 10, cost: 0.1 });
+    expect(second.settleProviderAttempt({ ...reservations[0]!, tokens: 10, cost: 0.1 })).toEqual(firstItem);
+    expect(() => second.settleProviderAttempt({ ...reservations[0]!, tokens: 99_999 }))
+      .toThrow(/幂等结算载荷冲突/);
+    expect(first.accountProviderUsageItemModelCalls(firstItem.itemId)).toBe(true);
+    first.markProviderUsageItemCanaryAccounted(firstItem.itemId, true);
+    first.markProviderUsageItemAuditAccounted(firstItem.itemId);
+    first.accountProviderUsageItemRuntime(firstItem.itemId);
+    first.saveRoleCheckpoint({
+      experimentId: "exp", generation: 1, role: "generator", attemptId: "attempt",
+      result: roleResult("generator", "failed"), tokens: 999, cost: 9, modelCalls: 8,
+    });
+    expect(first.listPendingProviderUsageItems("exp", 1, "generator")).toEqual([]);
+
+    const secondItem = second.settleProviderAttempt({ ...reservations[1]!, tokens: 20, cost: 0.2 });
+    expect(secondItem).toMatchObject({ tokens: 20, cost: 0.2, modelCalls: 1 });
+    expect(second.listPendingProviderUsageItems("exp", 1, "generator"))
+      .toEqual([expect.objectContaining({ itemId: secondItem.itemId })]);
+    expect(second.listPendingProviderUsageItems("exp", 1, "generator"))
+      .not.toContainEqual(expect.objectContaining({ itemId: firstItem.itemId }));
+    expect(second.accountProviderUsageItemModelCalls(secondItem.itemId)).toBe(true);
+    second.markProviderUsageItemCanaryAccounted(secondItem.itemId, true);
+    second.markProviderUsageItemAuditAccounted(secondItem.itemId);
+    second.accountProviderUsageItemRuntime(secondItem.itemId);
+    expect(second.get("exp")).toMatchObject({ usage: { tokens: 30, modelCalls: 2 } });
+    expect(second.get("exp")!.usage.cost).toBeCloseTo(0.3);
+    expect(second.getRoleCheckpoint("exp", 1, "generator")).toMatchObject({ tokens: 30, modelCalls: 2 });
+    expect(second.getRoleCheckpoint("exp", 1, "generator")!.cost).toBeCloseTo(0.3);
+    expect(second.getProviderInvocationUsage("c".repeat(64))).toMatchObject({ tokens: 30, modelCalls: 2 });
+    second.close();
+    first.close();
+  });
+
+  it("Provider invocation 与 usage item 跨实验、代次与角色严格隔离", () => {
+    const runtime = new ExperimentRuntimeRepository(":memory:");
+    for (const experimentId of ["exp-a", "exp-b"]) runtime.registerReady({
+      experimentId, champions: { generator: "g", solver: "s" }, tokenLimit: 10_000,
+      costLimit: 10, compatibilityFingerprint: "compat",
+    });
+    const invocationId = "f".repeat(64);
+    const auditDetails = { outcome: "failed" };
+    expect(runtime.reserveRemainingModelCalls("exp-a", 1, "generator")).toBe(8);
+    const reservationId = runtime.reserveProviderAttempt({
+      experimentId: "exp-a", generation: 1, role: "generator", tokens: 100, cost: 0.1,
+      invocationId, reservedModelCalls: 8, auditDetails,
+    });
+    for (const [experimentId, generation, role] of [
+      ["exp-b", 1, "generator"], ["exp-a", 2, "generator"], ["exp-a", 1, "solver"],
+    ] as const) {
+      expect(runtime.reserveRemainingModelCalls(experimentId, generation, role)).toBe(8);
+      expect(() => runtime.reserveProviderAttempt({
+        experimentId, generation, role, tokens: 100, cost: 0.1,
+        invocationId, reservedModelCalls: 8, auditDetails,
+      })).toThrow(/invocation owner 冲突/);
+    }
+    runtime.settleProviderAttempt({ reservationId, tokens: 10, cost: 0.01 });
+    expect(runtime.listPendingProviderUsageItems("exp-a", 1, "generator")).toHaveLength(1);
+    expect(runtime.listPendingProviderUsageItems("exp-b", 1, "generator")).toEqual([]);
+    expect(runtime.listPendingProviderUsageItems("exp-a", 2, "generator")).toEqual([]);
+    expect(runtime.listPendingProviderUsageItems("exp-a", 1, "solver")).toEqual([]);
+    runtime.close();
+  });
+
+  it("Provider invocation 在 SQLite 账本层拒绝超出模型调用预留", () => {
+    const runtime = new ExperimentRuntimeRepository(":memory:");
+    runtime.registerReady({
+      experimentId: "exp", champions: { generator: "g", solver: "s" }, tokenLimit: 10_000,
+      costLimit: 10, compatibilityFingerprint: "compat",
+    });
+    expect(runtime.reserveRemainingModelCalls("exp", 1, "generator")).toBe(8);
+    const common = {
+      experimentId: "exp", generation: 1, role: "generator" as const, tokens: 100, cost: 0.1,
+      invocationId: "8".repeat(64), reservedModelCalls: 2, auditDetails: { outcome: "failed" },
+    };
+    runtime.reserveProviderAttempt(common);
+    runtime.reserveProviderAttempt(common);
+    expect(() => runtime.reserveProviderAttempt(common)).toThrow(/模型调用预留已耗尽/);
+    runtime.close();
+  });
+
+  it("Provider attempt settle 删除失败时回滚 outbox 聚合并保留预留", () => {
+    const databasePath = join(mkdtempSync(join(tmpdir(), "maze-provider-batch-rollback-")), "arena.sqlite");
+    const runtime = new ExperimentRuntimeRepository(databasePath);
+    runtime.registerReady({
+      experimentId: "exp", champions: { generator: "g", solver: "s" }, tokenLimit: 1_000,
+      costLimit: 1, compatibilityFingerprint: "compat",
+    });
+    expect(runtime.reserveRemainingModelCalls("exp", 1, "generator")).toBe(8);
+    const reservationId = runtime.reserveProviderAttempt({
+      experimentId: "exp", generation: 1, role: "generator", tokens: 500, cost: 0.5,
+      invocationId: "d".repeat(64), reservedModelCalls: 8, auditDetails: { outcome: "failed" },
+    });
+    const sabotage = new DatabaseSync(databasePath);
+    sabotage.exec(`CREATE TRIGGER reject_provider_settle BEFORE DELETE ON generation_role_provider_attempts
+      BEGIN SELECT RAISE(ABORT, 'settle rejected'); END`);
+    expect(() => runtime.settleProviderAttempt({ reservationId, tokens: 123, cost: 0.12 }))
+      .toThrow(/settle rejected/);
+    expect(runtime.listPendingProviderUsageItems("exp", 1, "generator")).toEqual([]);
+    sabotage.exec("DROP TRIGGER reject_provider_settle");
+    expect(runtime.settleProviderAttempt({ reservationId, tokens: 123, cost: 0.12 }))
+      .toMatchObject({ tokens: 123, cost: 0.12, modelCalls: 1 });
+    sabotage.close();
+    runtime.close();
+  });
+
+  it("正式 Repair60 Provider attempts 旧表正常升级为逐 attempt items", () => {
+    const databasePath = join(mkdtempSync(join(tmpdir(), "maze-provider-repair60-migration-")), "arena.sqlite");
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`CREATE TABLE generation_role_provider_attempts (
+      reservation_id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL, generation INTEGER NOT NULL, role TEXT NOT NULL,
+      reserved_tokens INTEGER NOT NULL, reserved_cost REAL NOT NULL, actual_tokens INTEGER, actual_cost REAL
+    )`);
+    legacy.prepare(`INSERT INTO generation_role_provider_attempts VALUES
+      ('settled', 'exp', 1, 'generator', 100, 1, 10, 0.1),
+      ('pending', 'exp', 1, 'generator', 200, 2, NULL, NULL)`).run();
+    legacy.close();
+
+    const migrated = new ExperimentRuntimeRepository(databasePath);
+    expect(migrated.listPendingProviderUsageItems("exp", 1, "generator"))
+      .toEqual([expect.objectContaining({ itemId: "settled", reservationId: "settled", invocationId: "settled",
+        tokens: 10, cost: 0.1, modelCalls: 1 })]);
+    migrated.close();
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    expect(database.prepare(`SELECT reservation_id, invocation_id, reserved_model_calls, audit_details_json
+      FROM generation_role_provider_attempts`).all()).toEqual([
+      { reservation_id: "pending", invocation_id: "pending", reserved_model_calls: 1, audit_details_json: "{}" },
+    ]);
+    database.close();
+  });
+
+  it.each([
+    ["generation_role_provider_attempt_receipts"],
+    ["generation_role_provider_usage_batches"],
+    ["generation_role_provider_attempt_receipts", "generation_role_provider_usage_batches",
+      "real_dsh_canary_usage_receipts", "experiment_audit_events"],
+  ])("检测到未发布 Repair66 中间表时 fail-closed 且不部分修改：%s", (...tables) => {
+    const databasePath = join(mkdtempSync(join(tmpdir(), "maze-provider-intermediate-reject-")), "arena.sqlite");
+    const legacy = new DatabaseSync(databasePath);
+    for (const table of tables) legacy.exec(`CREATE TABLE ${table} (marker TEXT)`);
+    const before = legacy.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name").all();
+    legacy.close();
+    expect(() => new ExperimentRuntimeRepository(databasePath)).toThrow(/未发布的 Repair66 Provider usage 中间表/);
+    const unchanged = new DatabaseSync(databasePath, { readOnly: true });
+    expect(unchanged.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name").all())
+      .toEqual(before);
+    unchanged.close();
+  });
+
+  it("七次顶层工具额度按 generation/role 跨 repair 与仓储重启累计", () => {
+    const databasePath = join(mkdtempSync(join(tmpdir(), "maze-tool-budget-")), "arena.sqlite");
+    const first = new ExperimentRuntimeRepository(databasePath);
+    first.registerReady({
+      experimentId: "exp", champions: { generator: "g", solver: "s" }, tokenLimit: 1_000,
+      compatibilityFingerprint: "compat",
+    });
+    for (let repair = 0; repair < 3; repair += 1) {
+      expect(first.reserveTopLevelToolCall("exp", 1, "generator")).toBe(true);
+      expect(first.reserveTopLevelToolCall("exp", 1, "generator")).toBe(true);
+    }
+    expect(first.reserveTopLevelToolCall("exp", 1, "generator")).toBe(true);
+    first.close();
+    const restarted = new ExperimentRuntimeRepository(databasePath);
+    expect(restarted.reserveTopLevelToolCall("exp", 1, "generator")).toBe(false);
+    expect(restarted.reserveTopLevelToolCall("exp", 1, "solver")).toBe(true);
+    expect(restarted.reserveTopLevelToolCall("exp", 2, "generator")).toBe(true);
+    restarted.close();
+  });
+
+  it("把旧版六次工具额度表迁移为七次并保留已有账本", () => {
+    const databasePath = join(mkdtempSync(join(tmpdir(), "maze-tool-budget-migrate-")), "arena.sqlite");
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`CREATE TABLE generation_role_tool_calls (
+      experiment_id TEXT NOT NULL, generation INTEGER NOT NULL, role TEXT NOT NULL,
+      calls_used INTEGER NOT NULL CHECK (calls_used >= 0 AND calls_used <= 6),
+      PRIMARY KEY (experiment_id, generation, role)
+    )`);
+    legacy.prepare("INSERT INTO generation_role_tool_calls VALUES (?, ?, ?, ?)").run("exp", 1, "generator", 6);
+    legacy.close();
+
+    const migrated = new ExperimentRuntimeRepository(databasePath);
+    migrated.registerReady({
+      experimentId: "exp", champions: { generator: "g", solver: "s" }, tokenLimit: 1_000,
+      compatibilityFingerprint: "compat",
+    });
+    expect(migrated.reserveTopLevelToolCall("exp", 1, "generator")).toBe(true);
+    expect(migrated.reserveTopLevelToolCall("exp", 1, "generator")).toBe(false);
+    expect(MAX_TOP_LEVEL_TOOL_CALLS).toBe(7);
+    migrated.close();
   });
 
   it("提供方基础设施错误退避三次后抛出", async () => {

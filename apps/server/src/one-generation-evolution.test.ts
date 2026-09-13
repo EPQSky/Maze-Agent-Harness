@@ -1,4 +1,5 @@
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,7 +46,7 @@ describe("确定性一代累积自进化", () => {
     mkdirSync(globalHome);
     writeFileSync(join(globalHome, "readonly.txt"), "locked");
     writeFileSync(catalogPath, JSON.stringify({
-      schemaVersion: 1, harnessVersion: "2026.09-preview.1", credentialRefs: ["dsh-credential://production"],
+      schemaVersion: 1, harnessVersion: "2026.09-preview.1", credentialRefs: ["dsh-credential://PRODUCTION_CRED"],
       providers: [{ id: "provider", label: "Provider", models: [{ id: "model", label: "Model", capabilities: {
         reasoningEfforts: [], maxContextTokens: 8_000, maxOutputTokens: 1_000,
         maxTotalTokens: 20_000, providerOptions: {},
@@ -64,13 +65,28 @@ describe("确定性一代累积自进化", () => {
     await installer.prepare();
     const commandPath = resolve(dirname(fileURLToPath(import.meta.url)), "../test/fixtures/deterministic-evolution-harness.mjs");
     chmodSync(commandPath, 0o755);
+    const modelRelease = join(root, "model-release");
+    mkdirSync(modelRelease, { mode: 0o700 });
+    const catalogBytes = readFileSync(catalogPath);
+    const settingsBytes = Buffer.from("{}\n");
+    const frozenCatalogPath = join(modelRelease, "catalog.json");
+    const modelExportPath = join(modelRelease, "model-export.json");
+    const settingsPath = join(modelRelease, "settings.yaml");
+    writeFileSync(frozenCatalogPath, catalogBytes, { mode: 0o400 });
+    writeFileSync(modelExportPath, catalogBytes, { mode: 0o400 });
+    writeFileSync(settingsPath, settingsBytes, { mode: 0o400 });
+    chmodSync(modelRelease, 0o500);
+    const modelReleaseSha256 = createHash("sha256").update(catalogBytes).update("\0").update(catalogBytes)
+      .update("\0").update(settingsBytes).digest("hex");
     const harness = createProductionHarnessAdapter({
-      ARENA_MODEL_CATALOG_PATH: catalogPath, DSH_HARNESS_VERSION: "2026.09-preview.1",
+      ARENA_MODEL_CATALOG_PATH: frozenCatalogPath, DSH_HARNESS_VERSION: "2026.09-preview.1",
+      DSH_MODEL_EXPORT_PATH: modelExportPath, DSH_MODEL_SETTINGS_PATH: settingsPath,
+      ARENA_MODEL_RELEASE_SHA256: modelReleaseSha256,
       DSH_EVOLUTION_COMMAND: commandPath, DSH_SMOKE_COMMAND: "/bin/false",
       DSH_EVOLUTION_EXECUTION_KIND: "deterministic-fixture", DSH_HOME: globalHome,
     });
     const profile: ModelProfile = harness.validateModelProfile({
-      providerId: "provider", modelId: "model", credentialRef: "dsh-credential://production",
+      providerId: "provider", modelId: "model", credentialRef: "dsh-credential://PRODUCTION_CRED",
       contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000,
     });
     const experiments = new ExperimentRepository(databasePath, join(root, "harness"));

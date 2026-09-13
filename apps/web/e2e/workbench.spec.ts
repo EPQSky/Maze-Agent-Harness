@@ -3,7 +3,7 @@ import { expect, test, type Page } from "@playwright/test";
 const experiment = {
   id: "e2e-experiment", name: "长期自治实验", status: "paused", createdAt: "2026-09-02T12:00:00.000Z",
   costLimit: 1,
-  modelProfile: { providerId: "fake-basic", modelId: "compact-v1", credentialRef: "dsh-credential://basic",
+  modelProfile: { providerId: "fake-basic", modelId: "compact-v1", credentialRef: "dsh-credential://BASIC_CRED",
     contextTokens: 4_000, outputTokens: 1_000, totalTokenLimit: 5_000, providerLabel: "Fake", modelLabel: "Compact" },
   harnessEnvironments: { generator: { home: "/g/home", workspace: "/g/work" }, solver: { home: "/s/home", workspace: "/s/work" } },
 };
@@ -123,22 +123,22 @@ test("工作台导航、筛选、播放和画布布局可用", async ({ page }, 
     await page.getByLabel("跳到结尾").click();
     await expect(page.getByText("已解决")).toBeVisible();
 
-    await page.getByRole("tab", { name: "Matches" }).click();
+    await page.getByRole("tab", { name: "比赛" }).click();
     await page.getByLabel("角色筛选").selectOption("generator");
     await expect(page.getByText("match-exhibition")).toHaveCount(0);
     await page.getByLabel("角色筛选").selectOption("exhibition");
     await expect(page.getByText("match-exhibition")).toBeVisible();
-    await page.getByRole("tab", { name: "Lineages" }).click();
+    await page.getByRole("tab", { name: "谱系" }).click();
     await expect(page.getByText("baseline: generator", { exact: true })).toBeVisible();
     await expect(page.getByText("baseline/e2e/generator", { exact: true })).toBeVisible();
     await expect(page.getByText("可信基线")).toHaveCount(2);
     await expect(page.getByText("中间修复候选")).toBeVisible();
     await expect(page.getByText("当前冠军")).toHaveCount(2);
     await expect(page.getByText("promotion/e2e/generator/g0001")).toBeVisible();
-    await page.getByRole("tab", { name: "Generations" }).click();
+    await page.getByRole("tab", { name: "进化代" }).click();
     await expect(page.getByLabel("第 1 代证据").getByText("下一代已继承该冠军")).toHaveCount(2);
     await expect(page.getByLabel("第 1 代证据").getByText("本代起点")).toHaveCount(2);
-    await page.getByRole("tab", { name: "Candidates" }).click();
+    await page.getByRole("tab", { name: "候选" }).click();
     await expect(page.getByLabel("第 1 代 Generator 候选").getByText("真实模型运行")).toBeVisible();
     await expect(page.getByLabel("第 1 代 Solver 候选").getByText("确定性自治夹具")).toBeVisible();
     await expect(page.getByLabel("第 2 代 Generator 候选").getByText("Fake Harness 测试")).toBeVisible();
@@ -148,7 +148,7 @@ test("工作台导航、筛选、播放和画布布局可用", async ({ page }, 
     await expect(page.getByText("hiddenSecretMetric")).toHaveCount(0);
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
     await page.screenshot({ path: testInfo.outputPath(`ticket-10-candidates-${testInfo.project.name}.png`), fullPage: true });
-    await page.getByRole("tab", { name: "Audit" }).click();
+    await page.getByRole("tab", { name: "审计" }).click();
     await expect(page.getByText(/实际提供方返回/)).toBeVisible();
     await expect(page.getByText("Harness 已调用")).toHaveCount(3);
     await expect(page.getByText("候选无效")).toBeVisible();

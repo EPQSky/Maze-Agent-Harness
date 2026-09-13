@@ -1,9 +1,15 @@
 import { mkdtempSync, rmSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MATCH_PROTOCOL_VERSION, type Experiment, type GenerationRoleResult } from "@maze-arena/contracts";
-import { HARNESS_EVOLUTION_PROTOCOL_VERSION, type HarnessAdapter, type HarnessEvolutionResponse } from "@maze-arena/dsh-integration";
+import {
+  HARNESS_EVOLUTION_PROTOCOL_VERSION,
+  MIN_EVOLUTION_SESSION_MODEL_CALLS,
+  type HarnessAdapter,
+  type HarnessEvolutionResponse,
+  type HarnessExecutionIdentity,
+} from "@maze-arena/dsh-integration";
 import { runEvolutionAttempt } from "@maze-arena/evolution";
 import {
   compareGeneratorScores,
@@ -18,13 +24,14 @@ import {
   type PairedEvaluationRunner,
   type TrustedCandidateTestRunner,
 } from "@maze-arena/match-profile";
-import type { ExperimentRuntimeRepository } from "@maze-arena/control-plane";
+import { ModelCallBudgetError, type ExperimentRuntimeRepository } from "@maze-arena/control-plane";
 import type { AuditRepository } from "./audit-repository.js";
 import type { AutonomousEvolutionAdapter } from "./autonomous-runner.js";
 import type { ExperimentRepository } from "./experiment-repository.js";
 import { HarnessInvocationError } from "./harness-invocation-error.js";
 import { assembleTrustedEvolutionFeedback } from "./trusted-evolution-feedback.js";
 import { CandidateEvaluationFacts } from "./candidate-evaluation-facts.js";
+import { reconcileProviderUsageItems } from "./provider-usage-reconciliation.js";
 
 const MAX_PUBLIC_TRACE_EVENTS = 128;
 
@@ -60,7 +67,7 @@ export function createLocalEvolutionAdapter(options: {
       let provider: HarnessEvolutionResponse | undefined;
       let evaluationCandidate: { commit: string; root: string } | undefined;
       let trustedBuildSha256: string | undefined;
-      const trustedUsage = { tokens: 0, cost: 0 };
+      const trustedUsage = { tokens: 0, cost: 0, modelCalls: 0 };
       const evaluationFacts = new CandidateEvaluationFacts();
       const context = {
         opponentVersion: input.frozenChampions[opponentRole],
@@ -95,47 +102,174 @@ export function createLocalEvolutionAdapter(options: {
             return {
               run: async (sessionRequest) => {
                 if (input.signal.aborted) throw new Error("自治任务已取消");
+                reconcileProviderUsageItems({
+                  runtime: options.runtime, audits: options.audits, usageBudget: input.usageBudget,
+                  experimentId: input.experimentId, generation: input.generation, role: input.role,
+                });
+                const remaining = input.usageBudget?.remaining();
+                if (remaining && (remaining.tokens < 1 || remaining.cost <= 0)) {
+                  throw new HarnessInvocationError("金丝雀剩余硬预算不足以开始新的提供方调用", "provider", undefined,
+                    undefined, "CANARY_BUDGET_INSUFFICIENT");
+                }
+                let maxModelCalls: number;
+                try {
+                  // 严格进化提示要求 read、edit、最终 JSON 三个回合；不足时不启动注定无法收尾的 repair Session。
+                  maxModelCalls = options.runtime.reserveRemainingModelCalls(
+                    input.experimentId,
+                    input.generation,
+                    input.role,
+                    MIN_EVOLUTION_SESSION_MODEL_CALLS,
+                    sessionRequest.repairAttempt === 0 ? 5 : 8,
+                  );
+                } catch (error) {
+                  if (input.usageBudget && error instanceof ModelCallBudgetError) {
+                    options.audits.append(input.experimentId, "harness.activity", harnessAuditDetails(
+                      input.role, input.attemptId, undefined, "failed", {
+                        sessionId,
+                        failureKind: "protocol",
+                        failureCode: "MODEL_CALL_BUDGET_EXHAUSTED",
+                        usageTokens: null,
+                        usageCost: null,
+                        usageModelCalls: null,
+                      },
+                    ));
+                    throw new HarnessInvocationError(
+                      "剩余模型调用额度不足以完成进化 Session 的最小收尾",
+                      "protocol", undefined, undefined, "MODEL_CALL_BUDGET_EXHAUSTED", 0,
+                    );
+                  }
+                  throw error;
+                }
+                const invocationBudget = remaining
+                  ? { maxTokens: remaining.tokens, maxCost: remaining.cost, maxModelCalls }
+                  : { maxTokens: experiment.modelProfile!.totalTokenLimit, maxCost: Number.MAX_VALUE, maxModelCalls };
+                const invocationId = createHash("sha256").update(JSON.stringify({
+                  experimentId: input.experimentId,
+                  generation: input.generation,
+                  role: input.role,
+                  attemptId: input.attemptId,
+                  sessionId,
+                  repairAttempt: sessionRequest.repairAttempt,
+                })).digest("hex");
+                const pendingAuditDetails = harnessAuditDetails(input.role, input.attemptId, {
+                  kind: "real-provider",
+                  protocolVersion: HARNESS_EVOLUTION_PROTOCOL_VERSION,
+                  sessionId,
+                  harnessVersion: "unknown",
+                  providerId: experiment.modelProfile!.providerId,
+                  modelId: experiment.modelProfile!.modelId,
+                }, "failed", { failureKind: "process", failureCode: "PROVIDER_PROCESS_INTERRUPTED" });
                 try {
                   provider = await options.harness.evolvePlugin!({
                     sessionId,
                     experimentId: input.experimentId, generation: input.generation, role: input.role,
-                    attemptId: input.attemptId, modelProfile: experiment.modelProfile!,
+                    attemptId: input.attemptId, modelProfile: experiment.modelProfile!, budget: invocationBudget,
                     home: sessionRequest.home, workspace: sessionRequest.workspace,
                     input: sessionRequest.input, allowedTools: sessionRequest.allowedTools,
                     repairAttempt: sessionRequest.repairAttempt, diagnostics: sessionRequest.diagnostics,
+                    budgetLedger: {
+                      reserveProviderAttempt: (upper) => options.runtime.reserveProviderAttempt({
+                        experimentId: input.experimentId, generation: input.generation, role: input.role, ...upper,
+                        invocationId, reservedModelCalls: invocationBudget.maxModelCalls,
+                        auditDetails: pendingAuditDetails,
+                        ...(remaining ? { availableTokens: remaining.tokens, availableCost: remaining.cost } : {}),
+                      }),
+                      settleProviderAttempt: (reservationId, usage) => options.runtime.settleProviderAttempt({
+                        reservationId, ...usage,
+                      }),
+                      reserveTopLevelToolCall: () => options.runtime.reserveTopLevelToolCall(
+                        input.experimentId, input.generation, input.role,
+                      ),
+                    },
                     signal: input.signal,
                   });
+                  if (provider.execution.kind === "real-provider") {
+                    const ledgerUsage = options.runtime.getProviderInvocationUsage(invocationId);
+                    if (!ledgerUsage || ledgerUsage.tokens !== provider.usage.tokens
+                      || Math.abs(ledgerUsage.cost - provider.usage.cost) > 1e-12
+                      || ledgerUsage.modelCalls !== (provider.usage.modelCalls ?? 0)) {
+                      throw new HarnessInvocationError("Provider attempt 账本与 Harness 响应用量不一致", "protocol",
+                        ledgerUsage, provider.execution, "PROVIDER_ATTEMPT_USAGE_MISMATCH", undefined,
+                        Boolean(ledgerUsage));
+                    }
+                    reconcileProviderUsageItems({
+                      runtime: options.runtime, audits: options.audits, usageBudget: input.usageBudget,
+                      experimentId: input.experimentId, generation: input.generation, role: input.role,
+                      auditDetails: harnessAuditDetails(input.role, input.attemptId, provider.execution, "succeeded"),
+                    });
+                  } else {
+                    options.runtime.settleModelCallReservation({
+                      experimentId: input.experimentId, generation: input.generation, role: input.role,
+                      reserved: invocationBudget.maxModelCalls, used: provider.usage.modelCalls ?? 0,
+                    });
+                  }
                 } catch (error) {
                   const currentInvocation = error instanceof HarnessInvocationError ? error : undefined;
+                  if (currentInvocation?.usageLedgerBacked) throw currentInvocation;
                   const execution = currentInvocation?.execution ?? provider?.execution;
-                  options.audits.append(input.experimentId, "harness.activity", {
-                    role: input.role,
-                    attemptId: input.attemptId,
-                    executionKind: execution?.kind ?? "unknown",
-                    protocolVersion: execution?.protocolVersion ?? HARNESS_EVOLUTION_PROTOCOL_VERSION,
-                    sessionId: execution?.sessionId ?? sessionId,
-                    harnessVersion: execution?.harnessVersion ?? "unknown",
-                    providerId: execution?.providerId ?? experiment.modelProfile!.providerId,
-                    modelId: execution?.modelId ?? experiment.modelProfile!.modelId,
-                    outcome: "failed",
+                  const attemptedModelCalls = currentInvocation?.attemptedModelCalls
+                    ?? currentInvocation?.usage?.modelCalls;
+                  const auditDetails = harnessAuditDetails(input.role, input.attemptId, execution, "failed", {
                     failureKind: currentInvocation?.kind ?? "unknown",
-                    usageTokens: currentInvocation?.usage?.tokens ?? null,
-                    usageCost: currentInvocation?.usage?.cost ?? null,
+                    failureCode: currentInvocation?.code ?? null,
+                    // 仅持久化 Harness 已去敏、受界限的诊断摘要，禁止原始 prompt/响应/stderr 进入审计。
+                    diagnostic: currentInvocation?.diagnostic
+                      ? JSON.stringify(currentInvocation.diagnostic)
+                      : null,
+                    failureFacts: currentInvocation?.failureFacts
+                      ? JSON.stringify(currentInvocation.failureFacts)
+                      : null,
                   });
-                  const hasTrustedUsage = trustedUsage.tokens > 0 || trustedUsage.cost > 0 || currentInvocation?.usage !== undefined;
+                  const ledgerUsage = execution?.kind === "real-provider"
+                    ? options.runtime.getProviderInvocationUsage(invocationId)
+                    : undefined;
+                  if (ledgerUsage) {
+                    reconcileProviderUsageItems({
+                      runtime: options.runtime, audits: options.audits, usageBudget: input.usageBudget,
+                      experimentId: input.experimentId, generation: input.generation, role: input.role,
+                      auditDetails,
+                    });
+                  } else if (attemptedModelCalls !== undefined && !currentInvocation?.usageLedgerBacked) {
+                    options.runtime.settleModelCallReservation({
+                      experimentId: input.experimentId, generation: input.generation, role: input.role,
+                      reserved: invocationBudget.maxModelCalls, used: attemptedModelCalls,
+                    });
+                  }
+                  const invocationUsage = execution?.kind === "real-provider"
+                    ? ledgerUsage
+                    : currentInvocation?.usage;
+                  if (!ledgerUsage) options.audits.append(input.experimentId, "harness.activity", {
+                    ...auditDetails,
+                    usageTokens: invocationUsage?.tokens ?? null,
+                    usageCost: invocationUsage?.cost ?? null,
+                    usageModelCalls: invocationUsage?.modelCalls ?? null,
+                  });
+                  if (!ledgerUsage && invocationUsage && input.usageBudget?.consume(invocationUsage) === false) {
+                    throw new HarnessInvocationError("金丝雀提供方调用超过剩余硬预算", "provider", invocationUsage, execution,
+                      "CANARY_USAGE_LIMIT_EXCEEDED");
+                  }
+                  const hasTrustedUsage = trustedUsage.tokens > 0 || trustedUsage.cost > 0 || invocationUsage !== undefined;
                   throw new HarnessInvocationError(
                     currentInvocation?.message ?? "Harness 自治调用失败",
                     currentInvocation?.kind ?? "process",
                     hasTrustedUsage ? {
-                      tokens: trustedUsage.tokens + (currentInvocation?.usage?.tokens ?? 0),
-                      cost: trustedUsage.cost + (currentInvocation?.usage?.cost ?? 0),
+                      tokens: trustedUsage.tokens + (invocationUsage?.tokens ?? 0),
+                      cost: trustedUsage.cost + (invocationUsage?.cost ?? 0),
+                      modelCalls: trustedUsage.modelCalls + (invocationUsage?.modelCalls ?? 0),
                     } : undefined,
                     execution,
+                    currentInvocation?.code,
+                    attemptedModelCalls,
+                    Boolean(ledgerUsage) || currentInvocation?.usageLedgerBacked,
+                    currentInvocation?.diagnostic,
+                    currentInvocation?.failureFacts,
                   );
                 }
-                trustedUsage.tokens += provider.usage.tokens;
-                trustedUsage.cost += provider.usage.cost;
-                options.audits.append(input.experimentId, "harness.activity", {
+                const invocationUsage = provider.usage;
+                trustedUsage.tokens += invocationUsage.tokens;
+                trustedUsage.cost += invocationUsage.cost;
+                trustedUsage.modelCalls += invocationUsage.modelCalls ?? 0;
+                if (provider.execution.kind !== "real-provider") options.audits.append(input.experimentId, "harness.activity", {
                   role: input.role, attemptId: input.attemptId,
                   executionKind: provider.execution.kind,
                   protocolVersion: provider.execution.protocolVersion,
@@ -144,9 +278,14 @@ export function createLocalEvolutionAdapter(options: {
                   providerId: provider.execution.providerId,
                   modelId: provider.execution.modelId,
                   outcome: "succeeded",
-                  usageTokens: provider.usage.tokens,
-                  usageCost: provider.usage.cost,
+                  usageTokens: invocationUsage.tokens,
+                  usageCost: invocationUsage.cost,
+                  usageModelCalls: invocationUsage.modelCalls ?? 0,
                 });
+                if (provider.execution.kind !== "real-provider" && input.usageBudget?.consume(invocationUsage) === false) {
+                  throw new HarnessInvocationError("金丝雀提供方调用超过剩余硬预算", "provider", invocationUsage,
+                    provider.execution, "CANARY_USAGE_LIMIT_EXCEEDED");
+                }
                 return provider;
               },
               close: () => undefined,
@@ -290,6 +429,27 @@ export function createLocalEvolutionAdapter(options: {
 function stableCandidateReason(diagnostics: readonly string[]): string {
   if (diagnostics.includes("Harness 未提交候选")) return "not-submitted";
   return diagnostics.length > 0 ? "candidate-validation-failed" : "unknown";
+}
+
+function harnessAuditDetails(
+  role: "generator" | "solver",
+  attemptId: string,
+  execution: HarnessExecutionIdentity | undefined,
+  outcome: "succeeded" | "failed",
+  extra: Record<string, boolean | number | string | null> = {},
+): Record<string, boolean | number | string | null> {
+  return {
+    role,
+    attemptId,
+    executionKind: execution?.kind ?? "unknown",
+    protocolVersion: execution?.protocolVersion ?? HARNESS_EVOLUTION_PROTOCOL_VERSION,
+    sessionId: execution?.sessionId ?? "unknown",
+    harnessVersion: execution?.harnessVersion ?? "unknown",
+    providerId: execution?.providerId ?? "unknown",
+    modelId: execution?.modelId ?? "unknown",
+    outcome,
+    ...extra,
+  };
 }
 
 export function createFrozenEvaluationCases(

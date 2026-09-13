@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  constants,
   cpSync,
   existsSync,
   fstatSync,
@@ -19,17 +20,37 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import type { Stats } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { request } from "node:http";
 import { Socket } from "node:net";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { RuntimeBackupManager, sensitiveEnvironmentValues } from "@maze-arena/backup";
+import {
+  redactionSensitiveValues,
+  RuntimeBackupManager,
+  sensitiveEnvironmentValues,
+  type SensitiveEnvironmentValueSet,
+} from "@maze-arena/backup";
+import {
+  createMatchProfileConfiguration,
+  MATCH_OUTPUT_LIMIT_BYTES,
+  type MatchPluginRole,
+  type MatchProtocolRequest,
+  type MatchProtocolResponse,
+  type ModelProfileInput,
+  type RealDshCanaryReport,
+  type RealDshCanaryRequest,
+  REAL_DSH_CANARY_MAX_COST,
+  REAL_DSH_CANARY_MAX_TOKENS,
+} from "@maze-arena/contracts";
 import {
   createHarnessNetworkSeccompProgram,
+  credentialEnvironmentNameFromReference,
+  credentialEnvironmentNameIssue,
   hashHarnessRuntimePayload,
   parseHarnessModelCatalog,
   runIsolatedHarnessCommand,
@@ -44,6 +65,7 @@ const requirements = {
 
 interface RuntimePaths {
   configRoot: string;
+  environmentFile: string;
   dataRoot: string;
   stateRoot: string;
   manifest: string;
@@ -54,6 +76,7 @@ interface RuntimePaths {
   processLock: string;
   harnessRuntimes: string;
   backups: string;
+  canaryReports: string;
 }
 
 interface ProcessState {
@@ -64,13 +87,21 @@ interface ProcessState {
   port: number;
   startedAt: string;
   databasePath: string;
-  harnessCommit: string;
+  harnessPackage: string;
+  harnessPackageVersion: string;
   harnessVersion: string;
   harnessExecutablePath: string;
   harnessExecutableSha256: string;
   harnessRuntimeRoot: string;
   harnessRuntimePayloadSha256: string;
+  harnessAdapterPath: string;
+  harnessAdapterSha256: string;
   modelCatalogRelease: string;
+  modelReleaseRoot: string;
+  modelReleaseSha256: string;
+  modelCatalogPath: string;
+  modelExportPath: string;
+  modelSettingsPath: string;
   imageDigest: string;
   logPath: string;
 }
@@ -100,16 +131,19 @@ interface InstallManifest {
     state: string;
   };
   harness: {
-    sourceDirectory: string;
-    commit: string;
+    packageName: "@deepseek-ai/dsh";
+    packageVersion: string;
     executable: {
-      sourcePath: string;
-      sourceRuntimeRoot: string;
       path: string;
       runtimeRoot: string;
       payloadSha256: string;
       sha256: string;
       version: string;
+    };
+    adapter: {
+      path: string;
+      sha256: string;
+      protocolVersion: 1;
     };
   };
   isolation: {
@@ -119,7 +153,9 @@ interface InstallManifest {
     imageId: string;
     imageReference: string;
     projectArtifactSha256: string;
-    harnessCommit: string;
+    harnessPackage: string;
+    harnessPackageVersion: string;
+    harnessRuntimePayloadSha256: string;
     dshExecutableSha256: string;
     resourcePolicy: typeof matchProfilePolicy;
   };
@@ -135,6 +171,8 @@ interface ValidatedDoctorContext {
   manifest: InstallManifest;
   catalog: ReturnType<typeof validateModelCatalog>;
   build: ReturnType<typeof validateProductionBuild>;
+  runtimeEnvironment: NodeJS.ProcessEnv;
+  sensitiveValues: SensitiveEnvironmentValueSet;
 }
 
 const matchProfilePolicy = {
@@ -199,6 +237,7 @@ function runtimePaths(environment: NodeJS.ProcessEnv): RuntimePaths {
   }
   return {
     configRoot,
+    environmentFile: join(configRoot, "env"),
     dataRoot,
     stateRoot,
     manifest: join(configRoot, "install-manifest.json"),
@@ -222,7 +261,107 @@ function runtimePaths(environment: NodeJS.ProcessEnv): RuntimePaths {
     processLock: join(runtime, "server.lock"),
     harnessRuntimes: join(dataRoot, "harness-runtimes"),
     backups: join(dataRoot, "backups"),
+    canaryReports: join(dataRoot, "canary-reports"),
   };
+}
+
+const environmentNamePattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const environmentFileTemplate = [
+  "# Maze Arena 用户级凭据。格式为 NAME=value，不执行 shell 展开。",
+  "# 名称需与 settings.yaml 中 provider 的 apiKeyEnv 完全一致。",
+  "",
+].join("\n");
+
+function validateEnvironmentFileStat(path: string, stat: Stats): void {
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new CliError(`凭据环境文件必须是普通文件且不得为符号链接：${path}`);
+  const mode = stat.mode & 0o777;
+  if (mode !== 0o600) throw new CliError(`凭据环境文件权限必须为 0600：${path} 当前为 ${mode.toString(8).padStart(4, "0")}`);
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+    throw new CliError(`凭据环境文件必须由当前用户拥有：${path}`);
+  }
+  if (stat.size > 64 * 1024) throw new CliError(`凭据环境文件不得超过 64 KiB：${path}`);
+}
+
+function assertSecureEnvironmentFile(path: string): void {
+  validateEnvironmentFileStat(path, lstatSync(path));
+}
+
+function parseEnvironmentFile(path: string): Map<string, string> {
+  let descriptor: number;
+  try {
+    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch {
+    try { validateEnvironmentFileStat(path, lstatSync(path)); } catch (error) {
+      if (error instanceof CliError) throw error;
+    }
+    throw new CliError(`凭据环境文件无法作为非符号链接普通文件打开：${path}`);
+  }
+  let serialized: string;
+  try {
+    validateEnvironmentFileStat(path, fstatSync(descriptor));
+    serialized = readFileSync(descriptor, "utf8");
+  } finally {
+    closeSync(descriptor);
+  }
+  if (serialized.includes("\0") || serialized.includes("\r")) {
+    throw new CliError(`凭据环境文件格式无效：${path}`);
+  }
+  const values = new Map<string, string>();
+  for (const [index, line] of serialized.split("\n").entries()) {
+    if (line.trim() === "" || /^\s*#/.test(line)) continue;
+    const separator = line.indexOf("=");
+    const name = separator > 0 ? line.slice(0, separator) : "";
+    const value = separator > 0 ? line.slice(separator + 1) : "";
+    if (!environmentNamePattern.test(name) || values.has(name)
+      || value.includes("$(") || value.includes("`") || value.endsWith("\\")) {
+      throw new CliError(`凭据环境文件第 ${index + 1} 行格式无效：仅允许唯一的 POSIX_NAME=value 字面量`);
+    }
+    values.set(name, value);
+  }
+  return values;
+}
+
+function validateCredentialName(name: string): string {
+  const issue = credentialEnvironmentNameIssue(name);
+  if (issue) throw new CliError(`模型目录${issue}：${name}`);
+  return name;
+}
+
+function credentialNamesFromReferences(references: readonly string[]): string[] {
+  return references.map((reference) => {
+    try { return credentialEnvironmentNameFromReference(reference); }
+    catch (error) {
+      const message = error instanceof Error ? error.message : "包含非法凭据引用";
+      throw new CliError(`模型目录${message}`);
+    }
+  });
+}
+
+function loadUserEnvironment(
+  paths: RuntimePaths,
+  environment: NodeJS.ProcessEnv,
+  allowedCredentialNames: readonly string[],
+): NodeJS.ProcessEnv {
+  if (!existsSync(paths.environmentFile)) return { ...environment };
+  const allowed = new Set(allowedCredentialNames.map(validateCredentialName));
+  const merged = { ...environment };
+  for (const [name, value] of parseEnvironmentFile(paths.environmentFile)) {
+    validateCredentialName(name);
+    if (!allowed.has(name)) throw new CliError(`凭据环境文件包含冻结模型目录未登记的名称：${name}`);
+    if (environment[name] === undefined) merged[name] = value;
+  }
+  return merged;
+}
+
+function ensureEnvironmentFile(paths: RuntimePaths): void {
+  if (!existsSync(paths.environmentFile)) {
+    try {
+      writeFileSync(paths.environmentFile, environmentFileTemplate, { mode: 0o600, flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+  assertSecureEnvironmentFile(paths.environmentFile);
 }
 
 function run(command: string, args: string[], timeout = 10_000): string {
@@ -373,7 +512,7 @@ setTimeout(() => finish(36), 2000).unref();
     `检查通过：Docker daemon ${dockerDaemon}`,
     "检查通过：Harness PID namespace 隔离可用",
     `检查通过：${bubblewrapOutput} 文件系统隔离可用`,
-    "检查通过：Harness Unix socket 系统调用已隔离且 TCP 回环可用",
+    "检查通过：Harness Unix socket 外部连接已隔离且 TCP 回环可用",
   ] };
 }
 
@@ -445,6 +584,21 @@ function hashPaths(paths: string[]): string {
     }
   }
   return digest.digest("hex");
+}
+
+function restoreCopiedModes(sourceRoot: string, targetRoot: string): void {
+  const pending = [sourceRoot];
+  while (pending.length > 0) {
+    const source = pending.pop()!;
+    const local = relative(sourceRoot, source);
+    const target = local ? join(targetRoot, local) : targetRoot;
+    const stat = lstatSync(source);
+    if (stat.isSymbolicLink()) continue;
+    chmodSync(target, stat.mode & 0o777);
+    if (stat.isDirectory()) {
+      pending.push(...readdirSync(source).map((entry) => join(source, entry)));
+    }
+  }
 }
 
 function resolveFile(path: string, label: string): string {
@@ -539,8 +693,8 @@ async function validateSandboxedHarnessVersion(
 
 function materializeHarnessRuntimeSnapshot(
   paths: RuntimePaths,
-  sourceRuntimeRoot: string,
-  sourceExecutable: string,
+  inputRuntimeRoot: string,
+  inputExecutable: string,
   payloadSha256: string,
   executableSha256: string,
   snapshotName = payloadSha256,
@@ -548,7 +702,7 @@ function materializeHarnessRuntimeSnapshot(
   if (!/^(?:[0-9a-f]{64}|instance-[0-9a-f-]{36})$/.test(snapshotName)) {
     throw new CliError("Harness 私有 runtime 快照名称无效");
   }
-  const executableLocalPath = relative(sourceRuntimeRoot, sourceExecutable);
+  const executableLocalPath = relative(inputRuntimeRoot, inputExecutable);
   if (!executableLocalPath || executableLocalPath === ".." || executableLocalPath.startsWith(`..${sep}`) || isAbsolute(executableLocalPath)) {
     throw new CliError("dsh 可执行文件必须位于声明的来源运行根内");
   }
@@ -556,7 +710,9 @@ function materializeHarnessRuntimeSnapshot(
   const staging = join(paths.harnessRuntimes, `.staging-${process.pid}-${randomUUID()}`);
   try {
     if (!existsSync(runtimeRoot)) {
-      cpSync(sourceRuntimeRoot, staging, { recursive: true, errorOnExist: true, verbatimSymlinks: true });
+      cpSync(inputRuntimeRoot, staging, { recursive: true, errorOnExist: true, verbatimSymlinks: true });
+      // cpSync 创建的每层目录会受 umask 影响；载荷摘要包含权限，必须逐层恢复。
+      restoreCopiedModes(inputRuntimeRoot, staging);
       const copiedIdentity = hashHarnessRuntimePayload(staging);
       if (copiedIdentity !== payloadSha256) {
         throw new CliError("Harness runtime 来源在创建私有快照期间发生漂移");
@@ -577,86 +733,26 @@ function materializeHarnessRuntimeSnapshot(
   }
 }
 
-function findHarnessRuntimePackage(sourceDirectory: string): HarnessRuntimePackage {
-  const matches: HarnessRuntimePackage[] = [];
-  const pending = [sourceDirectory];
-  while (pending.length > 0) {
-    const directory = pending.pop()!;
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      if (entry.name === ".git" || entry.name === "node_modules") continue;
-      const path = join(directory, entry.name);
-      if (entry.isDirectory()) {
-        pending.push(path);
-      } else if (entry.isFile() && entry.name === "package.json") {
-        let manifest: { name?: unknown; bin?: unknown };
-        try {
-          manifest = JSON.parse(readFileSync(path, "utf8"));
-        } catch (error) {
-          throw new CliError(`Harness package.json 无效：${path}：${(error as Error).message}`);
-        }
-        const bin = typeof manifest.bin === "string"
-          ? manifest.bin
-          : manifest.bin && typeof manifest.bin === "object"
-            ? (manifest.bin as Record<string, unknown>).dsh
-            : undefined;
-        if (typeof manifest.name === "string" && typeof bin === "string") {
-          const declaredExecutable = resolve(directory, bin);
-          const relation = relative(directory, declaredExecutable);
-          if (relation === ".." || relation.startsWith(`..${sep}`) || isAbsolute(relation)) {
-            throw new CliError(`Harness dsh bin 禁止越出所属运行包：${bin}`);
-          }
-          matches.push({ name: manifest.name, root: directory, executable: bin });
-        }
-      }
-    }
+function findHarnessRuntimePackage(runtimeRoot: string): HarnessRuntimePackage {
+  const root = join(runtimeRoot, "node_modules", "@deepseek-ai", "dsh");
+  const manifestPath = resolveFile(join(root, "package.json"), "npm DSH package.json");
+  let manifest: { name?: unknown; bin?: unknown };
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  } catch (error) {
+    throw new CliError(`npm DSH package.json 无效：${(error as Error).message}`);
   }
-  if (matches.length !== 1) {
-    throw new CliError(`锁定 Harness 源码必须且只能包含一个声明 dsh bin 的运行包，实际 ${matches.length} 个`);
+  const executable = typeof manifest.bin === "string" ? manifest.bin
+    : manifest.bin && typeof manifest.bin === "object" ? (manifest.bin as Record<string, unknown>).dsh : undefined;
+  if (manifest.name !== "@deepseek-ai/dsh" || typeof executable !== "string") {
+    throw new CliError("npm 安装结果缺少有效的 @deepseek-ai/dsh 运行包");
   }
-  const match = matches[0]!;
-  return match;
-}
-
-function validateDeployedHarnessRuntime(runtimeRoot: string, expected: HarnessRuntimePackage, executableSha256: string): string {
-  const manifestPath = join(runtimeRoot, "package.json");
-  if (!existsSync(manifestPath)) throw new CliError("Harness 生产部署缺少 package.json");
-  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
-    name?: unknown;
-    bin?: unknown;
-    dependencies?: Record<string, unknown>;
-  };
-  const bin = typeof manifest.bin === "string"
-    ? manifest.bin
-    : manifest.bin && typeof manifest.bin === "object"
-      ? (manifest.bin as Record<string, unknown>).dsh
-      : undefined;
-  if (manifest.name !== expected.name || typeof bin !== "string" || bin !== expected.executable) {
-    throw new CliError("Harness 生产部署的包名或 dsh 入口与锁定源码不一致");
+  const declaredExecutable = resolve(root, executable);
+  const relation = relative(root, declaredExecutable);
+  if (!relation || relation === ".." || relation.startsWith(`..${sep}`) || isAbsolute(relation)) {
+    throw new CliError("npm DSH 入口禁止越出所属运行包");
   }
-  const deployedExecutable = resolveFile(join(runtimeRoot, bin), "Harness 生产部署 dsh 入口");
-  if (sha256(deployedExecutable) !== executableSha256) {
-    throw new CliError("Harness 生产部署 dsh 入口与安装清单中的可执行文件身份不一致");
-  }
-  for (const dependency of Object.keys(manifest.dependencies ?? {})) {
-    const dependencyRoot = join(runtimeRoot, "node_modules", ...dependency.split("/"));
-    if (!existsSync(join(dependencyRoot, "package.json"))) {
-      throw new CliError(`Harness 生产部署缺少运行依赖：${dependency}`);
-    }
-  }
-  return bin.split(sep).join("/");
-}
-
-function currentHarnessCommit(sourceDirectory: string): string {
-  return run("git", ["-C", sourceDirectory, "rev-parse", "HEAD"]);
-}
-
-function validateCleanHarnessWorktree(sourceDirectory: string): void {
-  const status = run("git", ["-C", sourceDirectory, "status", "--porcelain=v1", "--untracked-files=all"]);
-  if (status) throw new CliError("Harness 源码工作树不干净");
-}
-
-function validateCommit(commit: string): void {
-  if (!/^[0-9a-f]{40}$/.test(commit)) throw new CliError("Harness 固定提交必须是 40 位小写 Git 对象 ID");
+  return { name: manifest.name, root, executable };
 }
 
 function ensureDirectories(paths: RuntimePaths): void {
@@ -675,7 +771,7 @@ function atomicWriteManifest(path: string, manifest: InstallManifest): void {
 }
 
 async function runHarnessModelExport(
-  executable: string,
+  adapter: string,
   runtimeRoot: string,
   payloadSha256: string,
   environment: NodeJS.ProcessEnv,
@@ -697,19 +793,20 @@ async function runHarnessModelExport(
     XDG_CONFIG_HOME: join(sessionHome, ".config"),
     XDG_DATA_HOME: join(sessionHome, ".local/share"),
     XDG_STATE_HOME: join(sessionHome, ".local/state"),
-    DSH_HOME: resolve(harnessHome),
+    DSH_HOME: sessionHome,
+    DSH_MODEL_SETTINGS_PATH: join(harnessHome, "settings.yaml"),
   });
   try {
     const result = await runIsolatedHarnessCommand({
-      command: executable,
-      args: ["models", "export", "--schema-version", "1", "--format", "json"],
+      command: adapter,
+      args: ["catalog"],
       runtimeRoot,
       expectedRuntimePayloadSha256: payloadSha256,
       environment: childEnvironment,
       timeoutMs: 30_000,
       cwd: workspace,
       writablePaths: [sessionHome, workspace],
-      readOnlyPaths: [harnessHome],
+      readOnlyPaths: existsSync(join(harnessHome, "settings.yaml")) ? [join(harnessHome, "settings.yaml")] : [],
       unshareCommand: unshareExecutable,
       bubblewrapCommand: bubblewrapExecutable,
     });
@@ -723,7 +820,7 @@ async function runHarnessModelExport(
   }
 }
 
-function validateExistingModelRelease(release: string, serialized: string): void {
+function validateExistingModelRelease(release: string, catalogSerialized: string, runtimeSerialized: string, settingsSerialized: string): void {
   try {
     const releaseStat = lstatSync(release);
     if (releaseStat.isSymbolicLink() || !releaseStat.isDirectory() || (releaseStat.mode & 0o777) !== 0o500) {
@@ -732,9 +829,19 @@ function validateExistingModelRelease(release: string, serialized: string): void
     const catalogPath = join(release, "catalog.json");
     const catalogStat = lstatSync(catalogPath);
     if (catalogStat.isSymbolicLink() || !catalogStat.isFile() || (catalogStat.mode & 0o777) !== 0o400
-      || readFileSync(catalogPath, "utf8") !== serialized) {
+      || readFileSync(catalogPath, "utf8") !== catalogSerialized) {
       throw new Error("invalid catalog");
     }
+    const runtimePath = join(release, "model-export.json");
+    const runtimeStat = lstatSync(runtimePath);
+    if (runtimeStat.isSymbolicLink() || !runtimeStat.isFile() || (runtimeStat.mode & 0o777) !== 0o400
+      || readFileSync(runtimePath, "utf8") !== runtimeSerialized) {
+      throw new Error("invalid runtime export");
+    }
+    const settingsPath = join(release, "settings.yaml");
+    const settingsStat = lstatSync(settingsPath);
+    if (settingsStat.isSymbolicLink() || !settingsStat.isFile() || (settingsStat.mode & 0o777) !== 0o400
+      || readFileSync(settingsPath, "utf8") !== settingsSerialized) throw new Error("invalid settings snapshot");
   } catch {
     throw new CliError("已存在的同摘要模型目录不满足不可变发布约束，拒绝发布");
   }
@@ -744,14 +851,10 @@ async function syncHarnessModels(environment: NodeJS.ProcessEnv): Promise<void> 
   const paths = runtimePaths(environment);
   const manifest = readManifest(paths);
   validateDirectoryPermissions(paths);
-  const sourceDirectory = resolveDirectory(manifest.harness.sourceDirectory, "Harness 源码目录");
-  if (currentHarnessCommit(sourceDirectory) !== manifest.harness.commit) throw new CliError("Harness 源码提交已漂移，拒绝同步模型目录");
-  validateCleanHarnessWorktree(sourceDirectory);
-  const executable = resolveFile(manifest.harness.executable.path, "dsh 可执行文件");
-  if (sha256(executable) !== manifest.harness.executable.sha256) throw new CliError("dsh 可执行文件内容已漂移，拒绝同步模型目录");
+  const { executablePath: executable, runtimeRoot } = validateFrozenHarnessRuntime(manifest);
   await validateSandboxedHarnessVersion(
     executable,
-    manifest.harness.executable.runtimeRoot,
+    runtimeRoot,
     manifest.harness.executable.version,
     environment,
     "dsh 精确版本已漂移，拒绝同步模型目录",
@@ -761,8 +864,8 @@ async function syncHarnessModels(environment: NodeJS.ProcessEnv): Promise<void> 
   let raw: unknown;
   try {
     raw = JSON.parse(await runHarnessModelExport(
-      executable,
-      manifest.harness.executable.runtimeRoot,
+      manifest.harness.adapter.path,
+      runtimeRoot,
       manifest.harness.executable.payloadSha256,
       environment,
       join(paths.dataRoot, "harness"),
@@ -771,22 +874,34 @@ async function syncHarnessModels(environment: NodeJS.ProcessEnv): Promise<void> 
     if (error instanceof CliError) throw error;
     throw new CliError("Harness 模型导出不是有效 JSON");
   }
-  const catalog = parseHarnessModelCatalog(raw, manifest.harness.executable.version);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new CliError("Harness 模型导出缺少运行声明");
+  const { runtimeProviders: _runtimeProviders, ...publicCatalog } = raw as Record<string, unknown>;
+  const catalog = parseHarnessModelCatalog(publicCatalog, manifest.harness.executable.version);
+  credentialNamesFromReferences(catalog.credentialRefs);
   const serialized = `${JSON.stringify(catalog, null, 2)}\n`;
-  const releaseId = createHash("sha256").update(serialized).digest("hex");
+  const runtimeSerialized = `${JSON.stringify(raw, null, 2)}\n`;
+  const settingsSerialized = readFileSync(join(paths.dataRoot, "harness/settings.yaml"), "utf8");
+  const releaseId = createHash("sha256").update(serialized).update("\0").update(runtimeSerialized)
+    .update("\0").update(settingsSerialized).digest("hex");
   const modelsRoot = join(paths.dataRoot, "models");
   const releasesRoot = join(modelsRoot, "releases");
   const release = join(releasesRoot, releaseId);
   mkdirSync(releasesRoot, { recursive: true, mode: 0o700 });
   chmodSync(releasesRoot, 0o700);
   if (lstatSync(release, { throwIfNoEntry: false })) {
-    validateExistingModelRelease(release, serialized);
+    validateExistingModelRelease(release, serialized, runtimeSerialized, settingsSerialized);
   } else {
     const staging = mkdtempSync(join(modelsRoot, ".sync-"));
     try {
       const catalogPath = join(staging, "catalog.json");
       writeFileSync(catalogPath, serialized, { mode: 0o400, flag: "wx" });
       chmodSync(catalogPath, 0o400);
+      const runtimePath = join(staging, "model-export.json");
+      writeFileSync(runtimePath, runtimeSerialized, { mode: 0o400, flag: "wx" });
+      chmodSync(runtimePath, 0o400);
+      const settingsPath = join(staging, "settings.yaml");
+      cpSync(join(paths.dataRoot, "harness/settings.yaml"), settingsPath);
+      chmodSync(settingsPath, 0o400);
       renameSync(staging, release);
       chmodSync(release, 0o500);
     } finally {
@@ -808,7 +923,7 @@ async function syncHarnessModels(environment: NodeJS.ProcessEnv): Promise<void> 
 }
 
 function parseInstallOptions(args: string[]): Record<string, string> {
-  const allowed = new Set(["--harness-source", "--harness-commit", "--dsh-executable", "--dsh-version"]);
+  const allowed = new Set(["--dsh-version"]);
   const options: Record<string, string> = {};
   for (let index = 0; index < args.length; index += 2) {
     const key = args[index];
@@ -820,63 +935,88 @@ function parseInstallOptions(args: string[]): Record<string, string> {
   return options;
 }
 
+function validateExactNpmVersion(version: string): void {
+  const exact = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+  if (!exact.test(version)) {
+    throw new CliError("DSH npm 版本必须是精确 SemVer，禁止 latest、dist-tag、版本范围、file、git 或 URL 来源");
+  }
+}
+
 async function install(args: string[], environment: NodeJS.ProcessEnv): Promise<void> {
   const options = parseInstallOptions(args);
   const { diagnostics, bubblewrapVersion } = validateTools();
-  const sourceDirectory = resolveDirectory(options["--harness-source"]!, "Harness 源码目录");
-  const commit = options["--harness-commit"]!;
-  validateCommit(commit);
-  const actualCommit = currentHarnessCommit(sourceDirectory);
-  if (actualCommit !== commit) throw new CliError(`Harness 源码提交不匹配：期望 ${commit}，实际 ${actualCommit}`);
-  validateCleanHarnessWorktree(sourceDirectory);
-  const executablePath = resolveFile(options["--dsh-executable"]!, "dsh 可执行文件");
-  const sourceRuntimeRoot = resolveHarnessRuntimeRoot(executablePath);
   const expectedVersion = options["--dsh-version"]!;
-  await validateSandboxedHarnessVersion(
-    executablePath,
-    sourceRuntimeRoot,
-    expectedVersion,
-    environment,
-    "dsh 版本不匹配",
-  );
+  validateExactNpmVersion(expectedVersion);
 
   const paths = runtimePaths(environment);
   ensureDirectories(paths);
-  const executableSha256 = sha256(executablePath);
-  const payloadSha256 = hashHarnessRuntimePayload(sourceRuntimeRoot);
-  const snapshot = materializeHarnessRuntimeSnapshot(
-    paths, sourceRuntimeRoot, executablePath, payloadSha256, executableSha256,
-  );
-  await validateSandboxedHarnessVersion(
-    snapshot.executablePath,
-    snapshot.runtimeRoot,
-    expectedVersion,
-    environment,
-    "隔离运行中的 dsh 版本漂移",
-    payloadSha256,
-  );
-  atomicWriteManifest(paths.manifest, {
-    schemaVersion: 1,
-    requirements,
-    directories: { config: paths.configRoot, data: paths.dataRoot, state: paths.stateRoot },
-    harness: {
-      sourceDirectory,
-      commit,
-      executable: {
-        sourcePath: executablePath,
-        sourceRuntimeRoot,
-        path: snapshot.executablePath,
-        runtimeRoot: snapshot.runtimeRoot,
-        payloadSha256,
-        sha256: executableSha256,
-        version: expectedVersion,
+  ensureEnvironmentFile(paths);
+  const installRoot = mkdtempSync(join(paths.stateRoot, ".harness-npm-install-"));
+  try {
+    writeFileSync(join(installRoot, "package.json"), `${JSON.stringify({
+      name: "maze-arena-harness-install", private: true,
+    }, null, 2)}\n`, { mode: 0o600 });
+    run("npm", [
+      "install", "--prefix", installRoot, "--no-audit", "--no-fund", "--package-lock=false", "--include=optional",
+      "--save-exact", `@deepseek-ai/dsh@${expectedVersion}`, `pnpm@${requirements.pnpm.exact}`,
+    ], 300_000);
+    const runtimePackage = findHarnessRuntimePackage(installRoot);
+    if (runtimePackage.name !== "@deepseek-ai/dsh") throw new CliError("npm 安装结果缺少 @deepseek-ai/dsh 运行包");
+    const installedManifest = JSON.parse(readFileSync(join(runtimePackage.root, "package.json"), "utf8")) as { version?: unknown };
+    if (installedManifest.version !== expectedVersion) throw new CliError(`npm 安装的 DSH 包版本漂移：期望 ${expectedVersion}`);
+    validateFrozenPnpm(installRoot);
+    const executablePath = resolveFile(join(runtimePackage.root, runtimePackage.executable), "npm DSH 可执行文件");
+    await validateSandboxedHarnessVersion(executablePath, installRoot, expectedVersion, environment, "dsh --version 与 npm 包版本不一致");
+    const adapterSource = resolveFile(join(repositoryRoot, "packages/dsh-integration/dist/dsh-sdk-adapter.js"), "Arena DSH SDK adapter 构建产物");
+    const credentialPolicySource = resolveFile(
+      join(repositoryRoot, "packages/dsh-integration/dist/credential-environment-policy.js"),
+      "Arena 凭据环境策略构建产物",
+    );
+    const adapterDirectory = join(installRoot, "maze-arena");
+    const adapterPath = join(adapterDirectory, "dsh-sdk-adapter.js");
+    const credentialPolicyPath = join(adapterDirectory, "credential-environment-policy.js");
+    mkdirSync(adapterDirectory, { recursive: true, mode: 0o700 });
+    cpSync(adapterSource, adapterPath);
+    cpSync(credentialPolicySource, credentialPolicyPath);
+    const adapterContents = readFileSync(adapterPath, "utf8");
+    writeFileSync(adapterPath, adapterContents.replace(/^#![^\n]*/, `#!${process.execPath}`), { mode: 0o500 });
+    chmodSync(adapterPath, 0o500);
+    chmodSync(credentialPolicyPath, 0o400);
+    const adapterSha256 = sha256(adapterPath);
+    const executableSha256 = sha256(executablePath);
+    const payloadSha256 = hashHarnessRuntimePayload(installRoot);
+    const snapshot = materializeHarnessRuntimeSnapshot(paths, installRoot, executablePath, payloadSha256, executableSha256);
+    await validateSandboxedHarnessVersion(snapshot.executablePath, snapshot.runtimeRoot, expectedVersion, environment,
+      "隔离运行中的 dsh 版本漂移", payloadSha256);
+    atomicWriteManifest(paths.manifest, {
+      schemaVersion: 1,
+      requirements,
+      directories: { config: paths.configRoot, data: paths.dataRoot, state: paths.stateRoot },
+      harness: {
+        packageName: "@deepseek-ai/dsh",
+        packageVersion: expectedVersion,
+        executable: {
+          path: snapshot.executablePath,
+          runtimeRoot: snapshot.runtimeRoot,
+          payloadSha256,
+          sha256: executableSha256,
+          version: expectedVersion,
+        },
+        adapter: {
+          path: join(snapshot.runtimeRoot, "maze-arena/dsh-sdk-adapter.js"),
+          sha256: adapterSha256,
+          protocolVersion: 1,
+        },
       },
-    },
-    isolation: { bubblewrap: { path: bubblewrapExecutable, version: bubblewrapVersion } },
-  });
+      isolation: { bubblewrap: { path: bubblewrapExecutable, version: bubblewrapVersion } },
+    });
+  } finally {
+    rmSync(installRoot, { recursive: true, force: true });
+  }
   for (const diagnostic of diagnostics) process.stdout.write(`${diagnostic}\n`);
   process.stdout.write(`正式运行目录已初始化：${paths.dataRoot}\n`);
   process.stdout.write(`安装清单已写入：${paths.manifest}\n`);
+  process.stdout.write(`用户凭据环境文件：${paths.environmentFile}\n`);
 }
 
 function readManifest(paths: RuntimePaths): InstallManifest {
@@ -888,14 +1028,64 @@ function readManifest(paths: RuntimePaths): InstallManifest {
     throw new CliError(`安装清单不是有效 JSON：${(error as Error).message}`);
   }
   const manifest = value as Partial<InstallManifest>;
-  if (manifest.schemaVersion !== 1 || !manifest.harness?.sourceDirectory || !manifest.harness.commit
-    || !manifest.harness.executable?.sourcePath || !manifest.harness.executable.sourceRuntimeRoot
-    || !manifest.harness.executable.path || !manifest.harness.executable.runtimeRoot
+  if (manifest.schemaVersion !== 1 || manifest.harness?.packageName !== "@deepseek-ai/dsh"
+    || !manifest.harness.packageVersion || !manifest.harness.executable?.path || !manifest.harness.executable.runtimeRoot
     || !manifest.harness.executable.payloadSha256 || !manifest.harness.executable.sha256 || !manifest.harness.executable.version
+    || !manifest.harness.adapter?.path || !manifest.harness.adapter.sha256 || manifest.harness.adapter.protocolVersion !== 1
     || manifest.isolation?.bubblewrap.path !== bubblewrapExecutable || !manifest.isolation.bubblewrap.version) {
     throw new CliError("安装清单结构无效");
   }
+  validateExactNpmVersion(manifest.harness.packageVersion);
+  if (manifest.harness.executable.version !== manifest.harness.packageVersion) throw new CliError("安装清单 DSH 包版本与入口版本不一致");
   return manifest as InstallManifest;
+}
+
+function validateFrozenHarnessRuntime(manifest: InstallManifest): { runtimeRoot: string; executablePath: string } {
+  const runtimeRoot = resolveDirectory(manifest.harness.executable.runtimeRoot, "Harness 私有 runtime");
+  const packageRoot = join(runtimeRoot, "node_modules", "@deepseek-ai", "dsh");
+  const packageManifest = JSON.parse(readFileSync(resolveFile(join(packageRoot, "package.json"), "DSH npm package.json"), "utf8")) as {
+    name?: unknown; version?: unknown; bin?: unknown;
+  };
+  const bin = typeof packageManifest.bin === "string" ? packageManifest.bin
+    : packageManifest.bin && typeof packageManifest.bin === "object"
+      ? (packageManifest.bin as Record<string, unknown>).dsh : undefined;
+  if (packageManifest.name !== manifest.harness.packageName || packageManifest.version !== manifest.harness.packageVersion
+    || typeof bin !== "string") throw new CliError("DSH npm 包身份与安装清单不一致");
+  const executablePath = resolveFile(join(packageRoot, bin), "DSH npm 入口");
+  if (executablePath !== resolveFile(manifest.harness.executable.path, "dsh 私有快照可执行文件")) {
+    throw new CliError("DSH npm 包入口与安装清单路径不一致");
+  }
+  if (sha256(executablePath) !== manifest.harness.executable.sha256) throw new CliError("dsh 可执行文件内容已漂移");
+  validateFrozenPnpm(runtimeRoot);
+  const expectedAdapter = resolveFile(join(runtimeRoot, "maze-arena/dsh-sdk-adapter.js"), "Arena DSH SDK adapter");
+  if (expectedAdapter !== resolveFile(manifest.harness.adapter.path, "安装清单 Arena DSH SDK adapter")
+    || sha256(expectedAdapter) !== manifest.harness.adapter.sha256) {
+    throw new CliError("Arena DSH SDK adapter 身份已漂移");
+  }
+  if (hashHarnessRuntimePayload(runtimeRoot) !== manifest.harness.executable.payloadSha256) throw new CliError("Harness 私有 runtime 载荷已漂移");
+  return { runtimeRoot, executablePath };
+}
+
+function validateFrozenPnpm(runtimeRoot: string): string {
+  const packageRoot = join(runtimeRoot, "node_modules/pnpm");
+  const packageManifest = JSON.parse(readFileSync(resolveFile(join(packageRoot, "package.json"), "pnpm package.json"), "utf8")) as {
+    name?: unknown; version?: unknown; bin?: unknown;
+  };
+  const bin = typeof packageManifest.bin === "string" ? packageManifest.bin
+    : packageManifest.bin && typeof packageManifest.bin === "object"
+      ? (packageManifest.bin as Record<string, unknown>).pnpm : undefined;
+  if (packageManifest.name !== "pnpm" || packageManifest.version !== requirements.pnpm.exact || typeof bin !== "string") {
+    throw new CliError(`冻结 pnpm 包身份不一致，要求 pnpm@${requirements.pnpm.exact}`);
+  }
+  const executablePath = resolveFile(join(packageRoot, bin), "冻结 pnpm 入口");
+  const relation = relative(packageRoot, executablePath);
+  if (!relation || relation === ".." || relation.startsWith(`..${sep}`) || isAbsolute(relation)) {
+    throw new CliError("冻结 pnpm 入口必须位于 pnpm 包内");
+  }
+  const commandDirectory = join(runtimeRoot, "node_modules/.bin");
+  const commandPath = resolveFile(join(commandDirectory, "pnpm"), "冻结 pnpm 命令");
+  if (commandPath !== executablePath) throw new CliError("冻结 pnpm 命令与包入口不一致");
+  return commandDirectory;
 }
 
 function parseImageBuildOptions(args: string[]): { baseImage: string; imageName: string } {
@@ -960,21 +1150,250 @@ function createSmokeProfile(target: string, role: "generator" | "solver"): void 
       "@maze-arena/match-profile": "0.1.0",
       [`@maze-arena/${rolePackage}`]: "0.1.0",
     },
-    dsh: { profile: { bundles: ["@maze-arena/match-profile", `@maze-arena/${rolePackage}`] } },
+    dsh: {
+      profile: createMatchProfileConfiguration(["@maze-arena/match-profile", `@maze-arena/${rolePackage}`]),
+    },
   }, null, 2)}\n`);
+  writeFileSync(join(profile, "cordis.yml"), "[]\n");
   writeFileSync(join(profile, "cordis.patch.yml"), "[]\n");
+  writeFileSync(join(profile, "pnpm-workspace.yaml"), [
+    "packages:",
+    "  - .",
+    "",
+    "nodeLinker: hoisted",
+    "autoInstallPeers: false",
+    "",
+  ].join("\n"));
 }
 
-function buildMatchProfileImage(args: string[], environment: NodeJS.ProcessEnv): void {
+function imageSmokeRequest(role: MatchPluginRole): MatchProtocolRequest {
+  return {
+    protocolVersion: 1,
+    requestId: `image-smoke-${role}`,
+    sequence: 1,
+    role,
+    payload: role === "generator"
+      ? { type: "generator.start", seed: "image-smoke", rules: { size: 31, start: { x: 0, y: 0 }, goal: { x: 30, y: 30 } } }
+      : { type: "solver.start", start: { x: 0, y: 0 }, goal: { x: 30, y: 30 } },
+  };
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const sorted = [...expected].sort();
+  return actual.length === sorted.length && actual.every((key, index) => key === sorted[index]);
+}
+
+function validateImageSmokeResponse(value: unknown, requestValue: MatchProtocolRequest): void {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new CliError("Match Profile smoke 响应不是 JSON 对象");
+  const response = value as Record<string, unknown>;
+  if (!hasOnlyKeys(response, ["protocolVersion", "requestId", "sequence", "role", "payload"])
+    || response.protocolVersion !== 1 || response.requestId !== requestValue.requestId
+    || response.sequence !== requestValue.sequence || response.role !== requestValue.role
+    || !response.payload || typeof response.payload !== "object" || Array.isArray(response.payload)) {
+    throw new CliError(`${requestValue.role} Match Profile smoke 响应信封无效`);
+  }
+  const payload = response.payload as Record<string, unknown>;
+  if (requestValue.role === "solver") {
+    if (!hasOnlyKeys(payload, ["type"]) || payload.type !== "solver.ready") {
+      throw new CliError("solver Match Profile smoke 未返回 solver.ready");
+    }
+    return;
+  }
+  const coordinate = (candidate: unknown): candidate is { x: number; y: number } => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    const value = candidate as Record<string, unknown>;
+    return hasOnlyKeys(value, ["x", "y"])
+      && Number.isInteger(value.x) && Number.isInteger(value.y)
+      && Number(value.x) >= 0 && Number(value.x) < 31 && Number(value.y) >= 0 && Number(value.y) < 31;
+  };
+  if (!hasOnlyKeys(payload, ["type", "from", "to"]) || payload.type !== "generator.carve"
+    || !coordinate(payload.from) || !coordinate(payload.to)
+    || Math.abs(payload.from.x - payload.to.x) + Math.abs(payload.from.y - payload.to.y) !== 1) {
+    throw new CliError("generator Match Profile smoke 未返回合法相邻通道");
+  }
+}
+
+interface BoundedDockerResult {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+}
+
+function runBoundedDockerCommand(args: string[], timeoutMs = 2_000): Promise<BoundedDockerResult> {
+  return new Promise((resolveCommand, reject) => {
+    const child = spawn("docker", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let terminalError: Error | undefined;
+    const consume = (current: string, chunk: Buffer): string => {
+      const next = current + chunk.toString("utf8");
+      if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) + chunk.length > MATCH_OUTPUT_LIMIT_BYTES) {
+        terminalError ??= new CliError(`docker ${args[0] ?? "命令"} 输出超限`);
+        child.kill("SIGKILL");
+      }
+      return next;
+    };
+    child.stdout.on("data", (chunk: Buffer) => { stdout = consume(stdout, chunk); });
+    child.stderr.on("data", (chunk: Buffer) => { stderr = consume(stderr, chunk); });
+    const timer = setTimeout(() => {
+      terminalError ??= new CliError(`docker ${args[0] ?? "命令"} 超时`);
+      child.kill("SIGKILL");
+    }, timeoutMs);
+    child.once("error", (error: NodeJS.ErrnoException) => {
+      clearTimeout(timer);
+      reject(new CliError(error.code === "ENOENT" ? "缺少必需工具 docker" : `无法执行 docker：${error.message}`));
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (terminalError) reject(terminalError);
+      else resolveCommand({ code, signal, stdout, stderr });
+    });
+  });
+}
+
+function dockerReportsAbsent(result: BoundedDockerResult): boolean {
+  return result.code !== null && result.code !== 0 && result.signal === null
+    && /no such (?:container|object)/i.test(`${result.stdout}\n${result.stderr}`);
+}
+
+function dockerKillReportsContainerAlreadyStopped(result: BoundedDockerResult): boolean {
+  return result.code !== null && result.code !== 0 && result.signal === null
+    && /no such container|is not running/i.test(`${result.stdout}\n${result.stderr}`);
+}
+
+async function cleanupImageSmokeContainer(role: MatchPluginRole, containerName: string): Promise<void> {
+  const remove = async (): Promise<void> => {
+    const result = await runBoundedDockerCommand(["rm", "-f", containerName]);
+    if (result.code !== 0 && !dockerReportsAbsent(result)) {
+      throw new CliError(`${role} Match Profile smoke 容器强制清理失败`);
+    }
+  };
+  await remove();
+  const deadline = Date.now() + 2_000;
+  let stableAbsent = 0;
+  while (Date.now() < deadline) {
+    const result = await runBoundedDockerCommand(["inspect", containerName]);
+    if (result.code === 0) {
+      stableAbsent = 0;
+      await remove();
+    } else if (dockerReportsAbsent(result)) {
+      stableAbsent += 1;
+    } else {
+      throw new CliError(`${role} Match Profile smoke 容器清理未确认`);
+    }
+    if (stableAbsent >= 2) return;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+  }
+  throw new CliError(`${role} Match Profile smoke 容器未在时限内稳定消失`);
+}
+
+async function runImageSmoke(args: string[], role: MatchPluginRole, containerName: string): Promise<void> {
+  const requestValue = imageSmokeRequest(role);
+  let terminalError: Error | undefined;
+  let inputError: Error | undefined;
+  let controlledShutdown = false;
+  let terminationSucceeded = false;
+  let terminationReportedAbsent = false;
+  let terminationPromise: Promise<void> | undefined;
+  let shutdownTimer: NodeJS.Timeout | undefined;
+  let stdout = "";
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  const frames: unknown[] = [];
+  const child = spawn("docker", args, { stdio: ["pipe", "pipe", "pipe"] });
+  const fail = (error: Error): void => {
+    terminalError ??= error;
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  };
+  child.once("error", (error: NodeJS.ErrnoException) => fail(new CliError(error.code === "ENOENT" ? "缺少必需工具 docker" : `无法执行 docker：${error.message}`)));
+  child.stdin.once("error", (error: NodeJS.ErrnoException) => {
+    if (controlledShutdown && error.code === "EPIPE") return;
+    inputError = new CliError(`Match Profile smoke 输入失败：${error.message}`);
+    if (error.code !== "EPIPE") fail(inputError);
+  });
+  child.stderr.on("data", (chunk: Buffer) => {
+    stderrBytes += chunk.length;
+    if (stdoutBytes + stderrBytes > MATCH_OUTPUT_LIMIT_BYTES) fail(new CliError(`${role} Match Profile smoke 输出超限`));
+  });
+  child.stdout.on("data", (chunk: Buffer) => {
+    stdoutBytes += chunk.length;
+    if (stdoutBytes + stderrBytes > MATCH_OUTPUT_LIMIT_BYTES) return fail(new CliError(`${role} Match Profile smoke 输出超限`));
+    stdout += chunk.toString("utf8");
+    while (stdout.includes("\n")) {
+      const boundary = stdout.indexOf("\n");
+      const line = stdout.slice(0, boundary);
+      stdout = stdout.slice(boundary + 1);
+      try {
+        const frame = JSON.parse(line) as unknown;
+        frames.push(frame);
+        if (frames.length === 1) {
+          if (!frame || typeof frame !== "object" || Array.isArray(frame)
+            || !hasOnlyKeys(frame as Record<string, unknown>, ["type", "protocolVersion", "role"])
+            || (frame as Record<string, unknown>).type !== "match-profile.ready"
+            || (frame as Record<string, unknown>).protocolVersion !== 1
+            || (frame as Record<string, unknown>).role !== role) throw new CliError(`${role} Match Profile ready 握手字段无效`);
+          child.stdin.write(`${JSON.stringify(requestValue)}\n`);
+        } else if (frames.length === 2) {
+          validateImageSmokeResponse(frame, requestValue);
+          controlledShutdown = true;
+          child.stdin.end();
+          terminationPromise = runBoundedDockerCommand(["kill", "--signal=TERM", containerName])
+            .then((termination) => {
+              // DSH 在 EOF 后可能先自然退出并因 --rm 被删除，此时 kill 的
+              // "No such container" 只说明受控关闭已完成，不能误判为失败。
+              if (termination.signal || termination.code !== 0 && !dockerKillReportsContainerAlreadyStopped(termination)) {
+                throw new CliError(`${role} Match Profile smoke 无法向容器发送 SIGTERM`);
+              }
+              if (termination.code === 0) terminationSucceeded = true;
+              else terminationReportedAbsent = true;
+              shutdownTimer = setTimeout(
+                () => fail(new CliError(`${role} Match Profile smoke 受控关闭超时`)),
+                2_000,
+              );
+            })
+            .catch((error) => fail(error instanceof Error ? error : new CliError(`${role} Match Profile smoke SIGTERM 失败`)));
+        } else throw new CliError(`${role} Match Profile smoke 产生额外输出帧`);
+      } catch (error) { fail(error instanceof Error ? error : new CliError(`${role} Match Profile smoke 输出无效`)); }
+    }
+  });
+  const timer = setTimeout(() => fail(new CliError(`${role} Match Profile smoke 超时`)), 60_000);
+  try {
+    await new Promise<void>((resolvePromise) => child.once("close", (code, signal) => { void (async () => {
+      if (terminationPromise) await terminationPromise;
+      const expectedControlledExit = controlledShutdown && (terminationSucceeded || terminationReportedAbsent)
+        && (code === 0 || code === 143) && signal === null;
+      if (!terminalError && !expectedControlledExit) {
+        terminalError = new CliError(`${role} Match Profile smoke 异常退出（code=${code ?? "null"}，signal=${signal ?? "null"}）`);
+      }
+      if (!terminalError && inputError) terminalError = inputError;
+      if (!terminalError && (stdout.length !== 0 || frames.length !== 2)) terminalError = new CliError(`${role} Match Profile smoke 未完成请求响应与 EOF 退出`);
+      resolvePromise();
+    })(); }));
+  } finally {
+    clearTimeout(timer);
+    if (shutdownTimer) clearTimeout(shutdownTimer);
+    try { await cleanupImageSmokeContainer(role, containerName); }
+    catch (error) {
+      const cleanupError = error instanceof Error ? error : new CliError(`${role} Match Profile smoke 容器清理失败`);
+      terminalError = terminalError ? new CliError(`${terminalError.message}；${cleanupError.message}`) : cleanupError;
+    }
+  }
+  if (terminalError) throw terminalError;
+}
+
+async function buildMatchProfileImage(args: string[], environment: NodeJS.ProcessEnv): Promise<void> {
   const options = parseImageBuildOptions(args);
   const paths = runtimePaths(environment);
   const manifest = readManifest(paths);
   validateDirectoryPermissions(paths);
-  const sourceDirectory = resolveDirectory(manifest.harness.sourceDirectory, "Harness 源码目录");
-  if (currentHarnessCommit(sourceDirectory) !== manifest.harness.commit) throw new CliError("Harness 源码提交已漂移，拒绝构建镜像");
-  validateCleanHarnessWorktree(sourceDirectory);
   const executablePath = resolveFile(manifest.harness.executable.path, "dsh 可执行文件");
   if (sha256(executablePath) !== manifest.harness.executable.sha256) throw new CliError("dsh 可执行文件内容已漂移，拒绝构建镜像");
+  const frozenRuntimeRoot = resolveDirectory(manifest.harness.executable.runtimeRoot, "Harness 私有 runtime");
+  if (hashHarnessRuntimePayload(frozenRuntimeRoot) !== manifest.harness.executable.payloadSha256) {
+    throw new CliError("Harness 私有 runtime 载荷已漂移，拒绝构建镜像");
+  }
 
   for (const { directory } of imageProjectPackages) {
     rmSync(join(repositoryRoot, "packages", directory, "dist"), { recursive: true, force: true });
@@ -985,22 +1404,14 @@ function buildMatchProfileImage(args: string[], environment: NodeJS.ProcessEnv):
   ], 120_000);
   const projectArtifactSha256 = hashPaths(projectArtifactPaths);
   const staging = mkdtempSync(join(paths.stateRoot, ".match-image-build-"));
-  const worktree = join(staging, "harness-worktree");
   try {
-    run("git", ["-C", sourceDirectory, "worktree", "add", "--detach", worktree, manifest.harness.commit], 120_000);
-    run("pnpm", ["--dir", worktree, "install", "--offline", "--frozen-lockfile"], 300_000);
-    const runtimePackage = findHarnessRuntimePackage(worktree);
-    run("pnpm", ["--dir", runtimePackage.root, "build"], 300_000);
-    const builtRuntimeExecutable = resolveFile(
-      join(runtimePackage.root, runtimePackage.executable),
-      "Harness 源码 dsh 构建产物",
-    );
-    if (sha256(builtRuntimeExecutable) !== manifest.harness.executable.sha256) {
-      throw new CliError("Harness 固定源码构建出的 dsh 与安装清单可执行文件身份不一致");
-    }
     const runtimeRoot = join(staging, "harness-runtime");
-    run("pnpm", ["--dir", worktree, "--filter", runtimePackage.name, "deploy", "--prod", runtimeRoot], 300_000);
-    const runtimeExecutable = validateDeployedHarnessRuntime(runtimeRoot, runtimePackage, manifest.harness.executable.sha256);
+    cpSync(frozenRuntimeRoot, runtimeRoot, { recursive: true, verbatimSymlinks: true });
+    restoreCopiedModes(frozenRuntimeRoot, runtimeRoot);
+    if (hashHarnessRuntimePayload(runtimeRoot) !== manifest.harness.executable.payloadSha256) {
+      throw new CliError("复制到镜像上下文的 Harness runtime 身份不一致");
+    }
+    const runtimeExecutable = relative(frozenRuntimeRoot, executablePath).split(sep).join("/");
     copyProjectArtifacts(staging);
     const smokeHomes = {
       generator: join(staging, "smoke-home-generator"),
@@ -1021,7 +1432,9 @@ function buildMatchProfileImage(args: string[], environment: NodeJS.ProcessEnv):
     const iidFile = join(staging, "image-id");
     run("docker", [
       "build", "--pull=false", "--network=none", "--iidfile", iidFile, "--tag", options.imageName,
-      "--label", `org.maze-arena.harness-commit=${manifest.harness.commit}`,
+      "--label", `org.maze-arena.harness-package=${manifest.harness.packageName}`,
+      "--label", `org.maze-arena.harness-version=${manifest.harness.packageVersion}`,
+      "--label", `org.maze-arena.harness-runtime-sha256=${manifest.harness.executable.payloadSha256}`,
       "--label", `org.maze-arena.dsh-sha256=${manifest.harness.executable.sha256}`,
       "--label", `org.maze-arena.project-artifact-sha256=${projectArtifactSha256}`,
       staging,
@@ -1030,35 +1443,28 @@ function buildMatchProfileImage(args: string[], environment: NodeJS.ProcessEnv):
     const inspectedId = parseDigest(run("docker", ["image", "inspect", options.imageName, "--format", "{{.Id}}"]), "Docker inspect 镜像 ID");
     if (imageId !== inspectedId) throw new CliError(`Docker 构建摘要不一致：iidfile ${imageId}，inspect ${inspectedId}`);
     for (const role of ["generator", "solver"] as const) {
-      const handshake = runWithInput("docker", [
-        "run", "--rm", "--network=none", "--read-only", `--user=${matchProfilePolicy.user}`,
+      const containerName = `maze-image-smoke-${role}-${randomUUID()}`;
+      await runImageSmoke([
+        "run", "--interactive", "--rm", "--name", containerName, "--network=none", "--read-only", `--user=${matchProfilePolicy.user}`,
         `--memory=${matchProfilePolicy.memory}`, `--memory-swap=${matchProfilePolicy.memorySwap}`,
         `--cpus=${matchProfilePolicy.cpus}`, `--ulimit=cpu=${matchProfilePolicy.cpuUlimit}`,
         `--pids-limit=${matchProfilePolicy.pidsLimit}`, "--security-opt=no-new-privileges", "--cap-drop=ALL",
         "--tmpfs=/tmp:rw,noexec,nosuid,size=16m",
-        `--mount=type=bind,src=${smokeHomes[role]},dst=/arena,readonly`,
-        "--env=DSH_HOME=/arena", `--env=MAZE_MATCH_ROLE=${role}`,
-        imageId, "dsh", "--profile", `maze-match-${role}`,
-      ], "", 60_000);
-      const firstFrame = handshake.split("\n")[0];
-      let ready: unknown;
-      try {
-        ready = JSON.parse(firstFrame ?? "");
-      } catch {
-        throw new CliError(`${role} Match Profile ready 握手不是有效 JSON，预期单行 match-profile.ready`);
-      }
-      if (!ready || typeof ready !== "object"
-        || (ready as Record<string, unknown>).type !== "match-profile.ready"
-        || (ready as Record<string, unknown>).protocolVersion !== 1
-        || (ready as Record<string, unknown>).role !== role) {
-        throw new CliError(`${role} Match Profile ready 握手字段无效，预期 protocolVersion=1 且角色匹配`);
-      }
+        "--tmpfs=/arena:rw,noexec,nosuid,size=32m,mode=0700,uid=65532,gid=65532",
+        `--mount=type=bind,src=${smokeHomes[role]},dst=/arena-source,readonly`,
+        "--env=DSH_HOME=/arena", "--env=MAZE_MATCH_PROFILE_SOURCE=/arena-source",
+        `--env=MAZE_MATCH_ROLE=${role}`,
+        imageId, "node", "/opt/maze-arena/packages/match-profile/dist/container-launcher.js",
+        "dsh", "--profile", `maze-match-${role}`,
+      ], role, containerName);
     }
     manifest.matchProfile = {
       imageId,
       imageReference: validateImmutableImageReference(imageId),
       projectArtifactSha256,
-      harnessCommit: manifest.harness.commit,
+      harnessPackage: manifest.harness.packageName,
+      harnessPackageVersion: manifest.harness.packageVersion,
+      harnessRuntimePayloadSha256: manifest.harness.executable.payloadSha256,
       dshExecutableSha256: manifest.harness.executable.sha256,
       resourcePolicy: matchProfilePolicy,
     };
@@ -1066,9 +1472,6 @@ function buildMatchProfileImage(args: string[], environment: NodeJS.ProcessEnv):
     process.stdout.write(`Match Profile 镜像已构建：${imageId}\n`);
     process.stdout.write(`正式不可变镜像引用：${manifest.matchProfile.imageReference}\n`);
   } finally {
-    if (existsSync(worktree)) {
-      try { run("git", ["-C", sourceDirectory, "worktree", "remove", "--force", worktree], 120_000); } catch {}
-    }
     rmSync(staging, { recursive: true, force: true });
   }
 }
@@ -1078,6 +1481,12 @@ function validateDirectoryPermissions(paths: RuntimePaths): void {
     if (!existsSync(path) || !statSync(path).isDirectory()) throw new CliError(`正式运行目录缺失：${path}`);
     const mode = statSync(path).mode & 0o777;
     if (mode !== 0o700) throw new CliError(`目录权限必须为 0700：${path} 当前为 ${mode.toString(8).padStart(4, "0")}`);
+  }
+  if (existsSync(paths.canaryReports)) {
+    const reportDirectory = statSync(paths.canaryReports);
+    if (!reportDirectory.isDirectory() || (reportDirectory.mode & 0o777) !== 0o700) {
+      throw new CliError(`金丝雀报告目录权限必须为 0700：${paths.canaryReports}`);
+    }
   }
   const manifestMode = statSync(paths.manifest).mode & 0o777;
   if (manifestMode !== 0o600) throw new CliError(`安装清单权限必须为 0600：当前为 ${manifestMode.toString(8).padStart(4, "0")}`);
@@ -1117,7 +1526,9 @@ function validateMatchProfileImage(manifest: InstallManifest): void {
   if (actualImageId !== expectedImageId) {
     throw new CliError(`Match Profile 镜像摘要漂移：期望 ${expectedImageId}`);
   }
-  if (matchProfile.harnessCommit !== manifest.harness.commit
+  if (matchProfile.harnessPackage !== manifest.harness.packageName
+    || matchProfile.harnessPackageVersion !== manifest.harness.packageVersion
+    || matchProfile.harnessRuntimePayloadSha256 !== manifest.harness.executable.payloadSha256
     || matchProfile.dshExecutableSha256 !== manifest.harness.executable.sha256) {
     throw new CliError("Match Profile 镜像构建身份与当前安装清单不一致");
   }
@@ -1133,7 +1544,9 @@ function validateMatchProfileImage(manifest: InstallManifest): void {
     throw new CliError("无法解析 Match Profile 镜像标签，预期为 JSON 对象");
   }
   const expectedLabels = {
-    "org.maze-arena.harness-commit": manifest.harness.commit,
+    "org.maze-arena.harness-package": manifest.harness.packageName,
+    "org.maze-arena.harness-version": manifest.harness.packageVersion,
+    "org.maze-arena.harness-runtime-sha256": manifest.harness.executable.payloadSha256,
     "org.maze-arena.dsh-sha256": manifest.harness.executable.sha256,
     "org.maze-arena.project-artifact-sha256": matchProfile.projectArtifactSha256,
   };
@@ -1146,7 +1559,9 @@ function validateMatchProfileImage(manifest: InstallManifest): void {
   }
 }
 
-function validateModelCatalog(paths: RuntimePaths, manifest: InstallManifest): { path: string; release: string } {
+function validateModelCatalog(paths: RuntimePaths, manifest: InstallManifest): {
+  path: string; exportPath: string; settingsPath: string; release: string; sha256: string; credentialNames: string[];
+} {
   const modelsRoot = join(paths.dataRoot, "models");
   const current = join(modelsRoot, "current");
   if (!existsSync(current) || !lstatSync(current).isSymbolicLink()) {
@@ -1158,18 +1573,92 @@ function validateModelCatalog(paths: RuntimePaths, manifest: InstallManifest): {
     throw new CliError("Harness 模型目录 current 未指向受控只读发布");
   }
   const catalogPath = join(release, "catalog.json");
+  const runtimePath = join(release, "model-export.json");
+  const settingsPath = join(release, "settings.yaml");
+  let credentialNames: string[] = [];
   try {
     const releaseStat = lstatSync(release);
     const catalogStat = lstatSync(catalogPath);
+    const runtimeStat = lstatSync(runtimePath);
+    const settingsStat = lstatSync(settingsPath);
     if (!releaseStat.isDirectory() || releaseStat.isSymbolicLink() || (releaseStat.mode & 0o777) !== 0o500
-      || !catalogStat.isFile() || catalogStat.isSymbolicLink() || (catalogStat.mode & 0o777) !== 0o400) {
+      || !catalogStat.isFile() || catalogStat.isSymbolicLink() || (catalogStat.mode & 0o777) !== 0o400
+      || !runtimeStat.isFile() || runtimeStat.isSymbolicLink() || (runtimeStat.mode & 0o777) !== 0o400
+      || !settingsStat.isFile() || settingsStat.isSymbolicLink() || (settingsStat.mode & 0o777) !== 0o400) {
       throw new Error("invalid permissions");
     }
-    parseHarnessModelCatalog(JSON.parse(readFileSync(catalogPath, "utf8")), manifest.harness.executable.version);
+    const catalogSerialized = readFileSync(catalogPath, "utf8");
+    const runtimeSerialized = readFileSync(runtimePath, "utf8");
+    const settingsSerialized = readFileSync(settingsPath, "utf8");
+    const parsedCatalog = parseHarnessModelCatalog(JSON.parse(catalogSerialized), manifest.harness.executable.version);
+    credentialNames = credentialNamesFromReferences(parsedCatalog.credentialRefs);
+    const runtimeExport = JSON.parse(runtimeSerialized) as Record<string, unknown>;
+    const { runtimeProviders: _runtimeProviders, ...runtimeCatalog } = runtimeExport;
+    const parsedRuntimeCatalog = parseHarnessModelCatalog(runtimeCatalog, manifest.harness.executable.version);
+    if (`${JSON.stringify(parsedRuntimeCatalog, null, 2)}\n` !== catalogSerialized) {
+      throw new Error("catalog and runtime export disagree");
+    }
+    JSON.parse(settingsSerialized);
+    const expectedRelease = createHash("sha256").update(catalogSerialized).update("\0").update(runtimeSerialized)
+      .update("\0").update(settingsSerialized).digest("hex");
+    if (basename(release) !== expectedRelease) throw new Error("release identity mismatch");
   } catch (error) {
     throw new CliError(`Harness 模型目录无效：${error instanceof Error ? error.message : "未知错误"}`);
   }
-  return { path: catalogPath, release: basename(release) };
+  return { path: catalogPath, exportPath: runtimePath, settingsPath, release: basename(release), sha256: basename(release), credentialNames };
+}
+
+function materializeModelReleaseSnapshot(
+  paths: RuntimePaths,
+  catalog: ReturnType<typeof validateModelCatalog>,
+  instanceId: string,
+): { root: string; catalogPath: string; exportPath: string; settingsPath: string; sha256: string } {
+  const root = join(paths.harnessRuntimes, `model-instance-${instanceId}`);
+  const staging = join(paths.harnessRuntimes, `.model-staging-${process.pid}-${randomUUID()}`);
+  const entries = [
+    ["catalog.json", catalog.path],
+    ["model-export.json", catalog.exportPath],
+    ["settings.yaml", catalog.settingsPath],
+  ] as const;
+  try {
+    mkdirSync(staging, { mode: 0o700 });
+    const contents = entries.map(([name, source]) => {
+      const content = readFileSync(source);
+      writeFileSync(join(staging, name), content, { mode: 0o400, flag: "wx" });
+      return content;
+    });
+    const digest = createHash("sha256").update(contents[0]!).update("\0").update(contents[1]!)
+      .update("\0").update(contents[2]!).digest("hex");
+    if (digest !== catalog.sha256) throw new CliError("模型发布在创建实例快照期间发生漂移");
+    chmodSync(staging, 0o500);
+    renameSync(staging, root);
+    assertFrozenModelRelease(root, digest);
+    return {
+      root: realpathSync(root),
+      catalogPath: join(realpathSync(root), "catalog.json"),
+      exportPath: join(realpathSync(root), "model-export.json"),
+      settingsPath: join(realpathSync(root), "settings.yaml"),
+      sha256: digest,
+    };
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
+}
+
+function assertFrozenModelRelease(root: string, expectedSha256: string): void {
+  const resolvedRoot = resolveDirectory(root, "运行中模型发布快照");
+  const names = readdirSync(resolvedRoot).sort();
+  if (names.join("\n") !== ["catalog.json", "model-export.json", "settings.yaml"].join("\n")
+    || (lstatSync(resolvedRoot).mode & 0o777) !== 0o500) {
+    throw new CliError("运行中模型发布快照结构或权限已漂移");
+  }
+  const files = names.map((name) => resolveFile(join(resolvedRoot, name), `运行中模型发布 ${name}`));
+  if (files.some((path) => (lstatSync(path).mode & 0o777) !== 0o400)) {
+    throw new CliError("运行中模型发布文件权限已漂移");
+  }
+  const digest = createHash("sha256").update(readFileSync(files[0]!)).update("\0")
+    .update(readFileSync(files[1]!)).update("\0").update(readFileSync(files[2]!)).digest("hex");
+  if (digest !== expectedSha256) throw new CliError("运行中模型发布快照身份已漂移");
 }
 
 function validateProductionBuild(): { serverEntry: string; webRoot: string } {
@@ -1234,8 +1723,15 @@ function readProcessState(paths: RuntimePaths): ProcessState | undefined {
       || typeof value.instanceId !== "string" || !Number.isSafeInteger(value.port)
       || Number(value.port) < 1_024 || Number(value.port) > 65_535
       || typeof value.databasePath !== "string" || typeof value.logPath !== "string"
+      || value.harnessPackage !== "@deepseek-ai/dsh" || typeof value.harnessPackageVersion !== "string"
+      || typeof value.harnessVersion !== "string" || typeof value.modelCatalogRelease !== "string"
+      || typeof value.imageDigest !== "string"
       || typeof value.harnessExecutablePath !== "string" || typeof value.harnessExecutableSha256 !== "string"
-      || typeof value.harnessRuntimeRoot !== "string" || typeof value.harnessRuntimePayloadSha256 !== "string") {
+      || typeof value.harnessRuntimeRoot !== "string" || typeof value.harnessRuntimePayloadSha256 !== "string"
+      || typeof value.harnessAdapterPath !== "string" || typeof value.harnessAdapterSha256 !== "string"
+      || typeof value.modelReleaseRoot !== "string" || typeof value.modelReleaseSha256 !== "string"
+      || typeof value.modelCatalogPath !== "string" || typeof value.modelExportPath !== "string"
+      || typeof value.modelSettingsPath !== "string") {
       throw new Error("invalid state");
     }
     if (typeof value.procStartTime !== "string" || !/^[1-9]\d*$/.test(value.procStartTime)) {
@@ -1275,8 +1771,24 @@ function assertFrozenProcessRuntime(paths: RuntimePaths, state: ProcessState): v
   if (sha256(executablePath) !== state.harnessExecutableSha256) {
     throw new CliError("运行中 dsh 可执行文件身份已漂移");
   }
+  const adapterPath = resolveFile(state.harnessAdapterPath, "运行中 Arena DSH SDK adapter");
+  const adapterRelation = relative(runtimeRoot, adapterPath);
+  if (!adapterRelation || adapterRelation === ".." || adapterRelation.startsWith(`..${sep}`) || isAbsolute(adapterRelation)
+    || sha256(adapterPath) !== state.harnessAdapterSha256) {
+    throw new CliError("运行中 Arena DSH SDK adapter 身份已漂移");
+  }
   if (hashHarnessRuntimePayload(runtimeRoot) !== state.harnessRuntimePayloadSha256) {
     throw new CliError("运行中 Harness runtime 快照身份已漂移");
+  }
+  const expectedModelRoot = join(paths.harnessRuntimes, `model-instance-${state.instanceId}`);
+  if (realpathSync(state.modelReleaseRoot) !== realpathSync(expectedModelRoot)) {
+    throw new CliError("运行中模型发布快照路径与实例身份不一致");
+  }
+  assertFrozenModelRelease(state.modelReleaseRoot, state.modelReleaseSha256);
+  if (state.modelCatalogPath !== join(state.modelReleaseRoot, "catalog.json")
+    || state.modelExportPath !== join(state.modelReleaseRoot, "model-export.json")
+    || state.modelSettingsPath !== join(state.modelReleaseRoot, "settings.yaml")) {
+    throw new CliError("运行中模型发布文件路径与实例身份不一致");
   }
 }
 
@@ -1285,6 +1797,16 @@ function removeProcessRuntimeSnapshot(paths: RuntimePaths, state: ProcessState):
   if (resolve(state.harnessRuntimeRoot) === resolve(expectedRoot)) {
     rmSync(expectedRoot, { recursive: true, force: true });
   }
+  const modelRoot = join(paths.harnessRuntimes, `model-instance-${state.instanceId}`);
+  if (resolve(state.modelReleaseRoot) === resolve(modelRoot)) removeModelReleaseSnapshot(modelRoot);
+}
+
+function removeModelReleaseSnapshot(root: string): void {
+  if (!existsSync(root)) return;
+  const stat = lstatSync(root);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new CliError("拒绝清理非普通模型发布实例目录");
+  chmodSync(root, 0o700);
+  rmSync(root, { recursive: true, force: true });
 }
 
 function flockExecutable(): string {
@@ -1617,24 +2139,33 @@ function formalRuntimeEnvironment(
   environment: NodeJS.ProcessEnv,
   paths: RuntimePaths,
   manifest: InstallManifest,
-  catalogPath: string,
+  modelRelease: { catalogPath: string; exportPath: string; settingsPath: string; sha256: string },
   webRoot: string,
   port: number,
   instanceId: string,
   harnessRuntime: { runtimeRoot: string; executablePath: string },
+  credentialNames: readonly string[],
 ): NodeJS.ProcessEnv {
   const inherited = ["HOME", "LANG", "LC_ALL", "NODE_OPTIONS", "PATH", "TMPDIR"]
     .flatMap((name) => environment[name] === undefined ? [] : [[name, environment[name]!]]);
+  const inheritedPath = environment.PATH ?? "";
+  const runtimeBin = validateFrozenPnpm(harnessRuntime.runtimeRoot);
+  const credentials = Object.fromEntries(credentialNames.flatMap((name) =>
+    environment[name] === undefined ? [] : [[name, environment[name]!]]));
   return {
     ...Object.fromEntries(inherited),
+    ...credentials,
+    PATH: inheritedPath ? `${runtimeBin}${delimiter}${inheritedPath}` : runtimeBin,
     NODE_ENV: "production",
     PORT: String(port),
     ARENA_INSTANCE_ID: instanceId,
     ARENA_STARTUP_HANDSHAKE_FD: "3",
     ARENA_DATABASE_PATH: join(paths.dataRoot, "maze-arena.sqlite"),
-    ARENA_MODEL_CATALOG_PATH: catalogPath,
-    ARENA_MODEL_CATALOG_RELEASE: basename(dirname(catalogPath)),
-    ARENA_HARNESS_COMMIT: manifest.harness.commit,
+    ARENA_MODEL_CATALOG_PATH: modelRelease.catalogPath,
+    ARENA_MODEL_CATALOG_RELEASE: modelRelease.sha256,
+    ARENA_MODEL_RELEASE_SHA256: modelRelease.sha256,
+    ARENA_HARNESS_PACKAGE: manifest.harness.packageName,
+    ARENA_HARNESS_PACKAGE_VERSION: manifest.harness.packageVersion,
     ARENA_MATCH_IMAGE: manifest.matchProfile!.imageReference,
     ARENA_MATCH_TRUSTED_ROOT: join(paths.dataRoot, "harness"),
     ARENA_MATCH_PROTOCOL_PACKAGE: join(repositoryRoot, "packages/match-profile"),
@@ -1643,9 +2174,12 @@ function formalRuntimeEnvironment(
     ARENA_WEB_ROOT: webRoot,
     DSH_EXECUTABLE: harnessRuntime.executablePath,
     DSH_HOME: join(paths.dataRoot, "harness"),
+    DSH_MODEL_EXPORT_PATH: modelRelease.exportPath,
+    DSH_MODEL_SETTINGS_PATH: modelRelease.settingsPath,
     DSH_HARNESS_VERSION: manifest.harness.executable.version,
-    DSH_EVOLUTION_COMMAND: harnessRuntime.executablePath,
-    DSH_SMOKE_COMMAND: harnessRuntime.executablePath,
+    DSH_EVOLUTION_COMMAND: join(harnessRuntime.runtimeRoot, "maze-arena/dsh-sdk-adapter.js"),
+    DSH_SMOKE_COMMAND: join(harnessRuntime.runtimeRoot, "maze-arena/dsh-sdk-adapter.js"),
+    DSH_EVOLUTION_EXECUTION_KIND: "real-provider",
     DSH_UNSHARE_EXECUTABLE: unshareExecutable,
     DSH_BWRAP_EXECUTABLE: manifest.isolation.bubblewrap.path,
     DSH_HARNESS_RUNTIME_ROOT: harnessRuntime.runtimeRoot,
@@ -1653,7 +2187,11 @@ function formalRuntimeEnvironment(
   };
 }
 
-async function doctor(environment: NodeJS.ProcessEnv, printDiagnostics = true): Promise<ValidatedDoctorContext> {
+async function doctor(
+  environment: NodeJS.ProcessEnv,
+  printDiagnostics = true,
+  loadCredentialFile = true,
+): Promise<ValidatedDoctorContext> {
   const paths = runtimePaths(environment);
   const manifest = readManifest(paths);
   const { diagnostics, bubblewrapVersion } = validateTools();
@@ -1661,44 +2199,7 @@ async function doctor(environment: NodeJS.ProcessEnv, printDiagnostics = true): 
     throw new CliError(`bubblewrap 版本漂移：期望 ${manifest.isolation.bubblewrap.version}`);
   }
   validateDirectoryPermissions(paths);
-  const sourceDirectory = resolveDirectory(manifest.harness.sourceDirectory, "Harness 源码目录");
-  const actualCommit = currentHarnessCommit(sourceDirectory);
-  if (actualCommit !== manifest.harness.commit) {
-    throw new CliError(`Harness 源码提交漂移：期望 ${manifest.harness.commit}，实际 ${actualCommit}`);
-  }
-  validateCleanHarnessWorktree(sourceDirectory);
-  const sourceExecutablePath = resolveFile(manifest.harness.executable.sourcePath, "dsh 来源可执行文件");
-  const sourceRuntimeRoot = resolveDirectory(manifest.harness.executable.sourceRuntimeRoot, "Harness 来源 runtime root");
-  const inferredSourceRuntimeRoot = resolveHarnessRuntimeRoot(sourceExecutablePath);
-  if (sourceRuntimeRoot !== inferredSourceRuntimeRoot) {
-    throw new CliError(`Harness 来源 runtime root 漂移：期望 ${manifest.harness.executable.sourceRuntimeRoot}，实际 ${inferredSourceRuntimeRoot}`);
-  }
-  const sourceSha256 = sha256(sourceExecutablePath);
-  if (sourceSha256 !== manifest.harness.executable.sha256) {
-    throw new CliError(`dsh 可执行文件内容漂移：期望 ${manifest.harness.executable.sha256}，实际 ${sourceSha256}`);
-  }
-  await validateSandboxedHarnessVersion(
-    sourceExecutablePath,
-    sourceRuntimeRoot,
-    manifest.harness.executable.version,
-    environment,
-    "dsh 版本漂移",
-    manifest.harness.executable.payloadSha256,
-  );
-  const sourcePayloadSha256 = hashHarnessRuntimePayload(sourceRuntimeRoot);
-  if (sourcePayloadSha256 !== manifest.harness.executable.payloadSha256) {
-    throw new CliError(`Harness runtime 来源载荷内容漂移：期望 ${manifest.harness.executable.payloadSha256}，实际 ${sourcePayloadSha256}`);
-  }
-  const executablePath = resolveFile(manifest.harness.executable.path, "dsh 私有快照可执行文件");
-  const runtimeRoot = resolveDirectory(manifest.harness.executable.runtimeRoot, "Harness runtime root");
-  const inferredRuntimeRoot = resolveHarnessRuntimeRoot(executablePath);
-  if (runtimeRoot !== inferredRuntimeRoot) {
-    throw new CliError(`Harness runtime root 漂移：期望 ${manifest.harness.executable.runtimeRoot}，实际 ${inferredRuntimeRoot}`);
-  }
-  const actualSha256 = sha256(executablePath);
-  if (actualSha256 !== manifest.harness.executable.sha256) {
-    throw new CliError(`dsh 可执行文件内容漂移：期望 ${manifest.harness.executable.sha256}，实际 ${actualSha256}`);
-  }
+  const { executablePath, runtimeRoot } = validateFrozenHarnessRuntime(manifest);
   await validateSandboxedHarnessVersion(
     executablePath,
     runtimeRoot,
@@ -1714,8 +2215,13 @@ async function doctor(environment: NodeJS.ProcessEnv, printDiagnostics = true): 
   validateDockerSecurityCapabilities();
   validateMatchProfileImage(manifest);
   const catalog = validateModelCatalog(paths, manifest);
+  const runtimeEnvironment = loadCredentialFile
+    ? loadUserEnvironment(paths, environment, catalog.credentialNames)
+    : { ...environment };
+  const sensitiveValues = sensitiveEnvironmentValues(runtimeEnvironment, catalog.credentialNames);
   const build = validateProductionBuild();
-  const backup = createBackupManager(paths, manifest, catalog.release, environment);
+  const backup = createBackupManager(paths, manifest, catalog.release, sensitiveValues);
+  backup.assertSourceDatabaseSchemaSupported();
   if (hasRegisteredLineages(join(paths.dataRoot, "maze-arena.sqlite"))) {
     const latest = backup.latestComplete();
     if (!latest) throw new CliError("正式运行数据存在，但最近完整备份缺失或校验失败");
@@ -1730,14 +2236,14 @@ async function doctor(environment: NodeJS.ProcessEnv, printDiagnostics = true): 
     process.stdout.write("检查通过：生产 Server 与 Web 构建产物可用\n");
     process.stdout.write("检查通过：Docker seccomp 与 cgroupns 安全能力可用\n");
   }
-  return { manifest, catalog, build };
+  return { manifest, catalog, build, runtimeEnvironment, sensitiveValues };
 }
 
 function createBackupManager(
   paths: RuntimePaths,
   manifest: InstallManifest,
   modelCatalogRelease: string,
-  environment: NodeJS.ProcessEnv,
+  sensitiveValues: SensitiveEnvironmentValueSet,
 ): RuntimeBackupManager {
   if (!manifest.matchProfile) throw new CliError("Match Profile 镜像尚未构建，请先运行 image build");
   return new RuntimeBackupManager({
@@ -1745,12 +2251,13 @@ function createBackupManager(
     lineageRoot: join(paths.dataRoot, "lineages"),
     backupsRoot: paths.backups,
     runtimeIdentity: {
-      harnessCommit: manifest.harness.commit,
+      harnessPackage: manifest.harness.packageName,
       harnessVersion: manifest.harness.executable.version,
       modelCatalogRelease,
+      modelReleaseSha256: modelCatalogRelease,
       imageDigest: manifest.matchProfile.imageReference,
     },
-    sensitiveValues: sensitiveEnvironmentValues(environment),
+    sensitiveValues,
   });
 }
 
@@ -1786,12 +2293,14 @@ function backupCommand(args: string[], environment: NodeJS.ProcessEnv): void {
   const manifest = readManifest(paths);
   validateDirectoryPermissions(paths);
   const catalog = validateModelCatalog(paths, manifest);
-  const manager = createBackupManager(paths, manifest, catalog.release, environment);
+  const runtimeEnvironment = loadUserEnvironment(paths, environment, catalog.credentialNames);
+  const sensitiveValues = sensitiveEnvironmentValues(runtimeEnvironment, catalog.credentialNames);
+  const manager = createBackupManager(paths, manifest, catalog.release, sensitiveValues);
   const [action, ...rest] = args;
   if (action === "create" && rest.length === 0) {
     assertServerStopped(paths);
     const result = manager.create("manual");
-    process.stdout.write(`完整备份已创建：${redactBackupOutput(result.path, environment)}\n`);
+    process.stdout.write(`完整备份已创建：${redactBackupOutput(result.path, redactionSensitiveValues(sensitiveValues))}\n`);
     for (const warning of result.rotationWarnings) process.stdout.write(`警告：${warning}\n`);
     process.stdout.write("备份未由应用加密，请依赖操作系统保护磁盘与备份介质\n");
     return;
@@ -1806,15 +2315,15 @@ function backupCommand(args: string[], environment: NodeJS.ProcessEnv): void {
     assertServerStopped(paths);
     const { backupPath, target } = parseBackupPath(rest, "restore");
     const restored = manager.restore(backupPath, target!);
-    process.stdout.write(`完整备份已恢复到隔离目录：${redactBackupOutput(target!, environment)}\n备份身份：${restored.backupId}\n`);
+    process.stdout.write(`完整备份已恢复到隔离目录：${redactBackupOutput(target!, redactionSensitiveValues(sensitiveValues))}\n备份身份：${restored.backupId}\n`);
     return;
   }
   throw new CliError("用法：maze-arena backup <create|verify|restore> [参数]");
 }
 
-function redactBackupOutput(value: string, environment: NodeJS.ProcessEnv): string {
-  return sensitiveEnvironmentValues(environment).sort((left, right) => right.length - left.length)
-    .reduce((sanitized, secret) => secret.length >= 8 ? sanitized.split(secret).join("[REDACTED]") : sanitized, value);
+function redactBackupOutput(value: string, sensitiveValues: string[]): string {
+  return [...sensitiveValues].sort((left, right) => right.length - left.length)
+    .reduce((sanitized, secret) => sanitized.split(secret).join("[REDACTED]"), value);
 }
 
 async function start(environment: NodeJS.ProcessEnv): Promise<void> {
@@ -1834,7 +2343,7 @@ async function start(environment: NodeJS.ProcessEnv): Promise<void> {
   }
 
   // 使用同一份已验证上下文创建实例快照，避免 doctor 后重新读取可交换的清单。
-  const { manifest, catalog, build } = await doctor(environment);
+  const { manifest, catalog, build, runtimeEnvironment } = await doctor(environment, true, true);
   const port = parseRuntimePort(environment);
   const instanceId = randomUUID();
   const instanceRuntime = materializeHarnessRuntimeSnapshot(
@@ -1845,6 +2354,7 @@ async function start(environment: NodeJS.ProcessEnv): Promise<void> {
     manifest.harness.executable.sha256,
     `instance-${instanceId}`,
   );
+  const instanceModelRelease = materializeModelReleaseSnapshot(paths, catalog, instanceId);
   const logPath = join(paths.logs, `server-${new Date().toISOString().replace(/[:.]/g, "-")}.log`);
   const logDescriptor = openSync(logPath, "a", 0o600);
   let child: ReturnType<typeof spawn>;
@@ -1852,7 +2362,17 @@ async function start(environment: NodeJS.ProcessEnv): Promise<void> {
     child = spawn(process.execPath, [build.serverEntry], {
       detached: true,
       stdio: ["ignore", logDescriptor, logDescriptor, "pipe"],
-      env: formalRuntimeEnvironment(environment, paths, manifest, catalog.path, build.webRoot, port, instanceId, instanceRuntime),
+      env: formalRuntimeEnvironment(
+        runtimeEnvironment,
+        paths,
+        manifest,
+        instanceModelRelease,
+        build.webRoot,
+        port,
+        instanceId,
+        instanceRuntime,
+        catalog.credentialNames,
+      ),
     });
   } finally {
     closeSync(logDescriptor);
@@ -1877,13 +2397,21 @@ async function start(environment: NodeJS.ProcessEnv): Promise<void> {
       port: handshake.port,
       startedAt: new Date().toISOString(),
       databasePath: join(paths.dataRoot, "maze-arena.sqlite"),
-      harnessCommit: manifest.harness.commit,
+      harnessPackage: manifest.harness.packageName,
+      harnessPackageVersion: manifest.harness.packageVersion,
       harnessVersion: manifest.harness.executable.version,
       harnessExecutablePath: instanceRuntime.executablePath,
       harnessExecutableSha256: manifest.harness.executable.sha256,
       harnessRuntimeRoot: instanceRuntime.runtimeRoot,
       harnessRuntimePayloadSha256: manifest.harness.executable.payloadSha256,
+      harnessAdapterPath: join(instanceRuntime.runtimeRoot, "maze-arena/dsh-sdk-adapter.js"),
+      harnessAdapterSha256: manifest.harness.adapter.sha256,
       modelCatalogRelease: catalog.release,
+      modelReleaseRoot: instanceModelRelease.root,
+      modelReleaseSha256: instanceModelRelease.sha256,
+      modelCatalogPath: instanceModelRelease.catalogPath,
+      modelExportPath: instanceModelRelease.exportPath,
+      modelSettingsPath: instanceModelRelease.settingsPath,
       imageDigest: manifest.matchProfile!.imageReference,
       logPath,
     };
@@ -1900,6 +2428,7 @@ async function start(environment: NodeJS.ProcessEnv): Promise<void> {
     if (stopped) {
       rmSync(paths.processState, { force: true });
       rmSync(instanceRuntime.runtimeRoot, { recursive: true, force: true });
+      removeModelReleaseSnapshot(instanceModelRelease.root);
     }
     else throw new CliError(`生产 Server 启动失败且无法安全清理，运行状态已保留；请查看净化日志：${logPath}`);
     throw error;
@@ -1945,7 +2474,7 @@ async function status(environment: NodeJS.ProcessEnv): Promise<void> {
     if (!manifest.matchProfile) throw new CliError("Match Profile 镜像尚未构建，请先运行 image build");
     process.stdout.write("进程：已停止\nHTTP：不可用\n");
     process.stdout.write(`数据库：${join(paths.dataRoot, "maze-arena.sqlite")}\n`);
-    process.stdout.write(`Harness：${manifest.harness.executable.version} @ ${manifest.harness.commit}\n`);
+    process.stdout.write(`Harness：${manifest.harness.packageName}@${manifest.harness.packageVersion}\n`);
     process.stdout.write(`模型目录版本：${catalog.release}\n`);
     process.stdout.write(`镜像摘要：${manifest.matchProfile.imageReference}\n`);
     return;
@@ -1955,13 +2484,193 @@ async function status(environment: NodeJS.ProcessEnv): Promise<void> {
   process.stdout.write(`进程：运行中（PID ${state.pid}）\n`);
   process.stdout.write(`HTTP：${healthy ? "健康" : "异常"}（http://127.0.0.1:${state.port}）\n`);
   process.stdout.write(`数据库：${state.databasePath}\n`);
-  process.stdout.write(`Harness：${state.harnessVersion} @ ${state.harnessCommit}\n`);
+  process.stdout.write(`Harness：${state.harnessPackage}@${state.harnessPackageVersion}（dsh ${state.harnessVersion}）\n`);
   process.stdout.write(`模型目录版本：${state.modelCatalogRelease}\n`);
   process.stdout.write(`镜像摘要：${state.imageDigest}\n`);
 }
 
+function parsePositiveInteger(value: string | undefined, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) throw new CliError(`${label}必须为正整数`);
+  return parsed;
+}
+
+function parsePositiveNumber(value: string | undefined, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new CliError(`${label}必须为正有限数字`);
+  return parsed;
+}
+
+function parseCanaryRequest(args: string[]): RealDshCanaryRequest {
+  const allowed = new Set([
+    "--name", "--provider", "--model", "--credential-ref", "--context-tokens", "--output-tokens",
+    "--token-limit", "--cost-limit", "--reasoning-effort", "--temperature", "--top-p",
+  ]);
+  const values = new Map<string, string>();
+  for (let index = 0; index < args.length; index += 2) {
+    const name = args[index];
+    const value = args[index + 1];
+    if (!name || !allowed.has(name) || value === undefined || value.startsWith("--") || values.has(name)) {
+      throw new CliError("canary 参数必须使用唯一的 --name value 形式");
+    }
+    values.set(name, value);
+  }
+  const requireText = (name: string, label: string) => {
+    const value = values.get(name)?.trim();
+    if (!value) throw new CliError(`${label}不能为空`);
+    return value;
+  };
+  const tokenLimit = parsePositiveInteger(values.get("--token-limit"), "令牌上限");
+  if (tokenLimit > REAL_DSH_CANARY_MAX_TOKENS) {
+    throw new CliError(`金丝雀令牌上限不得超过 ${REAL_DSH_CANARY_MAX_TOKENS}`);
+  }
+  const contextTokens = parsePositiveInteger(values.get("--context-tokens"), "上下文令牌");
+  const outputTokens = parsePositiveInteger(values.get("--output-tokens"), "输出令牌");
+  const perSessionTokenLimit = contextTokens + outputTokens;
+  if (!Number.isSafeInteger(perSessionTokenLimit) || perSessionTokenLimit * 2 > tokenLimit) {
+    throw new CliError("金丝雀总令牌上限必须至少覆盖 Generator 与 Solver 两个会话的上下文和输出预算");
+  }
+  const profile: ModelProfileInput = {
+    providerId: requireText("--provider", "提供方"),
+    modelId: requireText("--model", "模型"),
+    credentialRef: requireText("--credential-ref", "凭据引用"),
+    contextTokens,
+    outputTokens,
+    totalTokenLimit: perSessionTokenLimit,
+  };
+  const reasoning = values.get("--reasoning-effort");
+  if (reasoning) {
+    if (!(["off", "low", "high", "max"] as const).includes(reasoning as "off" | "low" | "high" | "max")) {
+      throw new CliError("推理强度只允许 off、low、high 或 max");
+    }
+    profile.reasoningEffort = reasoning as "off" | "low" | "high" | "max";
+  }
+  if (values.has("--temperature")) profile.temperature = Number(values.get("--temperature"));
+  if (values.has("--top-p")) profile.topP = Number(values.get("--top-p"));
+  if (profile.temperature !== undefined && !Number.isFinite(profile.temperature)) throw new CliError("temperature 必须为有限数字");
+  if (profile.topP !== undefined && !Number.isFinite(profile.topP)) throw new CliError("top-p 必须为有限数字");
+  const costLimit = parsePositiveNumber(values.get("--cost-limit"), "成本上限");
+  if (costLimit > REAL_DSH_CANARY_MAX_COST) {
+    throw new CliError(`金丝雀成本上限不得超过 ${REAL_DSH_CANARY_MAX_COST}`);
+  }
+  return {
+    name: requireText("--name", "金丝雀名称"),
+    modelProfile: profile,
+    tokenLimit,
+    costLimit,
+    operatorConfirmed: true,
+  };
+}
+
+function assertCanaryCredentialConfigured(
+  requestBody: RealDshCanaryRequest,
+  environment: NodeJS.ProcessEnv,
+  environmentFile: string,
+): void {
+  const prefix = "dsh-credential://";
+  const reference = requestBody.modelProfile.credentialRef;
+  const name = reference.startsWith(prefix) ? reference.slice(prefix.length) : "";
+  if (!environmentNamePattern.test(name)) throw new CliError("金丝雀凭据引用必须使用 dsh-credential://POSIX_NAME 格式");
+  if (!environment[name]) {
+    throw new CliError(`金丝雀凭据 ${name} 未配置；请写入 ${environmentFile} 或在进程环境中设置`);
+  }
+}
+
+function localJsonRequest<T>(
+  state: ProcessState,
+  method: "GET" | "POST",
+  path: string,
+  body?: unknown,
+  timeout = 10_000,
+): Promise<T> {
+  return new Promise((resolveResponse, reject) => {
+    const serialized = body === undefined ? undefined : JSON.stringify(body);
+    const requestHandle = request({
+      host: "127.0.0.1",
+      port: state.port,
+      path,
+      method,
+      headers: serialized ? { "content-type": "application/json", "content-length": Buffer.byteLength(serialized) } : undefined,
+    }, (response) => {
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      response.on("data", (chunk: Buffer) => {
+        bytes += chunk.length;
+        if (bytes > 2 * 1024 * 1024) {
+          response.destroy(new Error("金丝雀 API 响应超过 2 MiB 限制"));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.once("error", reject);
+      response.once("end", () => {
+        let value: unknown;
+        try { value = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+        catch { reject(new CliError("金丝雀 API 未返回合法 JSON")); return; }
+        if ((response.statusCode ?? 500) >= 400) {
+          const record = value as { error?: { message?: unknown }; reason?: unknown };
+          const reason = typeof record.error?.message === "string" ? record.error.message
+            : typeof record.reason === "string" ? record.reason : "金丝雀 API 拒绝请求";
+          reject(new CliError(reason));
+          return;
+        }
+        resolveResponse(value as T);
+      });
+    });
+    requestHandle.once("error", () => reject(new CliError("无法连接本机 Maze Arena Server")));
+    requestHandle.setTimeout(timeout, () => requestHandle.destroy(new Error("金丝雀 API 请求超时")));
+    if (serialized) requestHandle.end(serialized); else requestHandle.end();
+  });
+}
+
+function persistCanaryReport(paths: RuntimePaths, report: RealDshCanaryReport): string {
+  mkdirSync(paths.canaryReports, { recursive: true, mode: 0o700 });
+  chmodSync(paths.canaryReports, 0o700);
+  const target = join(paths.canaryReports, `${report.canaryId}.json`);
+  const temporary = `${target}.${process.pid}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
+  renameSync(temporary, target);
+  chmodSync(target, 0o600);
+  return target;
+}
+
+async function canary(args: string[], environment: NodeJS.ProcessEnv): Promise<void> {
+  if (environment.DSH_EVOLUTION_EXECUTION_KIND && environment.DSH_EVOLUTION_EXECUTION_KIND !== "real-provider") {
+    throw new CliError("正式金丝雀只允许 executionKind=real-provider，拒绝确定性夹具或 Fake Harness");
+  }
+  const requestBody = parseCanaryRequest(args);
+  const paths = runtimePaths(environment);
+  const context = await doctor(environment, false, true);
+  assertCanaryCredentialConfigured(requestBody, context.runtimeEnvironment, paths.environmentFile);
+  const state = readProcessState(paths);
+  if (!state || requireKnownProcessStatus(state) !== "running" || !await healthCheck(state.port, state.instanceId)) {
+    throw new CliError("真实金丝雀要求已经由正式 start 启动且健康的本机 Server");
+  }
+  const latest = createBackupManager(
+    paths,
+    context.manifest,
+    context.catalog.release,
+    context.sensitiveValues,
+  ).latestComplete();
+  if (!latest) throw new CliError("真实金丝雀开始前必须存在已校验的最近完整备份");
+  process.stdout.write(`金丝雀预算上限：${requestBody.tokenLimit} tokens，成本 ${requestBody.costLimit}\n`);
+  process.stdout.write(`前置身份：镜像 ${context.manifest.matchProfile!.imageReference}，备份 ${latest.manifest.backupId}\n`);
+  let report = await localJsonRequest<RealDshCanaryReport>(state, "POST", "/api/canaries", requestBody, 45 * 60_000);
+  const deadline = Date.now() + 45 * 60_000;
+  while (report.status === "running" && Date.now() < deadline) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+    report = await localJsonRequest<RealDshCanaryReport>(state, "GET", `/api/canaries/${encodeURIComponent(report.canaryId)}`);
+  }
+  if (report.status === "running") throw new CliError("真实金丝雀在四十五分钟内未完成，实验保持可审计状态");
+  const reportPath = persistCanaryReport(paths, report);
+  process.stdout.write(`验收报告：${reportPath}\n`);
+  process.stdout.write(`mechanismClosed=${report.mechanismClosed}\npromoted=${report.promoted}\nformalAcceptancePassed=${report.formalAcceptancePassed}\n`);
+  process.stdout.write(`结论：${report.reason}\n非保证：${report.nonGuarantee}\n`);
+  if (!report.formalAcceptancePassed) throw new CliError("真实 DSH 金丝雀未通过正式验收；报告已持久化");
+}
+
 function usage(): never {
-  throw new CliError("用法：maze-arena <install|image build|models sync|doctor|start|stop|status|backup> [参数]");
+  throw new CliError("用法：maze-arena <install|image build|models sync|doctor|start|stop|status|backup|canary> [参数]");
 }
 
 async function main(args: string[], environment: NodeJS.ProcessEnv): Promise<void> {
@@ -1979,6 +2688,21 @@ async function main(args: string[], environment: NodeJS.ProcessEnv): Promise<voi
   }
   if (command === "backup") {
     if (locked) return backupCommand(rest, environment);
+    const code = await runWithRuntimeLock(args, paths, environment);
+    if (code === 75) throw new CliError("另一个运行管理命令正在执行");
+    if (code !== 0) process.exitCode = code;
+    return;
+  }
+  if (command === "canary") {
+    const canaryArgs = rest[0] === "run" ? rest.slice(1) : rest;
+    if (locked) return canary(canaryArgs, environment);
+    if (environment.DSH_EVOLUTION_EXECUTION_KIND && environment.DSH_EVOLUTION_EXECUTION_KIND !== "real-provider") {
+      throw new CliError("正式金丝雀只允许 executionKind=real-provider，拒绝确定性夹具或 Fake Harness");
+    }
+    parseCanaryRequest(canaryArgs);
+    if (!existsSync(paths.manifest) || !existsSync(paths.runtime)) {
+      throw new CliError("真实金丝雀尚未配置正式安装，请先完成 install、image build、models sync、backup create 与 start");
+    }
     const code = await runWithRuntimeLock(args, paths, environment);
     if (code === 75) throw new CliError("另一个运行管理命令正在执行");
     if (code !== 0) process.exitCode = code;

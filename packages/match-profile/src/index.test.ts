@@ -1,11 +1,12 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import type { Stats } from "node:fs";
 import { createServer, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { MatchPluginRole, MatchProtocolRequest } from "@maze-arena/contracts";
 import { hashHarnessRuntimePayload } from "@maze-arena/dsh-integration";
 import {
@@ -46,6 +47,115 @@ const stubCandidateTestRunner: TrustedCandidateTestRunner = {
     }
   },
 };
+const createdDshHomes = new Set<string>();
+
+function createDshHome(prefix = "maze-dsh-home-"): string {
+  const home = mkdtempSync(join(tmpdir(), prefix));
+  createdDshHomes.add(home);
+  return home;
+}
+
+interface DshHomeCleanupOperations {
+  chmodSync(path: string, mode: number): void;
+  lstatSync(path: string): Stats;
+  readdirSync(path: string): string[];
+  rmSync(path: string, options: { recursive: true; force: true }): void;
+}
+
+const dshHomeCleanupOperations: DshHomeCleanupOperations = {
+  chmodSync,
+  lstatSync,
+  readdirSync: (path) => readdirSync(path),
+  rmSync,
+};
+
+function cleanupCreatedDshHomes(overrides: Partial<DshHomeCleanupOperations> = {}): void {
+  const operations = { ...dshHomeCleanupOperations, ...overrides };
+  const cleanupErrors: unknown[] = [];
+  for (const home of [...createdDshHomes]) {
+    const homeErrors: unknown[] = [];
+    const restoreAccess = (path: string): void => {
+      let stat: Stats;
+      try { stat = operations.lstatSync(path); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") homeErrors.push(error);
+        return;
+      }
+      if (stat.isSymbolicLink()) return;
+      try { operations.chmodSync(path, (stat.mode & 0o777) | (stat.isDirectory() ? 0o700 : 0o600)); }
+      catch (error) { homeErrors.push(error); }
+      if (!stat.isDirectory()) return;
+      let entries: string[];
+      try { entries = operations.readdirSync(path); }
+      catch (error) { homeErrors.push(error); return; }
+      for (const entry of entries) restoreAccess(join(path, entry));
+    };
+    restoreAccess(home);
+    try { operations.rmSync(home, { recursive: true, force: true }); }
+    catch (error) { homeErrors.push(error); }
+    let exists = true;
+    try { operations.lstatSync(home); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") exists = false;
+      else homeErrors.push(error);
+    }
+    if (exists) homeErrors.push(new Error(`测试 DSH home 清理后仍存在：${home}`));
+    else createdDshHomes.delete(home);
+    cleanupErrors.push(...homeErrors);
+  }
+  if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, "测试 DSH home 清理失败");
+}
+
+afterEach(() => { cleanupCreatedDshHomes(); });
+
+describe("Match 测试 DSH home 清理", () => {
+  it("逐 home 收敛权限和删除，首个失败不阻断后续且保留跟踪供重试", () => {
+    const first = createDshHome();
+    const second = createDshHome();
+    const external = mkdtempSync(join(tmpdir(), "maze-dsh-external-"));
+    for (const home of [first, second]) {
+      mkdirSync(join(home, "nested", "deep"), { recursive: true });
+      writeFileSync(join(home, "nested", "deep", "locked"), "locked");
+      chmodSync(join(home, "nested", "deep", "locked"), 0o000);
+      chmodSync(join(home, "nested", "deep"), 0o000);
+      chmodSync(join(home, "nested"), 0o000);
+      chmodSync(home, 0o000);
+    }
+    writeFileSync(join(external, "outside"), "outside");
+    chmodSync(external, 0o000);
+    chmodSync(first, 0o700);
+    symlinkSync(external, join(first, "external-link"), "dir");
+    chmodSync(first, 0o000);
+    let failedOnce = false;
+    let caught: unknown;
+    try {
+      cleanupCreatedDshHomes({
+        rmSync: (path, options) => {
+          if (path === first && !failedOnce) {
+            failedOnce = true;
+            throw new Error("injected-first-home-remove-failure");
+          }
+          rmSync(path, options);
+        },
+      });
+    } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect(String((caught as AggregateError).errors[0])).toContain("injected-first-home-remove-failure");
+    expect(existsSync(first)).toBe(true);
+    expect(existsSync(second)).toBe(false);
+    expect(createdDshHomes.has(first)).toBe(true);
+    expect(createdDshHomes.has(second)).toBe(false);
+    expect(statSync(external).mode & 0o777).toBe(0o000);
+
+    cleanupCreatedDshHomes();
+    expect(createdDshHomes.has(first)).toBe(false);
+    expect(existsSync(first)).toBe(false);
+    expect(existsSync(external)).toBe(true);
+    chmodSync(external, 0o700);
+    expect(readFileSync(join(external, "outside"), "utf8")).toBe("outside");
+    rmSync(external, { recursive: true, force: true });
+  });
+});
 
 function command(mode: string, role: MatchPluginRole = "solver") {
   return { executable: process.execPath, args: [peer, mode], environment: { PATH: process.env.PATH, MAZE_MATCH_ROLE: role } };
@@ -72,12 +182,12 @@ function startRequest(role: MatchPluginRole = "solver"): MatchProtocolRequest {
 async function installProfiles(roleBundles = {
   generator: join(workspaceRoot, "packages/generator-plugin"),
   solver: join(workspaceRoot, "packages/solver-plugin"),
-}) {
-  const home = mkdtempSync(join(tmpdir(), "maze-dsh-home-"));
+}, environment?: NodeJS.ProcessEnv) {
+  const home = createDshHome();
   const installer = new HarnessMatchProfileInstaller({
     executable: fakeDsh, ...fakeHarnessRuntime,
     expectedVersion: "2026.09-preview.1", home,
-    protocolBundle: packageRoot, roleBundles,
+    protocolBundle: packageRoot, roleBundles, environment,
   });
   await installer.prepare();
   return { home, installer };
@@ -458,6 +568,15 @@ describe("Match Profile 进程协议", () => {
     expect(existsSync(`${marker}.removed`)).toBe(true);
   });
 
+  it("等待清理命令的 stderr 管道关闭后再判定容器已不存在", async () => {
+    const marker = join(mkdtempSync(join(tmpdir(), "maze-cleanup-late-output-")), "container");
+    const client = new MatchProfileProcess(cleanupCommand("hold-open", marker, "late-no-such"), "solver", 100);
+    await expect(client.request(startRequest())).resolves.toMatchObject({ payload: { type: "solver.ready" } });
+    await expect(client.close()).resolves.toBeUndefined();
+    expect(existsSync(marker)).toBe(false);
+    expect(existsSync(`${marker}.removed`)).toBe(true);
+  });
+
   it("close 与 spawn 异常路径也执行可信清理", async () => {
     for (const executable of [process.execPath, "/definitely-missing/maze-match-profile"]) {
       const marker = join(mkdtempSync(join(tmpdir(), "maze-close-cleanup-")), "container");
@@ -662,9 +781,10 @@ describe("原生插件与正式隔离策略", () => {
       expect(manifest.dsh.profile.bundles).toEqual([
         "@maze-arena/match-profile", `@maze-arena/${role}-plugin`,
       ]);
+      expect(manifest.dsh.profile.patchReload).toBe("startup");
       for (const name of manifest.dsh.profile.bundles) {
         const installed = join(home, "profiles", `maze-match-${role}`, "node_modules", ...name.split("/"));
-        expect(realpathSync(installed).startsWith(join(home, "artifacts", "sha256-"))).toBe(true);
+        expect(realpathSync(installed).startsWith(join(home, "profiles", `maze-match-${role}`, "node_modules/.pnpm"))).toBe(true);
         const artifactManifest = readFileSync(join(installed, "package.json"), "utf8");
         expect(artifactManifest).not.toContain("workspace:");
         expect(JSON.parse(artifactManifest).dependencies).toEqual({});
@@ -681,6 +801,42 @@ describe("原生插件与正式隔离策略", () => {
       expect(manifest.dsh.profile.bundles).toEqual([]);
       expect(manifest.dependencies).toEqual({});
     }
+  });
+
+  it("接受官方 dsh 将 dependencies 与 bundles 反序写回", async () => {
+    const { home } = await installProfiles(undefined, { DSH_PROFILE_MANIFEST_MODE: "reverse" });
+    const manifest = JSON.parse(readFileSync(join(home, "profiles/maze-match-generator/package.json"), "utf8"));
+    expect(Object.keys(manifest.dependencies)).toEqual([
+      "@maze-arena/generator-plugin", "@maze-arena/match-profile",
+    ]);
+    expect(manifest.dsh.profile.bundles).toEqual([
+      "@maze-arena/generator-plugin", "@maze-arena/match-profile",
+    ]);
+  });
+
+  it.each([
+    ["dependency-extra", "dependencies"],
+    ["dependency-missing", "dependencies"],
+    ["bundle-extra", "bundles"],
+    ["bundle-missing", "bundles"],
+    ["bundle-duplicate", "bundles"],
+  ] as const)("拒绝 Profile 精确成员集合漂移：%s", async (mode, field) => {
+    await expect(installProfiles(undefined, { DSH_PROFILE_MANIFEST_MODE: mode }))
+      .rejects.toThrow(new RegExp(`${field} 必须且只能包含`));
+  });
+
+  it.each(["patch-reload-live", "patch-reload-missing"])("拒绝 Profile patchReload 漂移：%s", async (mode) => {
+    await expect(installProfiles(undefined, { DSH_PROFILE_MANIFEST_MODE: mode }))
+      .rejects.toThrow(/固定 patchReload=startup/);
+  });
+
+  it.each([
+    ["package-source-mismatch", /package\.json dependencies 来源与已验证产物不一致/],
+    ["lock-source-mismatch", /pnpm-lock\.yaml importer 来源错配/],
+    ["installed-content-tamper", /安装载荷与已验证内容寻址产物不一致/],
+    ["virtual-store-escape", /越出当前 Profile 的 pnpm virtual store/],
+  ] as const)("拒绝 pnpm isolated 安装信任链漂移：%s", async (mode, expected) => {
+    await expect(installProfiles(undefined, { DSH_PROFILE_MANIFEST_MODE: mode })).rejects.toThrow(expected);
   });
 
   it("重复准备正式 Profile 会安全替换上一轮只读快照", async () => {
@@ -810,9 +966,12 @@ describe("原生插件与正式隔离策略", () => {
     expect(first).toMatchObject({
       executable: "docker",
       args: expect.arrayContaining([
-        "run", "--rm", "--name", expect.stringMatching(/^maze-match-solver-[a-f0-9]{24}$/), "--network=none", "--read-only", "--user=65532:65532", "--memory=128m",
+        "run", "--interactive", "--rm", "--name", expect.stringMatching(/^maze-match-solver-[a-f0-9]{24}$/), "--network=none", "--read-only", "--user=65532:65532", "--memory=128m",
         "--memory-swap=128m", "--ulimit=cpu=2:2", "--security-opt=no-new-privileges", "--cap-drop=ALL",
-        expect.stringContaining("src=" + join(root, "snapshots", "solver")),
+        "--tmpfs=/arena:rw,noexec,nosuid,size=32m,mode=0700,uid=65532,gid=65532",
+        expect.stringContaining("src=" + join(root, "snapshots", "solver") + ",dst=/arena-source,readonly"),
+        "--env=MAZE_MATCH_PROFILE_SOURCE=/arena-source",
+        "node", "/opt/maze-arena/packages/match-profile/dist/container-launcher.js",
         "dsh", "--profile", "maze-match-solver",
       ]),
       cleanup: {
@@ -1159,7 +1318,7 @@ describe("原生插件与正式隔离策略", () => {
   });
 
   it("拒绝 Harness home 叠加额外贡献项", async () => {
-    const home = mkdtempSync(join(tmpdir(), "maze-dsh-home-patch-"));
+    const home = createDshHome("maze-dsh-home-patch-");
     writeFileSync(join(home, "cordis.patch.yml"), "- insert: [{ id: extra, name: dangerous }]\n");
     const installer = new HarnessMatchProfileInstaller({
       executable: fakeDsh, ...fakeHarnessRuntime, expectedVersion: "2026.09-preview.1", home, protocolBundle: packageRoot,
@@ -1198,13 +1357,13 @@ describe("原生插件与正式隔离策略", () => {
     expect(existsSync(marker)).toBe(false);
   });
 
-  it("dsh 无法篡改只读的内容寻址安装产物", async () => {
+  it("dsh 篡改 pnpm 安装副本时由安装载荷复验关闭失败", async () => {
     const home = mkdtempSync(join(tmpdir(), "maze-postinstall-home-"));
     const installer = new HarnessMatchProfileInstaller({
       executable: fakeDsh, ...fakeHarnessRuntime, expectedVersion: "2026.09-preview.1", home, protocolBundle: packageRoot,
       roleBundles: { generator: join(workspaceRoot, "packages/generator-plugin"), solver: join(workspaceRoot, "packages/solver-plugin") },
       environment: { DSH_TAMPER_INSTALLED_PATCH: "1" },
     });
-    await expect(installer.prepare()).rejects.toThrow(/dsh 命令失败/);
+    await expect(installer.prepare()).rejects.toThrow(/角色 bundle 必须且只能挂载自身一个能力入口/);
   });
 });

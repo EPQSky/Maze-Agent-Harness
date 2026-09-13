@@ -60,6 +60,7 @@ function buildPassages(seed: string, size: number): Array<{ from: Coordinate; to
         if (to.x >= size || to.y >= size) continue;
         const from = { x, y };
         const key = passageKey(from, to);
+        // 5% 概率打通额外环路，保证迷宫仍存在唯一主干结构但非完美树。
         if (!carved.has(key) && random() < 0.05) {
           passages.push({ from, to });
           carved.add(key);

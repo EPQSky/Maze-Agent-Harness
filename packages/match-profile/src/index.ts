@@ -15,7 +15,12 @@ import type {
   MatchProtocolResponse,
   SolverResponse,
 } from "@maze-arena/contracts";
-import { MATCH_OUTPUT_LIMIT_BYTES, MATCH_PROTOCOL_VERSION } from "@maze-arena/contracts";
+import {
+  createMatchProfileConfiguration,
+  isMatchProfileConfiguration,
+  MATCH_OUTPUT_LIMIT_BYTES,
+  MATCH_PROTOCOL_VERSION,
+} from "@maze-arena/contracts";
 import { runIsolatedHarnessCommand } from "@maze-arena/dsh-integration";
 import {
   GOAL,
@@ -187,7 +192,7 @@ export class HarnessMatchProfileInstaller {
     const directory = join(resolve(this.options.home), "profiles", profile);
     mkdirSync(directory, { recursive: true });
     writeFileSync(join(directory, "package.json"), `${JSON.stringify({
-      name: `dsh-profile-${profile}`, private: true, dependencies: {}, dsh: { profile: { bundles: [] } },
+      name: `dsh-profile-${profile}`, private: true, dependencies: {}, dsh: { profile: createMatchProfileConfiguration([]) },
     }, null, 2)}\n`);
     writeFileSync(join(directory, "cordis.patch.yml"), "[]\n");
     await validatePluginPackage(this.options.protocolBundle);
@@ -205,16 +210,24 @@ export class HarnessMatchProfileInstaller {
     const protocolName = packageName(protocolArtifact);
     const roleName = packageName(roleArtifact);
     const expected = [protocolName, roleName];
-    if (JSON.stringify(Object.keys(manifest.dependencies ?? {})) !== JSON.stringify(expected)
-      || JSON.stringify(manifest.dsh?.profile?.bundles ?? []) !== JSON.stringify(expected)) {
-      throw new Error(`${profile} 必须且只能安装协议 bundle 与一个角色 bundle`);
+    if (!hasExactUniqueMembers(Object.keys(manifest.dependencies ?? {}), expected)) {
+      throw new Error(`${profile} 的 dependencies 必须且只能包含协议 bundle 与一个角色 bundle`);
     }
+    if (!isMatchProfileConfiguration(manifest.dsh?.profile, expected)) {
+      throw new Error(`${profile} 的 bundles 必须且只能包含协议 bundle 与一个角色 bundle，并固定 patchReload=startup`);
+    }
+    const expectedArtifacts = new Map<string, string>([
+      [protocolName, realpathSync(protocolArtifact)],
+      [roleName, realpathSync(roleArtifact)],
+    ]);
+    for (const [name, artifact] of expectedArtifacts) {
+      if (manifest.dependencies?.[name] !== `file:${artifact}`) {
+        throw new Error(`${profile} 的 package.json dependencies 来源与已验证产物不一致：${name}`);
+      }
+    }
+    validateProfileLockfile(directory, expectedArtifacts);
     validateProfilePatches(this.options.home, profile, expected);
-    for (const [name, artifact] of [[protocolName, protocolArtifact], [roleName, roleArtifact]] as const) {
-      const installed = join(directory, "node_modules", ...name.split("/"));
-      if (realpathSync(installed) !== realpathSync(artifact)) throw new Error(`${profile} 安装结果未指向已验证的内容寻址产物：${name}`);
-      await validateInstallArtifact(installed);
-    }
+    for (const [name, artifact] of expectedArtifacts) await validateProfileInstalledPackage(directory, profile, name, artifact);
     freezeProfileSnapshot(this.options.home, role);
   }
 
@@ -268,6 +281,12 @@ export class HarnessMatchProfileInstaller {
   }
 }
 
+function hasExactUniqueMembers(actual: readonly string[], expected: readonly string[]): boolean {
+  return actual.length === expected.length
+    && new Set(actual).size === actual.length
+    && expected.every((name) => actual.includes(name));
+}
+
 export class DockerMatchProfileCommandFactory implements MatchProfileCommandFactory {
   constructor(
     private readonly image: string,
@@ -289,13 +308,16 @@ export class DockerMatchProfileCommandFactory implements MatchProfileCommandFact
       executable: this.executable,
       environment: commandEnvironment,
       args: [
-        "run", "--rm", "--name", containerName, "--network=none", "--read-only", `--user=${MATCH_PROFILE_POLICY.user}`,
+        "run", "--interactive", "--rm", "--name", containerName, "--network=none", "--read-only", `--user=${MATCH_PROFILE_POLICY.user}`,
         "--memory=128m", "--memory-swap=128m", "--cpus=1", "--ulimit=cpu=2:2", "--pids-limit=64",
         "--security-opt=no-new-privileges", "--cap-drop=ALL", "--tmpfs=/tmp:rw,noexec,nosuid,size=16m",
-        `--mount=type=bind,src=${trustedRoot},dst=/arena,readonly`,
+        "--tmpfs=/arena:rw,noexec,nosuid,size=32m,mode=0700,uid=65532,gid=65532",
+        `--mount=type=bind,src=${trustedRoot},dst=/arena-source,readonly`,
         "--env=DSH_HOME=/arena",
+        "--env=MAZE_MATCH_PROFILE_SOURCE=/arena-source",
         "--env=MAZE_MATCH_ROLE=" + role,
         this.image,
+        "node", "/opt/maze-arena/packages/match-profile/dist/container-launcher.js",
         "dsh", "--profile", profileName(role),
       ],
       cleanup: {
@@ -1660,8 +1682,8 @@ function validateBundlePatch(packageName: string, text: string): void {
   const entries = patch[0].insert;
   if (packageName === "@maze-arena/match-profile") {
     const expected = [
-      { id: "maze-match-protocol-generator", name: "@maze-arena/match-profile/host", inject: ["mazeGenerator"], disabled: "process.env.MAZE_MATCH_ROLE !== 'generator'" },
-      { id: "maze-match-protocol-solver", name: "@maze-arena/match-profile/host", inject: ["mazeSolver"], disabled: "process.env.MAZE_MATCH_ROLE !== 'solver'" },
+      { id: "maze-match-protocol-generator", name: "./dist/host.js", inject: ["mazeGenerator"], disabled: "process.env.MAZE_MATCH_ROLE !== 'generator'" },
+      { id: "maze-match-protocol-solver", name: "./dist/host.js", inject: ["mazeSolver"], disabled: "process.env.MAZE_MATCH_ROLE !== 'solver'" },
     ];
     if (JSON.stringify(entries) !== JSON.stringify(expected)) throw new Error("协议 bundle 贡献项不符合冻结配置");
     return;
@@ -1669,7 +1691,7 @@ function validateBundlePatch(packageName: string, text: string): void {
   const id = packageName === "@maze-arena/generator-plugin" ? "maze-generator"
     : packageName === "@maze-arena/solver-plugin" ? "maze-solver" : undefined;
   if (!id || entries.length !== 1 || !record(entries[0]) || !exactKeys(entries[0], ["id", "name"])
-    || entries[0].id !== id || entries[0].name !== packageName) throw new Error("角色 bundle 必须且只能挂载自身一个能力入口");
+    || entries[0].id !== id || entries[0].name !== "./dist/index.js") throw new Error("角色 bundle 必须且只能挂载自身一个能力入口");
 }
 
 async function createInstallArtifact(source: string, artifactRoot: string): Promise<string> {
@@ -1712,16 +1734,105 @@ async function createInstallArtifact(source: string, artifactRoot: string): Prom
 
 async function validateInstallArtifact(root: string): Promise<void> {
   const artifact = realpathSync(resolve(root));
-  const manifestText = readFileSync(join(artifact, "package.json"), "utf8");
+  const digest = await validateInstallPayload(artifact);
+  if (artifact.split(sep).at(-1) !== `sha256-${digest}`) throw new Error("安装产物目录名与内容哈希不匹配");
+}
+
+async function validateInstallPayload(root: string): Promise<string> {
+  assertRegularPackageTree(root);
+  const manifestText = readFileSync(join(root, "package.json"), "utf8");
   if (manifestText.includes("workspace:")) throw new Error("安装产物不得保留 workspace 依赖");
   const manifest = JSON.parse(manifestText) as Record<string, any>;
   if (manifest.scripts || manifest.devDependencies || Object.keys(manifest.dependencies ?? {}).length !== 0) {
     throw new Error("安装产物必须是无生命周期脚本且依赖闭包完整的最小包");
   }
-  await validatePluginPackage(artifact);
-  validateModuleClosure(artifact, walk(artifact).map((path) => relative(artifact, path)), new Set());
-  const expected = `sha256-${hashDirectory(artifact)}`;
-  if (artifact.split(sep).at(-1) !== expected) throw new Error("安装产物目录名与内容哈希不匹配");
+  await validatePluginPackage(root);
+  validateModuleClosure(root, walk(root).map((path) => relative(root, path)), new Set());
+  return hashDirectory(root);
+}
+
+async function validateProfileInstalledPackage(
+  profileRoot: string,
+  profile: string,
+  name: string,
+  artifact: string,
+): Promise<void> {
+  const trustedProfileRoot = realpathSync(profileRoot);
+  const expectedVirtualStore = join(trustedProfileRoot, "node_modules/.pnpm");
+  const virtualStore = realpathSync(expectedVirtualStore);
+  if (virtualStore !== expectedVirtualStore) {
+    throw new Error(`${profile} 的 pnpm virtual store 必须位于当前 Profile 内`);
+  }
+  const installedLink = join(profileRoot, "node_modules", ...name.split("/"));
+  if (!lstatSync(installedLink).isSymbolicLink()) throw new Error(`${profile} 顶层包必须由 pnpm virtual store 链接：${name}`);
+  const installed = realpathSync(installedLink);
+  const relation = relative(virtualStore, installed);
+  if (!relation || relation === ".." || relation.startsWith(`..${sep}`) || isAbsolute(relation)) {
+    throw new Error(`${profile} 安装结果越出当前 Profile 的 pnpm virtual store：${name}`);
+  }
+  const suffix = join("node_modules", ...name.split("/"));
+  if (relation !== suffix && !relation.endsWith(`${sep}${suffix}`)) {
+    throw new Error(`${profile} 安装结果不符合受控 pnpm virtual store 布局：${name}`);
+  }
+  const installedDigest = await validateInstallPayload(installed);
+  const artifactDigest = hashDirectory(artifact);
+  if (installedDigest !== artifactDigest) throw new Error(`${profile} 安装载荷与已验证内容寻址产物不一致：${name}`);
+  if (packageName(installed) !== name) throw new Error(`${profile} 安装包身份不一致：${name}`);
+}
+
+function validateProfileLockfile(profileRoot: string, expectedArtifacts: ReadonlyMap<string, string>): void {
+  const path = join(profileRoot, "pnpm-lock.yaml");
+  const document = parseDocument(readFileSync(path, "utf8"));
+  if (document.errors.length) throw new Error("Profile pnpm-lock.yaml 不是合法 YAML");
+  const lockfile = document.toJS() as unknown;
+  if (!record(lockfile) || String(lockfile.lockfileVersion) !== "9.0" || !record(lockfile.importers)
+    || !exactKeys(lockfile.importers, ["."]) || !record(lockfile.importers["."])) {
+    throw new Error("Profile pnpm-lock.yaml 结构无效");
+  }
+  const dependencies = lockfile.importers["."].dependencies;
+  if (!exactKeys(lockfile.importers["."], ["dependencies"]) || !record(dependencies)
+    || !hasExactUniqueMembers(Object.keys(dependencies), [...expectedArtifacts.keys()])) {
+    throw new Error("Profile pnpm-lock.yaml importer 依赖集合不精确");
+  }
+  for (const [name, artifact] of expectedArtifacts) {
+    const entry = dependencies[name];
+    if (!record(entry) || entry.specifier !== `file:${artifact}` || typeof entry.version !== "string"
+      || resolveLockfileArtifact(profileRoot, entry.version) !== artifact) {
+      throw new Error(`Profile pnpm-lock.yaml importer 来源错配：${name}`);
+    }
+  }
+  if (!record(lockfile.packages) || !record(lockfile.snapshots)) throw new Error("Profile pnpm-lock.yaml 缺少包身份闭包");
+  const packageKeys = Object.keys(lockfile.packages);
+  if (packageKeys.length !== expectedArtifacts.size || !hasExactUniqueMembers(Object.keys(lockfile.snapshots), packageKeys)) {
+    throw new Error("Profile pnpm-lock.yaml 包身份闭包不精确");
+  }
+  for (const [name, artifact] of expectedArtifacts) {
+    const key = packageKeys.find((candidate) => candidate.startsWith(`${name}@file:`));
+    const value = key && lockfile.packages[key];
+    if (!key || resolveLockfileArtifact(profileRoot, key.slice(name.length + 1)) !== artifact
+      || !record(value) || !record(value.resolution) || value.resolution.type !== "directory"
+      || typeof value.resolution.directory !== "string"
+      || realpathSync(resolve(profileRoot, value.resolution.directory)) !== artifact) {
+      throw new Error(`Profile pnpm-lock.yaml 包来源错配：${name}`);
+    }
+  }
+}
+
+function resolveLockfileArtifact(profileRoot: string, reference: string): string {
+  if (!reference.startsWith("file:") || reference.length === 5) throw new Error("Profile lockfile 只允许 file: 产物来源");
+  return realpathSync(resolve(profileRoot, reference.slice(5)));
+}
+
+function assertRegularPackageTree(root: string): void {
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) throw new Error("安装载荷包含链接或特殊文件");
+      if (stat.isDirectory()) visit(path);
+    }
+  };
+  visit(root);
 }
 
 function validateModuleClosure(root: string, files: string[], allowedBare: Set<string>): void {
@@ -1884,7 +1995,8 @@ function runCleanupCommand(command: MatchProfileCleanupCommand): Promise<Cleanup
     child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
     child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
     child.once("error", (error) => { clearTimeout(timer); reject(error); });
-    child.once("exit", (code, signal) => { clearTimeout(timer); resolvePromise({ code, signal, stdout, stderr }); });
+    // 等待 close 而非 exit，确保 stdout/stderr 管道已排空；Docker CLI 的诊断可能在 exit 之后才到达。
+    child.once("close", (code, signal) => { clearTimeout(timer); resolvePromise({ code, signal, stdout, stderr }); });
   });
 }
 
